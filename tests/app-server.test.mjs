@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { AppServerClientBase } from "../plugins/codex/scripts/lib/app-server.mjs";
+import { AppServerClientBase } from "../plugins/agent/scripts/lib/app-server.mjs";
 
 /** Minimal client that records the JSON-RPC messages it would send. */
 class CapturingClient extends AppServerClientBase {

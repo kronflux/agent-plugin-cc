@@ -1,6 +1,8 @@
-# Codex plugin for Claude Code
+# Agent plugin for Claude Code
 
-Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
+Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex. Commands are
+provided by the `agent` plugin and prefixed with the agent they drive, for example
+`/agent:codex-review`.
 
 This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
 they already have.
@@ -9,9 +11,9 @@ they already have.
 
 ## What You Get
 
-- `/codex:review` for a normal read-only Codex review
-- `/codex:adversarial-review` for a steerable challenge review
-- `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
+- `/agent:codex-review` for a normal read-only Codex review
+- `/agent:codex-adversarial-review` for a steerable challenge review
+- `/agent:codex-rescue`, `/agent:codex-transfer`, `/agent:status`, `/agent:result`, and `/agent:cancel` to delegate work, hand off sessions, and manage background jobs
 
 ## Requirements
 
@@ -24,13 +26,13 @@ they already have.
 Add the marketplace in Claude Code:
 
 ```bash
-/plugin marketplace add openai/codex-plugin-cc
+/plugin marketplace add kronflux/agent-plugin-cc
 ```
 
 Install the plugin:
 
 ```bash
-/plugin install codex@openai-codex
+/plugin install agent@agent-plugin-cc
 ```
 
 Reload plugins:
@@ -42,10 +44,10 @@ Reload plugins:
 Then run:
 
 ```bash
-/codex:setup
+/agent:codex-setup
 ```
 
-`/codex:setup` will tell you whether Codex is ready. If Codex is missing and npm is available, it can offer to install Codex for you.
+`/agent:codex-setup` will tell you whether Codex is ready. If Codex is missing and npm is available, it can offer to install Codex for you.
 
 If you prefer to install Codex yourself, use:
 
@@ -62,19 +64,19 @@ If Codex is installed but not logged in yet, run:
 After install, you should see:
 
 - the slash commands listed below
-- the `codex:codex-rescue` subagent in `/agents`
+- the `agent:codex-rescue` subagent in `/agents`
 
 One simple first run is:
 
 ```bash
-/codex:review --background
-/codex:status
-/codex:result
+/agent:codex-review --background
+/agent:status
+/agent:result
 ```
 
 ## Usage
 
-### `/codex:review`
+### `/agent:codex-review`
 
 Runs a normal Codex review on your current work. It gives you the same quality of code review as running `/review` inside Codex directly.
 
@@ -86,26 +88,26 @@ Use it when you want:
 - a review of your current uncommitted changes
 - a review of your branch compared to a base branch like `main`
 
-Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
+Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/agent:codex-adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
 
 Examples:
 
 ```bash
-/codex:review
-/codex:review --base main
-/codex:review --background
+/agent:codex-review
+/agent:codex-review --base main
+/agent:codex-review --background
 ```
 
-This command is read-only and will not perform any changes. When run in the background you can use [`/codex:status`](#codexstatus) to check on the progress and [`/codex:cancel`](#codexcancel) to cancel the ongoing task.
+This command is read-only and will not perform any changes. When run in the background you can use [`/agent:status`](#codexstatus) to check on the progress and [`/agent:cancel`](#codexcancel) to cancel the ongoing task.
 
-### `/codex:adversarial-review`
+### `/agent:codex-adversarial-review`
 
 Runs a **steerable** review that questions the chosen implementation and design.
 
 It can be used to pressure-test assumptions, tradeoffs, failure modes, and whether a different approach would have been safer or simpler.
 
-It uses the same review target selection as `/codex:review`, including `--base <ref>` for branch review.
-It also supports `--wait` and `--background`. Unlike `/codex:review`, it can take extra focus text after the flags.
+It uses the same review target selection as `/agent:codex-review`, including `--base <ref>` for branch review.
+It also supports `--wait` and `--background`. Unlike `/agent:codex-review`, it can take extra focus text after the flags.
 
 Use it when you want:
 
@@ -116,16 +118,16 @@ Use it when you want:
 Examples:
 
 ```bash
-/codex:adversarial-review
-/codex:adversarial-review --base main challenge whether this was the right caching and retry design
-/codex:adversarial-review --background look for race conditions and question the chosen approach
+/agent:codex-adversarial-review
+/agent:codex-adversarial-review --base main challenge whether this was the right caching and retry design
+/agent:codex-adversarial-review --background look for race conditions and question the chosen approach
 ```
 
 This command is read-only. It does not fix code.
 
-### `/codex:rescue`
+### `/agent:codex-rescue`
 
-Hands a task to Codex through the `codex:codex-rescue` subagent.
+Hands a task to Codex through the `agent:codex-rescue` subagent.
 
 Use it when you want Codex to:
 
@@ -142,12 +144,12 @@ It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--
 Examples:
 
 ```bash
-/codex:rescue investigate why the tests started failing
-/codex:rescue fix the failing test with the smallest safe patch
-/codex:rescue --resume apply the top fix from the last run
-/codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
-/codex:rescue --model spark fix the issue quickly
-/codex:rescue --background investigate the regression
+/agent:codex-rescue investigate why the tests started failing
+/agent:codex-rescue fix the failing test with the smallest safe patch
+/agent:codex-rescue --resume apply the top fix from the last run
+/agent:codex-rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
+/agent:codex-rescue --model spark fix the issue quickly
+/agent:codex-rescue --background investigate the regression
 ```
 
 You can also just ask for a task to be delegated to Codex:
@@ -162,7 +164,7 @@ Ask Codex to redesign the database connection to be more resilient.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
 
-### `/codex:transfer`
+### `/agent:codex-transfer`
 
 Creates a persistent Codex thread from the current Claude Code session and prints a `codex resume <session-id>` command.
 
@@ -171,21 +173,21 @@ Use it when you started a debugging or implementation conversation in Claude Cod
 Examples:
 
 ```bash
-/codex:transfer
-/codex:transfer --source ~/.claude/projects/-Users-me-repo/<session-id>.jsonl
+/agent:codex-transfer
+/agent:codex-transfer --source ~/.claude/projects/-Users-me-repo/<session-id>.jsonl
 ```
 
 The plugin's existing `SessionStart` hook supplies the current transcript path automatically; `--source` is available as a manual override. The transfer uses Codex's external-agent session importer, so it follows the same conversion rules as importing Claude history in the Codex App and creates visible turns that can be continued in the App or TUI. The source must be under `~/.claude/projects`, and older Codex versions that do not expose session import must be upgraded before using this command.
 
-### `/codex:status`
+### `/agent:status`
 
 Shows running and recent Codex jobs for the current repository.
 
 Examples:
 
 ```bash
-/codex:status
-/codex:status task-abc123
+/agent:status
+/agent:status task-abc123
 ```
 
 Use it to:
@@ -194,7 +196,7 @@ Use it to:
 - see the latest completed job
 - confirm whether a task is still running
 
-### `/codex:result`
+### `/agent:result`
 
 Shows the final stored Codex output for a finished job.
 When available, it also includes the Codex session ID so you can reopen that run directly in Codex with `codex resume <session-id>`.
@@ -202,33 +204,33 @@ When available, it also includes the Codex session ID so you can reopen that run
 Examples:
 
 ```bash
-/codex:result
-/codex:result task-abc123
+/agent:result
+/agent:result task-abc123
 ```
 
-### `/codex:cancel`
+### `/agent:cancel`
 
 Cancels an active background Codex job.
 
 Examples:
 
 ```bash
-/codex:cancel
-/codex:cancel task-abc123
+/agent:cancel
+/agent:cancel task-abc123
 ```
 
-### `/codex:setup`
+### `/agent:codex-setup`
 
 Checks whether Codex is installed and authenticated.
 If Codex is missing and npm is available, it can offer to install Codex for you.
 
-You can also use `/codex:setup` to manage the optional review gate.
+You can also use `/agent:codex-setup` to manage the optional review gate.
 
 #### Enabling review gate
 
 ```bash
-/codex:setup --enable-review-gate
-/codex:setup --disable-review-gate
+/agent:codex-setup --enable-review-gate
+/agent:codex-setup --disable-review-gate
 ```
 
 When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted Codex review based on Claude's response. If that review finds issues, the stop is blocked so Claude can address them first.
@@ -241,27 +243,27 @@ When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted
 ### Review Before Shipping
 
 ```bash
-/codex:review
+/agent:codex-review
 ```
 
 ### Hand A Problem To Codex
 
 ```bash
-/codex:rescue investigate why the build is failing in CI
+/agent:codex-rescue investigate why the build is failing in CI
 ```
 
 ### Start Something Long-Running
 
 ```bash
-/codex:adversarial-review --background
-/codex:rescue --background investigate the flaky test
+/agent:codex-adversarial-review --background
+/agent:codex-rescue --background investigate the flaky test
 ```
 
 Then check in with:
 
 ```bash
-/codex:status
-/codex:result
+/agent:status
+/agent:result
 ```
 
 ## Codex Integration
@@ -287,7 +289,7 @@ Check out the Codex docs for more [configuration options](https://developers.ope
 
 ### Moving The Work Over To Codex
 
-Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
+Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/agent:result` or `/agent:status` or by selecting it from the list.
 
 This way you can review the Codex work or continue the work there.
 
@@ -297,7 +299,7 @@ This way you can review the Codex work or continue the work there.
 
 If you are already signed into Codex on this machine, that account should work immediately here too. This plugin uses your local Codex CLI authentication.
 
-If you only use Claude Code today and have not used Codex yet, you will also need to sign in to Codex with either a ChatGPT account or an API key. [Codex is available with your ChatGPT subscription](https://developers.openai.com/codex/pricing/), and [`codex login`](https://developers.openai.com/codex/cli/reference/#codex-login) supports both ChatGPT and API key sign-in. Run `/codex:setup` to check whether Codex is ready, and use `!codex login` if it is not.
+If you only use Claude Code today and have not used Codex yet, you will also need to sign in to Codex with either a ChatGPT account or an API key. [Codex is available with your ChatGPT subscription](https://developers.openai.com/codex/pricing/), and [`codex login`](https://developers.openai.com/codex/cli/reference/#codex-login) supports both ChatGPT and API key sign-in. Run `/agent:codex-setup` to check whether Codex is ready, and use `!codex login` if it is not.
 
 ### Does the plugin use a separate Codex runtime?
 

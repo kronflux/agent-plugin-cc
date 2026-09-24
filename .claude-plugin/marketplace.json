@@ -1,21 +1,21 @@
 {
-  "name": "openai-codex",
+  "name": "agent-plugin-cc",
   "owner": {
-    "name": "OpenAI"
+    "name": "kronflux"
   },
   "metadata": {
-    "description": "Codex plugins to use in Claude Code for delegation and code review.",
-    "version": "1.0.6"
+    "description": "Delegate work and code review from Claude Code to external agent CLIs.",
+    "version": "2.0.0"
   },
   "plugins": [
     {
-      "name": "codex",
-      "description": "Use Codex from Claude Code to review code or delegate tasks.",
-      "version": "1.0.6",
+      "name": "agent",
+      "description": "Delegate work and code review from Claude Code to Codex and other agent CLIs.",
+      "version": "2.0.0",
       "author": {
-        "name": "OpenAI"
+        "name": "kronflux"
       },
-      "source": "./plugins/codex"
+      "source": "./plugins/agent"
     }
   ]
 }

@@ -1,9 +1,9 @@
 {
-  "name": "@openai/codex-plugin-cc",
-  "version": "1.0.6",
+  "name": "agent-plugin-cc",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "Use Codex from Claude Code to review code or delegate tasks.",
+  "description": "Delegate work and code review from Claude Code to Codex and other agent CLIs.",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=18.18.0"
@@ -11,7 +11,7 @@
   "scripts": {
     "bump-version": "node scripts/bump-version.mjs",
     "check-version": "node scripts/bump-version.mjs --check",
-    "prebuild": "mkdir -p plugins/codex/.generated/app-server-types && codex app-server generate-ts --out plugins/codex/.generated/app-server-types",
+    "prebuild": "mkdir -p plugins/agent/.generated/app-server-types && codex app-server generate-ts --out plugins/agent/.generated/app-server-types",
     "build": "tsc -p tsconfig.app-server.json",
     "test": "node --import ./tests/test-env.mjs --test tests/*.test.mjs"
   },

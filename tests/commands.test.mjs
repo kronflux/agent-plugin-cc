@@ -5,14 +5,14 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
+const PLUGIN_ROOT = path.join(ROOT, "plugins", "agent");
 
 function read(relativePath) {
   return fs.readFileSync(path.join(PLUGIN_ROOT, relativePath), "utf8");
 }
 
 test("review command uses AskUserQuestion and background Bash while staying review-only", () => {
-  const source = read("commands/review.md");
+  const source = read("commands/codex-review.md");
   assert.match(source, /AskUserQuestion/);
   assert.match(source, /\bBash\(/);
   assert.match(source, /Do not fix issues/i);
@@ -40,7 +40,7 @@ test("review command uses AskUserQuestion and background Bash while staying revi
 });
 
 test("adversarial review command uses AskUserQuestion and background Bash while staying review-only", () => {
-  const source = read("commands/adversarial-review.md");
+  const source = read("commands/codex-adversarial-review.md");
   assert.match(source, /AskUserQuestion/);
   assert.match(source, /\bBash\(/);
   assert.match(source, /Do not fix issues/i);
@@ -64,7 +64,7 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /Claude Code's `Bash\(..., run_in_background: true\)` is what actually detaches the run/i);
   assert.match(source, /When in doubt, run the review/i);
   assert.match(source, /\(Recommended\)/);
-  assert.match(source, /uses the same review target selection as `\/codex:review`/i);
+  assert.match(source, /uses the same review target selection as `\/agent:codex-review`/i);
   assert.match(source, /supports working-tree review, branch review, and `--base <ref>`/i);
   assert.match(source, /does not support `--scope staged` or `--scope unstaged`/i);
   assert.match(source, /can still take extra focus text after the flags/i);
@@ -73,33 +73,30 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
 test("continue is not exposed as a user-facing command", () => {
   const commandFiles = fs.readdirSync(path.join(PLUGIN_ROOT, "commands")).sort();
   assert.deepEqual(commandFiles, [
-    "adversarial-review.md",
     "cancel.md",
-    "rescue.md",
+    "codex-adversarial-review.md",
+    "codex-rescue.md",
+    "codex-review.md",
+    "codex-setup.md",
+    "codex-transfer.md",
     "result.md",
-    "review.md",
-    "setup.md",
-    "status.md",
-    "transfer.md"
+    "status.md"
   ]);
 });
 
 test("rescue command absorbs continue semantics", () => {
-  const rescue = read("commands/rescue.md");
+  const rescue = read("commands/codex-rescue.md");
   const agent = read("agents/codex-rescue.md");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
   const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
 
   assert.match(rescue, /The final user-visible response must be Codex's output verbatim/i);
   assert.match(rescue, /allowed-tools:\s*Bash\(node:\*\),\s*AskUserQuestion,\s*Agent/);
-  // Regression for #234: `Skill(codex:rescue)` from the main agent recursed
-  // because rescue.md named the routing with ambiguous prose ("Route this
-  // request to the `codex:codex-rescue` subagent") while running under
-  // `context: fork` — forked general-purpose subagents do not expose the
-  // `Agent` tool, so the fork fell back to `Skill` and re-entered this
-  // command. Pin the explicit transport and the inline (no-fork) execution.
-  assert.match(rescue, /subagent_type: "codex:codex-rescue"/);
-  assert.match(rescue, /do not call `Skill\(codex:codex-rescue\)`/i);
+  // The rescue command must name the Agent-tool transport explicitly and run
+  // inline. Under `context: fork` a general-purpose subagent has no `Agent`
+  // tool, falls back to `Skill(agent:codex-rescue)`, and re-enters this command.
+  assert.match(rescue, /subagent_type: "agent:codex-rescue"/);
+  assert.match(rescue, /do not call `Skill\(agent:codex-rescue\)`/i);
   assert.doesNotMatch(rescue, /^context:\s*fork\b/m);
   assert.match(rescue, /--background\|--wait/);
   assert.match(rescue, /--resume\|--fresh/);
@@ -109,7 +106,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /AskUserQuestion/);
   assert.match(rescue, /Continue current Codex thread/);
   assert.match(rescue, /Start a new Codex thread/);
-  assert.match(rescue, /run the `codex:codex-rescue` subagent in the background/i);
+  assert.match(rescue, /run the `agent:codex-rescue` subagent in the background/i);
   assert.match(rescue, /default to foreground/i);
   assert.match(rescue, /Do not forward them to `task`/i);
   assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
@@ -153,25 +150,25 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
-  assert.match(readme, /`codex:codex-rescue` subagent/i);
+  assert.match(readme, /`agent:codex-rescue` subagent/i);
   assert.match(readme, /if you do not pass `--model` or `--effort`, Codex chooses its own defaults/i);
   assert.match(readme, /--model gpt-5\.4-mini --effort medium/i);
   assert.match(readme, /`spark`, the plugin maps that to `gpt-5\.3-codex-spark`/i);
   assert.match(readme, /continue a previous Codex task/i);
-  assert.match(readme, /### `\/codex:setup`/);
-  assert.match(readme, /### `\/codex:review`/);
-  assert.match(readme, /### `\/codex:adversarial-review`/);
-  assert.match(readme, /uses the same review target selection as `\/codex:review`/i);
+  assert.match(readme, /### `\/agent:codex-setup`/);
+  assert.match(readme, /### `\/agent:codex-review`/);
+  assert.match(readme, /### `\/agent:codex-adversarial-review`/);
+  assert.match(readme, /uses the same review target selection as `\/agent:codex-review`/i);
   assert.match(readme, /--base main challenge whether this was the right caching and retry design/);
-  assert.match(readme, /### `\/codex:rescue`/);
-  assert.match(readme, /### `\/codex:transfer`/);
-  assert.match(readme, /### `\/codex:status`/);
-  assert.match(readme, /### `\/codex:result`/);
-  assert.match(readme, /### `\/codex:cancel`/);
+  assert.match(readme, /### `\/agent:codex-rescue`/);
+  assert.match(readme, /### `\/agent:codex-transfer`/);
+  assert.match(readme, /### `\/agent:status`/);
+  assert.match(readme, /### `\/agent:result`/);
+  assert.match(readme, /### `\/agent:cancel`/);
 });
 
 test("transfer, result, and cancel commands are exposed as deterministic runtime entrypoints", () => {
-  const transfer = read("commands/transfer.md");
+  const transfer = read("commands/codex-transfer.md");
   const result = read("commands/result.md");
   const cancel = read("commands/cancel.md");
   const resultHandling = read("skills/codex-result-handling/SKILL.md");
@@ -211,7 +208,7 @@ test("hooks keep session-end cleanup and stop gating enabled", () => {
 });
 
 test("setup command can offer Codex install and still points users to codex login", () => {
-  const setup = read("commands/setup.md");
+  const setup = read("commands/codex-setup.md");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
 
   assert.match(setup, /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\]'/);
@@ -220,6 +217,6 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(setup, /codex-companion\.mjs" setup --json \$ARGUMENTS/);
   assert.match(readme, /!codex login/);
   assert.match(readme, /offer to install Codex for you/i);
-  assert.match(readme, /\/codex:setup --enable-review-gate/);
-  assert.match(readme, /\/codex:setup --disable-review-gate/);
+  assert.match(readme, /\/agent:codex-setup --enable-review-gate/);
+  assert.match(readme, /\/agent:codex-setup --disable-review-gate/);
 });
