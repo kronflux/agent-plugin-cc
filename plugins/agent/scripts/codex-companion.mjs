@@ -30,8 +30,8 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  markJobCancelled,
   setConfig,
-  upsertJob,
   writeJobFile
 } from "./lib/state.mjs";
 import {
@@ -695,7 +695,6 @@ function enqueueBackgroundTask(cwd, job, request) {
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  upsertJob(job.workspaceRoot, queuedRecord);
 
   return {
     payload: {
@@ -970,6 +969,7 @@ async function handleCancel(argv) {
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
+  markJobCancelled(workspaceRoot, job.id);
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
 
@@ -1000,14 +1000,6 @@ async function handleCancel(argv) {
     ...existing,
     ...nextJob,
     cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
   });
 
   const payload = {
