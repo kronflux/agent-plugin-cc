@@ -47,7 +47,18 @@ test("setup reports ready when fake codex is installed and authenticated", () =>
 test("setup is ready without npm when Codex is already installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
-  fs.symlinkSync(process.execPath, path.join(binDir, "node"));
+  // cmd.exe finds `node` only with a PATHEXT extension. A hard link needs no symlink
+  // privilege; a copy covers a temp folder on another volume.
+  if (process.platform === "win32") {
+    const nodeCopy = path.join(binDir, "node.exe");
+    try {
+      fs.linkSync(process.execPath, nodeCopy);
+    } catch {
+      fs.copyFileSync(process.execPath, nodeCopy);
+    }
+  } else {
+    fs.symlinkSync(process.execPath, path.join(binDir, "node"));
+  }
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
     cwd: ROOT,
