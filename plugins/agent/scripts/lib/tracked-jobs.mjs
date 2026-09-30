@@ -1,9 +1,17 @@
 import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 
 import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+// Text that the command line of a job's process contains. A background worker has its job id
+// in its arguments; a foreground run is identified by the companion script name.
+export const DEFAULT_PROCESS_MARKER = "codex-companion.mjs";
+
+function processMarkerFor(jobId) {
+  return process.argv.includes(jobId) ? jobId : path.basename(process.argv[1] ?? "") || DEFAULT_PROCESS_MARKER;
+}
 
 export function nowIso() {
   return new Date().toISOString();
@@ -135,6 +143,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     startedAt: nowIso(),
     phase: "starting",
     pid: process.pid,
+    processMarker: processMarkerFor(job.id),
     logFile: options.logFile ?? job.logFile ?? null
   };
   writeJobFile(job.workspaceRoot, job.id, runningRecord);

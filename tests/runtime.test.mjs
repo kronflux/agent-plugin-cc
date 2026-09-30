@@ -1569,7 +1569,9 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
 
-  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  // The trailing argument gives the stand-in worker the command line of a companion process,
+  // which is what cancel and session cleanup check before stopping a job's PID.
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "codex-companion.mjs"], {
     cwd: workspace,
     detached: true,
     stdio: "ignore"
@@ -1848,7 +1850,9 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   fs.writeFileSync(completedJobFile, JSON.stringify({ id: "review-completed" }, null, 2), "utf8");
   fs.writeFileSync(otherJobFile, JSON.stringify({ id: "review-other" }, null, 2), "utf8");
 
-  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  // The trailing argument gives the stand-in worker the command line of a companion process,
+  // which is what cancel and session cleanup check before stopping a job's PID.
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "codex-companion.mjs"], {
     cwd: repo,
     detached: true,
     stdio: "ignore"

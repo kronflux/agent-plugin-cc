@@ -233,14 +233,20 @@ export function writeJobFile(cwd, jobId, payload) {
   return jobFile;
 }
 
-/** Merges `jobPatch` into the job's record, creating it when absent. */
-export function upsertJob(cwd, jobPatch) {
+/**
+ * Merges `jobPatch` into the job's record, creating it when absent. With `onlyIf`, the patch
+ * is applied only when the current record satisfies it; otherwise null is returned.
+ */
+export function upsertJob(cwd, jobPatch, options = {}) {
   migrateLegacyState(cwd);
   const jobFile = resolveJobFile(cwd, jobPatch.id);
   if (isRemoved(jobFile)) {
     return null;
   }
   const existing = readJsonFile(jobFile);
+  if (options.onlyIf && !options.onlyIf(existing ? applyCancelMarker(existing, jobFile) : null)) {
+    return null;
+  }
   const timestamp = nowIso();
   const next = existing
     ? { ...existing, ...jobPatch, updatedAt: timestamp }

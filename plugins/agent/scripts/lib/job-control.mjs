@@ -1,12 +1,102 @@
 import fs from "node:fs";
 
-import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
-import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
+import { loadBrokerSession } from "./broker-lifecycle.mjs";
+import { getSessionRuntimeStatus, interruptAppServerTurn } from "./codex.mjs";
+import { isProcessAlive, readProcessCommandLines, terminateProcessTree } from "./process.mjs";
+import { getConfig, listJobs, readJobFile, resolveJobFile, upsertJob } from "./state.mjs";
+import { DEFAULT_PROCESS_MARKER, nowIso, SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
 export const DEFAULT_MAX_PROGRESS_LINES = 4;
+export const WORKER_START_GRACE_MS = 30_000;
+
+function isActiveJob(job) {
+  return job.status === "queued" || job.status === "running";
+}
+
+// A dead worker's turn keeps running in a shared broker, so it is interrupted there. Without
+// a broker the turn ran in an app-server owned by the worker and ended with it.
+async function interruptOrphanedTurn(workspaceRoot, job) {
+  if (!loadBrokerSession(workspaceRoot)) {
+    return;
+  }
+  await interruptAppServerTurn(workspaceRoot, { threadId: job.threadId, turnId: job.turnId });
+}
+
+/**
+ * Marks active jobs whose worker is gone as failed and returns their ids. A job with a PID
+ * fails when that process no longer exists; a queued job without a PID fails once its worker
+ * has had `WORKER_START_GRACE_MS` to start. A record that finished in the meantime is kept.
+ */
+export async function reconcileJobLiveness(cwd, options = {}) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const now = options.now ?? Date.now();
+  const isAlive = options.isAlive ?? isProcessAlive;
+  const interruptTurn = options.interruptTurn ?? interruptOrphanedTurn;
+  const reaped = [];
+
+  for (const job of listJobs(workspaceRoot)) {
+    if (!isActiveJob(job)) {
+      continue;
+    }
+    let errorMessage = null;
+    if (job.pid == null) {
+      if (job.status === "queued" && now - Date.parse(job.createdAt ?? "") > WORKER_START_GRACE_MS) {
+        errorMessage = "The background worker did not start.";
+      }
+    } else if (!isAlive(job.pid)) {
+      errorMessage = "The worker process exited before the job finished.";
+      if (job.threadId && job.turnId) {
+        try {
+          await interruptTurn(workspaceRoot, job);
+        } catch {
+          // The job fails either way; an unreachable broker leaves nothing to interrupt.
+        }
+      }
+    }
+    if (!errorMessage) {
+      continue;
+    }
+    const updated = upsertJob(
+      workspaceRoot,
+      { id: job.id, status: "failed", phase: "failed", pid: null, errorMessage, completedAt: nowIso() },
+      { onlyIf: (current) => current !== null && isActiveJob(current) && current.pid === job.pid }
+    );
+    if (updated) {
+      reaped.push(job.id);
+    }
+  }
+  return reaped;
+}
+
+/**
+ * Stops the processes of active jobs. A PID is signalled only when its command line still
+ * identifies the job, so a PID reused by an unrelated process is left alone. When the lookup
+ * itself fails, the PID is signalled.
+ */
+export function terminateJobProcesses(jobs, options = {}) {
+  const readCommandLines = options.readCommandLines ?? readProcessCommandLines;
+  const terminate = options.terminate ?? terminateProcessTree;
+  const targets = jobs.filter((job) => isActiveJob(job) && Number.isInteger(job.pid) && job.pid > 0);
+  const commandLines = targets.length > 0 ? readCommandLines(targets.map((job) => job.pid)) : new Map();
+
+  return targets.map((job) => {
+    if (commandLines && !commandLines.has(job.pid)) {
+      return { jobId: job.id, pid: job.pid, outcome: "not-running" };
+    }
+    const marker = job.processMarker ?? DEFAULT_PROCESS_MARKER;
+    if (commandLines && !commandLines.get(job.pid).includes(marker)) {
+      return { jobId: job.id, pid: job.pid, outcome: "pid-reused" };
+    }
+    try {
+      const result = terminate(job.pid);
+      return { jobId: job.id, pid: job.pid, outcome: result?.delivered === false ? "not-running" : "terminated" };
+    } catch (error) {
+      return { jobId: job.id, pid: job.pid, outcome: "failed", detail: error instanceof Error ? error.message : String(error) };
+    }
+  });
+}
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));

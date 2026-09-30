@@ -24,7 +24,7 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -38,9 +38,11 @@ import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
   readStoredJob,
+  reconcileJobLiveness,
   resolveCancelableJob,
   resolveResultJob,
-  sortJobsNewestFirst
+  sortJobsNewestFirst,
+  terminateJobProcesses
 } from "./lib/job-control.mjs";
 import {
   appendLogLine,
@@ -319,10 +321,12 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
   const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   const deadline = Date.now() + timeoutMs;
+  await reconcileJobLiveness(cwd);
   let snapshot = buildSingleJobSnapshot(cwd, reference);
 
   while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
     await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
+    await reconcileJobLiveness(cwd);
     snapshot = buildSingleJobSnapshot(cwd, reference);
   }
 
@@ -335,6 +339,7 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  await reconcileJobLiveness(workspaceRoot);
   const sessionId = getCurrentClaudeSessionId();
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
@@ -685,16 +690,28 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  // The record exists before the worker starts, because the worker reads its request from it.
+  // The worker records its own PID when it starts running.
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
+  const child = spawnDetachedTaskWorker(cwd, job.id);
+  if (!child.pid) {
+    writeJobFile(job.workspaceRoot, job.id, {
+      ...queuedRecord,
+      status: "failed",
+      phase: "failed",
+      errorMessage: "The background worker could not be started.",
+      completedAt: nowIso()
+    });
+    throw new Error("The background worker could not be started.");
+  }
 
   return {
     payload: {
@@ -850,6 +867,11 @@ async function handleTaskWorker(argv) {
     throw new Error(`No stored job found for ${options["job-id"]}.`);
   }
 
+  // A job cancelled or failed while queued is not run.
+  if (storedJob.status !== "queued") {
+    return;
+  }
+
   const request = storedJob.request;
   if (!request || typeof request !== "object") {
     throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
@@ -887,6 +909,9 @@ async function handleStatus(argv) {
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
+  if (!options.wait) {
+    await reconcileJobLiveness(cwd);
+  }
   if (reference) {
     const snapshot = options.wait
       ? await waitForSingleJobSnapshot(cwd, reference, {
@@ -906,7 +931,7 @@ async function handleStatus(argv) {
   outputResult(renderStatusPayload(report, options.json), options.json);
 }
 
-function handleResult(argv) {
+async function handleResult(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
     booleanOptions: ["json"]
@@ -914,6 +939,7 @@ function handleResult(argv) {
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
+  await reconcileJobLiveness(cwd);
   const { workspaceRoot, job } = resolveResultJob(cwd, reference);
   const storedJob = readStoredJob(workspaceRoot, job.id);
   const payload = {
@@ -924,7 +950,7 @@ function handleResult(argv) {
   outputCommandResult(payload, renderStoredJobResult(job, storedJob), options.json);
 }
 
-function handleTaskResumeCandidate(argv) {
+async function handleTaskResumeCandidate(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
     booleanOptions: ["json"]
@@ -933,6 +959,7 @@ function handleTaskResumeCandidate(argv) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentClaudeSessionId();
+  await reconcileJobLiveness(workspaceRoot);
   const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
   const candidate = findLatestResumableTaskJob(jobs);
 
@@ -967,6 +994,7 @@ async function handleCancel(argv) {
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
+  await reconcileJobLiveness(cwd);
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
   markJobCancelled(workspaceRoot, job.id);
@@ -983,7 +1011,12 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
+  const [termination] = terminateJobProcesses([{ ...job, ...existing }]);
+  if (termination?.outcome === "pid-reused") {
+    appendLogLine(job.logFile, `Process ${termination.pid} no longer belongs to this job; it was not stopped.`);
+  } else if (termination?.outcome === "failed") {
+    appendLogLine(job.logFile, `Stopping process ${termination.pid} failed: ${termination.detail}`);
+  }
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();
@@ -1045,10 +1078,10 @@ async function main() {
       await handleStatus(argv);
       break;
     case "result":
-      handleResult(argv);
+      await handleResult(argv);
       break;
     case "task-resume-candidate":
-      handleTaskResumeCandidate(argv);
+      await handleTaskResumeCandidate(argv);
       break;
     case "cancel":
       await handleCancel(argv);

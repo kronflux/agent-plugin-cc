@@ -132,6 +132,56 @@ function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
 }
 
+/**
+ * Returns a Map from PID to command line for the listed processes that are running, or null
+ * when the lookup itself failed. A PID missing from the Map is not running.
+ */
+export function readProcessCommandLines(pids, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  const ids = [...new Set(pids.filter((pid) => Number.isInteger(pid) && pid > 0))];
+  const found = new Map();
+  if (ids.length === 0) {
+    return found;
+  }
+
+  if (platform === "linux") {
+    for (const pid of ids) {
+      try {
+        found.set(pid, fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" ").trim());
+      } catch (error) {
+        if (error?.code !== "ENOENT") {
+          return null;
+        }
+      }
+    }
+    return found;
+  }
+
+  const lookup =
+    platform === "win32"
+      ? runCommandImpl("powershell.exe", [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `Get-CimInstance Win32_Process -Filter '${ids.map((pid) => `ProcessId=${pid}`).join(" OR ")}' | ` +
+            'ForEach-Object { "$($_.ProcessId) $($_.CommandLine)" }'
+        ])
+      : runCommandImpl("ps", ["-o", "pid=,command=", "-p", ids.join(",")]);
+  // ps exits 1 when none of the processes exist, which is a valid answer.
+  const psFoundNone = platform !== "win32" && lookup.status === 1 && !lookup.stdout.trim();
+  if (lookup.error || (lookup.status !== 0 && !psFoundNone)) {
+    return null;
+  }
+  for (const line of lookup.stdout.split(/\r?\n/)) {
+    const match = /^\s*(\d+)\s?(.*)$/.exec(line);
+    if (match) {
+      found.set(Number(match[1]), match[2].trim());
+    }
+  }
+  return found;
+}
+
 export function isProcessAlive(pid, killImpl = process.kill.bind(process)) {
   try {
     killImpl(pid, 0);
