@@ -318,6 +318,13 @@ rl.on("line", (line) => {
         break;
       }
 
+      case "thread/unsubscribe": {
+        state.unsubscribedThreads = [...(state.unsubscribedThreads ?? []), message.params.threadId];
+        saveState(state);
+        send({ id: message.id, result: {} });
+        break;
+      }
+
       case "thread/name/set": {
         const thread = ensureThread(state, message.params.threadId);
         thread.name = message.params.name;

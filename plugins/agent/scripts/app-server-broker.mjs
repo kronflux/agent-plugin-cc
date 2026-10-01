@@ -10,6 +10,24 @@ import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+const THREAD_LOADING_METHODS = new Set(["thread/start", "thread/resume", "thread/fork"]);
+const DEFAULT_IDLE_MS = 30 * 60 * 1000;
+const SHUTDOWN_APP_SERVER_MS = 5000;
+const SHUTDOWN_SOCKET_GRACE_MS = 1000;
+
+// CODEX_BROKER_IDLE_MS sets how long the broker runs with no client connected. Zero or a
+// negative value keeps it running until it is told to stop.
+function readIdleTimeoutMs() {
+  const raw = (process.env.CODEX_BROKER_IDLE_MS ?? "").trim();
+  if (!/^-?\d+$/.test(raw)) {
+    return DEFAULT_IDLE_MS;
+  }
+  return Math.min(Number(raw), 2 ** 31 - 1);
+}
+
+function withTimeout(promise, milliseconds) {
+  return Promise.race([promise, new Promise((resolve) => setTimeout(resolve, milliseconds).unref())]);
+}
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -70,6 +88,12 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  // Threads each client loaded, so they can be unloaded from the shared app-server when the
+  // client disconnects.
+  const socketThreads = new Map();
+  let shuttingDown = null;
+  let idleTimer = null;
+  const idleTimeoutMs = readIdleTimeoutMs();
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -99,24 +123,87 @@ async function main() {
     }
   }
 
-  async function shutdown(server) {
-    for (const socket of sockets) {
-      socket.end();
+  // Every step is bounded, so a client that never closes its side or an app-server that
+  // never exits cannot keep the broker alive. Later callers wait for the same shutdown.
+  function shutdown(server) {
+    shuttingDown ??= (async () => {
+      clearTimeout(idleTimer);
+      for (const socket of sockets) {
+        socket.end();
+      }
+      const socketsClosed = setTimeout(() => {
+        for (const socket of sockets) {
+          socket.destroy();
+        }
+      }, SHUTDOWN_SOCKET_GRACE_MS);
+      socketsClosed.unref();
+      await withTimeout(appClient.close().catch(() => {}), SHUTDOWN_APP_SERVER_MS);
+      await withTimeout(new Promise((resolve) => server.close(resolve)), SHUTDOWN_SOCKET_GRACE_MS * 2);
+      if (listenTarget.kind === "unix") {
+        fs.rmSync(listenTarget.path, { force: true });
+      }
+      if (pidFile) {
+        fs.rmSync(pidFile, { force: true });
+      }
+    })();
+    return shuttingDown;
+  }
+
+  function isIdle() {
+    return sockets.size === 0 && !activeRequestSocket && !activeStreamSocket;
+  }
+
+  function scheduleIdleShutdown() {
+    clearTimeout(idleTimer);
+    if (idleTimeoutMs <= 0 || !isIdle()) {
+      return;
     }
-    await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
-    if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
-      fs.unlinkSync(listenTarget.path);
+    idleTimer = setTimeout(async () => {
+      if (isIdle()) {
+        await shutdown(server);
+        process.exit(0);
+      }
+    }, idleTimeoutMs);
+  }
+
+  function rememberThread(socket, threadId) {
+    if (!threadId) {
+      return;
     }
-    if (pidFile && fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
+    if (!socketThreads.has(socket)) {
+      socketThreads.set(socket, new Set());
     }
+    socketThreads.get(socket).add(threadId);
+  }
+
+  // A thread still streaming to this client, or loaded by another client, stays loaded.
+  function unloadThreadsOf(socket) {
+    const threads = socketThreads.get(socket);
+    socketThreads.delete(socket);
+    for (const threadId of threads ?? []) {
+      const inUse =
+        activeStreamThreadIds?.has(threadId) ||
+        [...socketThreads.values()].some((other) => other.has(threadId));
+      if (!inUse) {
+        appClient.request("thread/unsubscribe", { threadId }).catch(() => {});
+      }
+    }
+  }
+
+  function handleSocketGone(socket) {
+    if (!sockets.delete(socket)) {
+      return;
+    }
+    unloadThreadsOf(socket);
+    clearSocketOwnership(socket);
+    scheduleIdleShutdown();
   }
 
   appClient.setNotificationHandler(routeNotification);
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
+    clearTimeout(idleTimer);
     socket.setEncoding("utf8");
     let buffer = "";
 
@@ -158,7 +245,20 @@ async function main() {
         }
 
         if (message.id !== undefined && message.method === "broker/shutdown") {
-          send(socket, { id: message.id, result: {} });
+          send(socket, { id: message.id, result: { stopped: true } });
+          await shutdown(server);
+          process.exit(0);
+        }
+
+        // Stops the broker only when the requesting client is its only client and no request
+        // or turn is in progress, so a session ending does not stop another session's work.
+        if (message.id !== undefined && message.method === "broker/shutdownIfIdle") {
+          const otherClients = [...sockets].some((other) => other !== socket);
+          if (otherClients || activeRequestSocket || activeStreamSocket) {
+            send(socket, { id: message.id, result: { stopped: false } });
+            continue;
+          }
+          send(socket, { id: message.id, result: { stopped: true } });
           await shutdown(server);
           process.exit(0);
         }
@@ -200,6 +300,9 @@ async function main() {
         try {
           const result = await appClient.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
+          if (THREAD_LOADING_METHODS.has(message.method)) {
+            rememberThread(socket, result?.thread?.id ?? message.params?.threadId);
+          }
           if (isStreaming) {
             activeStreamSocket = socket;
             activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
@@ -222,15 +325,8 @@ async function main() {
       }
     });
 
-    socket.on("close", () => {
-      sockets.delete(socket);
-      clearSocketOwnership(socket);
-    });
-
-    socket.on("error", () => {
-      sockets.delete(socket);
-      clearSocketOwnership(socket);
-    });
+    socket.on("close", () => handleSocketGone(socket));
+    socket.on("error", () => handleSocketGone(socket));
   });
 
   process.on("SIGTERM", async () => {
@@ -243,7 +339,7 @@ async function main() {
     process.exit(0);
   });
 
-  server.listen(listenTarget.path);
+  server.listen(listenTarget.path, scheduleIdleShutdown);
 }
 
 main().catch((error) => {

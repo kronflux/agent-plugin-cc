@@ -7,10 +7,11 @@ import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
   clearBrokerSession,
+  isBrokerProcess,
   LOG_FILE_ENV,
   loadBrokerSession,
   PID_FILE_ENV,
-  sendBrokerShutdown,
+  requestBrokerShutdownIfIdle,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
 import { terminateJobProcesses } from "./lib/job-control.mjs";
@@ -53,10 +54,31 @@ function cleanupSessionJobs(cwd, sessionId) {
   }
 }
 
+// A broker that exited, for example after its idle timeout, leaves its session record and
+// files behind; they are removed so the next command starts a new broker without probing.
+function removeExitedBrokerSession(cwd) {
+  const session = loadBrokerSession(cwd);
+  if (!session || isBrokerProcess(session.pid)) {
+    return;
+  }
+  teardownBrokerSession({
+    endpoint: session.endpoint ?? null,
+    pidFile: session.pidFile ?? null,
+    logFile: session.logFile ?? null,
+    sessionDir: session.sessionDir ?? null
+  });
+  clearBrokerSession(cwd);
+}
+
 function handleSessionStart(input) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
+  try {
+    removeExitedBrokerSession(input.cwd || process.cwd());
+  } catch {
+    // A failed cleanup must not stop the session from starting.
+  }
 }
 
 async function handleSessionEnd(input) {
@@ -76,11 +98,15 @@ async function handleSessionEnd(input) {
   const sessionDir = brokerSession?.sessionDir ?? null;
   const pid = brokerSession?.pid ?? null;
 
-  if (brokerEndpoint) {
-    await sendBrokerShutdown(brokerEndpoint);
-  }
-
+  // This session's jobs stop first, so their connections no longer count against the broker.
+  // The broker then stops only if no other session is using it.
   cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
+  if (!brokerEndpoint) {
+    return;
+  }
+  if ((await requestBrokerShutdownIfIdle(brokerEndpoint)) === "busy") {
+    return;
+  }
   teardownBrokerSession({
     endpoint: brokerEndpoint,
     pidFile,
