@@ -23,7 +23,7 @@ function readJobsState(stateDir) {
   const jobsDir = path.join(stateDir, "jobs");
   const jobs = fs
     .readdirSync(jobsDir)
-    .filter((name) => name.endsWith(".json"))
+    .filter((name) => name.endsWith(".json") && !name.endsWith(".request.json"))
     .map((name) => JSON.parse(fs.readFileSync(path.join(jobsDir, name), "utf8")))
     .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
   return { jobs };

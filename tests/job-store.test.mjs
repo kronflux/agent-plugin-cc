@@ -165,21 +165,19 @@ test("pruning deletes removal markers older than an hour", () => {
   assert.equal(fs.existsSync(recentMarker), true);
 });
 
-test("job listings omit request and result fields", () => {
+test("job listings omit result fields that the full record keeps", () => {
   const workspace = makeTempDir();
   writeJobFile(workspace, "task-3", {
     id: "task-3",
     status: "completed",
-    request: { prompt: "private prompt" },
     result: { text: "answer" },
     rendered: "answer"
   });
 
   const [listed] = listJobs(workspace);
-  assert.equal("request" in listed, false);
   assert.equal("result" in listed, false);
   assert.equal("rendered" in listed, false);
-  assert.equal(readJobFile(resolveJobFile(workspace, "task-3")).request.prompt, "private prompt");
+  assert.equal(readJobFile(resolveJobFile(workspace, "task-3")).rendered, "answer");
 });
 
 test("a legacy state.json index becomes job files and a config file", () => {

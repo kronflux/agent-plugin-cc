@@ -32,6 +32,7 @@ import {
   listJobs,
   markJobCancelled,
   setConfig,
+  takeJobRequest,
   writeJobFile
 } from "./lib/state.mjs";
 import {
@@ -872,9 +873,11 @@ async function handleTaskWorker(argv) {
     return;
   }
 
-  const request = storedJob.request;
+  const request = takeJobRequest(workspaceRoot, options["job-id"]);
   if (!request || typeof request !== "object") {
-    throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
+    const errorMessage = `Stored job ${options["job-id"]} is missing its task request payload.`;
+    writeJobFile(workspaceRoot, storedJob.id, { ...storedJob, status: "failed", phase: "failed", errorMessage, completedAt: nowIso() });
+    throw new Error(errorMessage);
   }
 
   const { logFile, progress } = createTrackedProgress(

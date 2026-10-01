@@ -4,10 +4,15 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
+import { redactSecrets } from "./redact.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
-const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
+// The temp directory is shared by all users on POSIX systems, so the fallback root is per user.
+const FALLBACK_STATE_ROOT_DIR = path.join(
+  os.tmpdir(),
+  typeof process.getuid === "function" ? `agent-plugin-${process.getuid()}` : "agent-plugin"
+);
 const LEGACY_STATE_FILE_NAME = "state.json";
 const CONFIG_FILE_NAME = "config.json";
 const JOBS_DIR_NAME = "jobs";
@@ -16,9 +21,15 @@ const ACTIVE_STATUSES = new Set(["queued", "running"]);
 const CANCELLED_MARKER_SUFFIX = ".cancelled";
 const REMOVED_MARKER_SUFFIX = ".removed";
 const REMOVED_MARKER_LIFETIME_MS = 60 * 60 * 1000;
+const REQUEST_FILE_SUFFIX = ".request.json";
+const PRIVATE_DIR_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
 const DEFAULT_CONFIG = Object.freeze({ stopReviewGate: false });
-// Fields that hold prompts and results. Job listings omit them; `readJobFile` returns them.
+// Fields that hold results, or the prompt in records written before requests had their own
+// file. Job listings omit them; `readJobFile` returns them.
 const DETAIL_FIELDS = ["request", "result", "rendered"];
+// Free-text fields that can repeat a prompt or a credential from tool output.
+const REDACTED_FIELDS = ["summary", "errorMessage"];
 
 // On Windows, replacing a file that another process has open fails with EPERM, EACCES, or
 // EBUSY until that process closes it, so the rename is retried for a bounded time.
@@ -77,14 +88,34 @@ export function resolveJobsDir(cwd) {
   return path.join(resolveStateDir(cwd), JOBS_DIR_NAME);
 }
 
+// State directories hold prompts and Codex output, so on POSIX systems they are readable by
+// their owner only, including directories created before this mode was applied.
+const privateDirs = new Set();
+
+function ensurePrivateDir(dir) {
+  if (privateDirs.has(dir)) {
+    return;
+  }
+  fs.mkdirSync(dir, { recursive: true, mode: PRIVATE_DIR_MODE });
+  if (process.platform !== "win32") {
+    fs.chmodSync(dir, PRIVATE_DIR_MODE);
+    fs.chmodSync(path.dirname(dir), PRIVATE_DIR_MODE);
+  }
+  privateDirs.add(dir);
+}
+
 export function ensureStateDir(cwd) {
-  fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
+  ensurePrivateDir(resolveJobsDir(cwd));
+}
+
+function isRecordFile(name) {
+  return name.endsWith(".json") && !name.endsWith(REQUEST_FILE_SUFFIX);
 }
 
 function writeJsonAtomic(filePath, value) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  ensurePrivateDir(path.dirname(filePath));
   const tempFile = `${filePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  fs.writeFileSync(tempFile, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  fs.writeFileSync(tempFile, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: PRIVATE_FILE_MODE });
   const deadline = Date.now() + RENAME_RETRY_LIMIT_MS;
   for (let delay = 10; ; delay = Math.min(delay * 2, 100)) {
     try {
@@ -140,6 +171,31 @@ function applyCancelMarker(record, jobFile) {
   return { ...record, status: "cancelled", phase: "cancelled", pid: null };
 }
 
+function requestFile(jobFile) {
+  return jobFile.replace(/\.json$/, REQUEST_FILE_SUFFIX);
+}
+
+// Writes a job record. A `request` field holds the prompt, so it is never kept in the record:
+// while the job is active it goes to the job's private request file, and once the job has
+// finished that file is deleted. Summaries and error messages are redacted.
+function storeRecord(jobFile, record) {
+  const { request, ...stored } = record;
+  for (const field of REDACTED_FIELDS) {
+    if (typeof stored[field] === "string") {
+      stored[field] = redactSecrets(stored[field]);
+    }
+  }
+  const active = ACTIVE_STATUSES.has(stored.status);
+  if (request !== undefined && active) {
+    writeJsonAtomic(requestFile(jobFile), request);
+  }
+  writeJsonAtomic(jobFile, stored);
+  if (!active) {
+    fs.rmSync(requestFile(jobFile), { force: true });
+  }
+  return stored;
+}
+
 function summarizeJob(record) {
   const summary = { ...record };
   for (const field of DETAIL_FIELDS) {
@@ -174,7 +230,7 @@ function migrateLegacyState(cwd) {
       } catch {
         stored = null;
       }
-      writeJsonAtomic(jobFile, { ...(stored ?? {}), ...entry });
+      storeRecord(jobFile, { ...(stored ?? {}), ...entry });
     }
     const configFile = path.join(stateDir, CONFIG_FILE_NAME);
     if (legacy.config && !fs.existsSync(configFile)) {
@@ -229,8 +285,16 @@ export function writeJobFile(cwd, jobId, payload) {
     return jobFile;
   }
   const timestamp = nowIso();
-  writeJsonAtomic(jobFile, applyCancelMarker({ createdAt: timestamp, ...payload, updatedAt: timestamp }, jobFile));
+  storeRecord(jobFile, applyCancelMarker({ createdAt: timestamp, ...payload, updatedAt: timestamp }, jobFile));
   return jobFile;
+}
+
+/** Reads and deletes a job's request, which holds its prompt. Returns null when absent. */
+export function takeJobRequest(cwd, jobId) {
+  const file = requestFile(resolveJobFile(cwd, jobId));
+  const request = readJsonFile(file);
+  fs.rmSync(file, { force: true });
+  return request;
 }
 
 /**
@@ -251,8 +315,7 @@ export function upsertJob(cwd, jobPatch, options = {}) {
   const next = existing
     ? { ...existing, ...jobPatch, updatedAt: timestamp }
     : { createdAt: timestamp, updatedAt: timestamp, ...jobPatch };
-  const stored = applyCancelMarker(next, jobFile);
-  writeJsonAtomic(jobFile, stored);
+  const stored = storeRecord(jobFile, applyCancelMarker(next, jobFile));
   if (!existing) {
     pruneFinishedJobs(cwd);
   }
@@ -272,7 +335,7 @@ export function listJobs(cwd) {
       continue;
     }
     for (const name of names) {
-      if (!name.endsWith(".json")) {
+      if (!isRecordFile(name)) {
         continue;
       }
       const jobFile = path.join(jobsDir, name);
@@ -289,6 +352,10 @@ export function listJobs(cwd) {
       if (typeof record?.id !== "string" || jobs.has(record.id)) {
         continue;
       }
+      // Records written before requests had their own file still hold the prompt.
+      if (record.request !== undefined) {
+        record = storeRecord(jobFile, record);
+      }
       jobs.set(record.id, summarizeJob(applyCancelMarker(record, jobFile)));
     }
   }
@@ -298,6 +365,7 @@ export function listJobs(cwd) {
 function removeJobArtifacts(jobFile, record) {
   fs.rmSync(jobFile, { force: true });
   fs.rmSync(markerFile(jobFile, CANCELLED_MARKER_SUFFIX), { force: true });
+  fs.rmSync(requestFile(jobFile), { force: true });
   if (record?.logFile) {
     fs.rmSync(record.logFile, { force: true });
   }
@@ -320,7 +388,7 @@ function pruneFinishedJobs(cwd) {
       }
       continue;
     }
-    if (!name.endsWith(".json")) {
+    if (!isRecordFile(name)) {
       continue;
     }
     const jobFile = path.join(jobsDir, name);
