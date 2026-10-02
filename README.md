@@ -238,6 +238,9 @@ You can also use `/agent:codex-setup` to manage the optional review gate.
 
 When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted Codex review based on Claude's response. If that review finds issues, the stop is blocked so Claude can address them first.
 
+After three blocks in a row in one Claude session, the next stop is allowed. Set
+`CODEX_REVIEW_GATE_MAX_ROUNDS` to change the limit, or to `0` to remove it.
+
 > [!WARNING]
 > The review gate can create a long-running Claude/Codex loop and may drain usage limits quickly. Only enable it when you plan to actively monitor the session.
 

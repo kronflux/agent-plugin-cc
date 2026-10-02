@@ -235,9 +235,12 @@ function structuredReviewPayload(prompt) {
 function taskPayload(prompt, resume) {
   if (prompt.includes("<task>") && prompt.includes("Only review the work from the previous Claude turn.")) {
     if (BEHAVIOR === "adversarial-clean") {
-      return "ALLOW: No blocking issues found in the previous turn.";
+      return JSON.stringify({ verdict: "allow", reason: "No blocking issues found in the previous turn." });
     }
-    return "BLOCK: Missing empty-state guard in src/app.js:4-6.";
+    if (BEHAVIOR === "gate-prose-block") {
+      return JSON.stringify({ verdict: "allow", reason: "BLOCK: appears only in this reason text." });
+    }
+    return JSON.stringify({ verdict: "block", reason: "Missing empty-state guard in src/app.js:4-6." });
   }
 
   if (resume || prompt.includes("Continue from the current thread state") || prompt.includes("follow up")) {
@@ -461,7 +464,10 @@ rl.on("line", (line) => {
 	        saveState(state);
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
-        const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
+        const isGateReview = prompt.includes("Only review the work from the previous Claude turn.");
+        state.lastTurnStart.outputSchema = message.params.outputSchema ?? null;
+        saveState(state);
+        const payload = !isGateReview && message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
           : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
 
