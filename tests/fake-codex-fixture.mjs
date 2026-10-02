@@ -145,6 +145,13 @@ function nextTurnId(state) {
   return turnId;
 }
 
+// Codex records Windows source paths in extended-length form.
+const LONG_PATH_PREFIX = String.fromCharCode(92, 92, 63, 92);
+
+function ledgerSourcePath(sourcePath) {
+  return process.platform === "win32" ? LONG_PATH_PREFIX + sourcePath : sourcePath;
+}
+
 function importLedgerPath() {
   return path.join(process.env.CODEX_HOME || path.join(process.env.HOME, ".codex"), "external_agent_session_imports.json");
 }
@@ -397,11 +404,44 @@ rl.on("line", (line) => {
           throw new Error("missing external session migration");
         }
         const sourcePath = fs.realpathSync(session.path);
+        state.nextImportId = (state.nextImportId || 0) + 1;
+        const importId = "import_" + state.nextImportId;
+        if (BEHAVIOR === "external-import-ledger-only" || BEHAVIOR === "external-import-stale-ledger") {
+          const stale = BEHAVIOR === "external-import-stale-ledger";
+          const ledgerThread = nextThread(state, session.cwd, false);
+          const staleLedger = loadImportLedger();
+          staleLedger.records.push({
+            source_path: process.platform === "win32" ? ledgerSourcePath(sourcePath).toUpperCase() : sourcePath,
+            content_sha256: "0".repeat(64),
+            imported_thread_id: ledgerThread.id,
+            imported_at: stale ? now() - 3600 : now(),
+            source_modified_at: null
+          });
+          saveState(state);
+          saveImportLedger(staleLedger);
+          send({ id: message.id, result: { importId } });
+          send({
+            method: "externalAgentConfig/import/completed",
+            params: {
+              importId,
+              itemTypeResults: [
+                {
+                  itemType: "SESSIONS",
+                  successes: [],
+                  failures: stale
+                    ? [{ itemType: "SESSIONS", failureStage: "session_missing", message: "external agent session was not detected for import: " + sourcePath }]
+                    : []
+                }
+              ]
+            }
+          });
+          break;
+        }
         const contents = fs.readFileSync(sourcePath, "utf8");
         const contentSha256 = crypto.createHash("sha256").update(contents).digest("hex");
         const ledger = loadImportLedger();
         let record = ledger.records.find(
-          (candidate) => candidate.source_path === sourcePath && candidate.content_sha256 === contentSha256
+          (candidate) => candidate.source_path === ledgerSourcePath(sourcePath) && candidate.content_sha256 === contentSha256
         );
         let thread;
         if (record) {
@@ -418,18 +458,65 @@ rl.on("line", (line) => {
           thread.visibleMessages = messages;
           state.lastExternalAgentImport = { sourcePath, threadId: thread.id, messages };
           record = {
-            source_path: sourcePath,
+            source_path: ledgerSourcePath(sourcePath),
             content_sha256: contentSha256,
             imported_thread_id: thread.id,
             imported_at: now(),
             source_modified_at: null
           };
           ledger.records.push(record);
-          saveState(state);
           saveImportLedger(ledger);
         }
-        send({ id: message.id, result: {} });
-        send({ method: "externalAgentConfig/import/completed", params: {} });
+        saveState(state);
+        send({ id: message.id, result: { importId } });
+        send({
+          method: "externalAgentConfig/import/completed",
+          params: {
+            importId,
+            itemTypeResults: [
+              {
+                itemType: "SESSIONS",
+                successes: [{ itemType: "SESSIONS", cwd: session.cwd, source: ledgerSourcePath(sourcePath), target: thread.id, title: thread.name }],
+                failures: []
+              }
+            ]
+          }
+        });
+        break;
+      }
+
+      case "account/rateLimits/read": {
+        if (BEHAVIOR === "rate-limits-fail") {
+          send({ id: message.id, error: { code: -32603, message: "failed to fetch codex rate limits: not signed in" } });
+          break;
+        }
+        const codexLimits = {
+          limitId: "codex",
+          limitName: null,
+          primary: { usedPercent: 42, windowDurationMins: 300, resetsAt: 1790990000 },
+          secondary: { usedPercent: 7, windowDurationMins: 10080, resetsAt: 1791500000 },
+          credits: { hasCredits: true, unlimited: false, balance: "12.50" },
+          planType: "plus",
+          rateLimitReachedType: null
+        };
+        send({
+          id: message.id,
+          result: {
+            rateLimits: codexLimits,
+            rateLimitsByLimitId: {
+              codex: codexLimits,
+              "codex-spark": {
+                limitId: "codex-spark",
+                limitName: "GPT-5.3-Codex-Spark",
+                primary: { usedPercent: 90, windowDurationMins: 300, resetsAt: 1790990000 },
+                secondary: null,
+                credits: null,
+                planType: "plus",
+                rateLimitReachedType: null
+              }
+            }
+          }
+        });
         break;
       }
 

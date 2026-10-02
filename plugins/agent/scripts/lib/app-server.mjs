@@ -69,6 +69,8 @@ export class AppServerClientBase {
     this.notificationHandler = null;
     this.lineBuffer = "";
     this.transport = "unknown";
+    // The server's `initialize` result: userAgent, codexHome, platformFamily, platformOs.
+    this.serverInfo = null;
 
     this.exitPromise = new Promise((resolve) => {
       this.resolveExit = resolve;
@@ -272,7 +274,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.handleLine(line);
     });
 
-    await this.request("initialize", {
+    this.serverInfo = await this.request("initialize", {
       clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
       capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
     });
@@ -351,7 +353,7 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
       });
     });
 
-    await this.request("initialize", {
+    this.serverInfo = await this.request("initialize", {
       clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
       capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
     });

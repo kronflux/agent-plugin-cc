@@ -17,11 +17,12 @@ import {
     importExternalAgentSession,
     interruptAppServerTurn,
     parseStructuredOutput,
+    readCodexRateLimits,
     readOutputSchema,
     runAppServerReview,
     runAppServerTurn
   } from "./lib/codex.mjs";
-import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
+import { resolveClaudeSessionPath, stageClaudeSessionForImport } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { KNOWN_REASONING_EFFORTS } from "./lib/model-catalog.mjs";
@@ -66,7 +67,8 @@ import {
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
-  renderTaskResult
+  renderTaskResult,
+  renderUsageReport
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -85,8 +87,9 @@ const SUBCOMMAND_USAGE = {
   setup: `setup [--enable-review-gate|--disable-review-gate] [--write-sandbox <${WRITE_SANDBOXES.join("|")}>] [--json]`,
   review: `review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark>] [--effort ${EFFORT_USAGE}]`,
   "adversarial-review": `adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark>] [--effort ${EFFORT_USAGE}] [focus text]`,
-  task: `task [--background] [--write] [--resume-last|--resume|--resume-thread <thread-id>|--fresh] [--model <model|spark>] [--effort ${EFFORT_USAGE}] [--output-schema <file>] [--] [prompt]`,
+  task: `task [--background] [--write] [--resume-last|--resume|--resume-thread <thread-id>|--fresh] [--from-last-review] [--model <model|spark>] [--effort ${EFFORT_USAGE}] [--output-schema <file>] [--] [prompt]`,
   transfer: "transfer [--source <claude-jsonl>] [--json]",
+  usage: "usage [--json]",
   status: "status [job-id] [--wait] [--timeout-ms <ms>] [--all] [--json]",
   result: "result [job-id] [--json]",
   cancel: "cancel [job-id] [--json]"
@@ -219,6 +222,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     npm: npmStatus,
     codex: codexStatus,
     auth: authStatus,
+    appServer: authStatus.userAgent ?? null,
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
     writeSandbox: config.writeSandbox ?? "workspace-write",
@@ -659,7 +663,13 @@ async function executeTransfer(cwd, options = {}) {
   const sourcePath = resolveClaudeSessionPath(cwd, {
     source: options.source
   });
-  const result = await importExternalAgentSession(cwd, { sourcePath });
+  const importSource = stageClaudeSessionForImport(sourcePath);
+  let result;
+  try {
+    result = await importExternalAgentSession(cwd, { sourcePath: importSource.path });
+  } finally {
+    importSource.cleanup();
+  }
   const payload = {
     threadId: result.threadId,
     resumeCommand: `codex resume ${result.threadId}`,
@@ -804,10 +814,44 @@ async function handleReview(argv) {
   });
 }
 
+// Builds a task prompt from the newest finished review in this repository, preferring reviews
+// run from the current Claude session.
+function buildReviewHandoffPrompt(workspaceRoot, userRequest) {
+  const reviews = sortJobsNewestFirst(filterJobsForCurrentClaudeSession(listJobs(workspaceRoot))).filter(
+    (job) => job.jobClass === "review" && job.status === "completed"
+  );
+  for (const job of reviews) {
+    const stored = readStoredJob(workspaceRoot, job.id);
+    const output = String(stored?.rendered ?? stored?.result?.codex?.stdout ?? "").trim();
+    if (!output) {
+      continue;
+    }
+    return interpolateTemplate(loadPromptTemplate(ROOT_DIR, "review-handoff"), {
+      TARGET_LABEL: stored?.result?.target?.label ?? "the reviewed changes",
+      REVIEW_OUTPUT: output,
+      USER_REQUEST: userRequest?.trim() ? `Instructions from the user:
+${userRequest.trim()}` : ""
+    });
+  }
+  throw new Error(
+    "No finished Codex review with output was found for this repository. Run /agent:codex-review or /agent:codex-adversarial-review first."
+  );
+}
+
+async function handleUsage(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+  const cwd = resolveCommandCwd(options);
+  const response = await readCodexRateLimits(cwd);
+  outputCommandResult(response, renderUsageReport(response), options.json);
+}
+
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file", "output-schema", "resume-thread"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "from-last-review"],
     stopAtFirstPositional: true,
     aliasMap: {
       m: "model"
@@ -818,7 +862,8 @@ async function handleTask(argv) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
-  const prompt = readTaskPrompt(cwd, options, positionals);
+  const requestText = readTaskPrompt(cwd, options, positionals);
+  const prompt = options["from-last-review"] ? buildReviewHandoffPrompt(workspaceRoot, requestText) : requestText;
   const outputSchema = options["output-schema"] ? readOutputSchema(path.resolve(cwd, options["output-schema"])) : null;
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
@@ -1143,6 +1188,9 @@ async function runSubcommand(subcommand, argv) {
       break;
     case "transfer":
       await handleTransfer(argv);
+      break;
+    case "usage":
+      await handleUsage(argv);
       break;
     case "task-worker":
       await handleTaskWorker(argv);

@@ -79,6 +79,7 @@ test("continue is not exposed as a user-facing command", () => {
     "codex-review.md",
     "codex-setup.md",
     "codex-transfer.md",
+    "codex-usage.md",
     "result.md",
     "status.md"
   ]);

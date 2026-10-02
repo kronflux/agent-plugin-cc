@@ -233,9 +233,7 @@ async function main() {
         if (message.id !== undefined && message.method === "initialize") {
           send(socket, {
             id: message.id,
-            result: {
-              userAgent: "codex-companion-broker"
-            }
+            result: appClient.serverInfo ?? { userAgent: "codex-companion-broker" }
           });
           continue;
         }

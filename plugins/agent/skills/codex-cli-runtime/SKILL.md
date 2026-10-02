@@ -30,6 +30,7 @@ Command selection:
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
+- If the forwarded request includes `--from-last-review`, strip that token from the task text and pass it through to `task`. The companion adds the newest review's findings to the prompt, so the request needs no other text.
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
 - `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up.
 - `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. The companion rejects an effort the selected model does not support and prints the efforts it does.

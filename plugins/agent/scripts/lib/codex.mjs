@@ -694,24 +694,70 @@ function sourceContentSha256(sourcePath) {
   return crypto.createHash("sha256").update(fs.readFileSync(sourcePath)).digest("hex");
 }
 
-function importedThreadIdForSource(sourcePath) {
+// Codex records the source path in its extended-length form on Windows (\\?\C:\...), and
+// Windows paths compare without case.
+function comparableImportPath(value, platform = process.platform) {
+  let text = String(value ?? "");
+  if (platform !== "win32") {
+    return text;
+  }
+  if (text.startsWith("\\\\?\\UNC\\")) {
+    text = `\\\\${text.slice(8)}`;
+  } else if (text.startsWith("\\\\?\\")) {
+    text = text.slice(4);
+  }
+  return path.win32.normalize(text).toLowerCase();
+}
+
+function ledgerTimeSeconds(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value > 1e12 ? value / 1000 : value;
+  }
+  if (typeof value === "string") {
+    const ms = Date.parse(value);
+    return Number.isNaN(ms) ? null : ms / 1000;
+  }
+  return null;
+}
+
+/**
+ * Finds the thread Codex recorded for `sourcePath` in its import ledger. A record whose content
+ * hash differs is accepted only when Codex wrote it after this import started, because a live
+ * Claude transcript keeps growing while it is imported.
+ */
+function importedThreadIdFromLedger(sourcePath, { contentSha256, importStartedAtMs }) {
   const ledgerPath = path.join(resolveCodexHome(), "external_agent_session_imports.json");
   if (!fs.existsSync(ledgerPath)) {
     return null;
   }
   const ledger = readJsonFile(ledgerPath);
-  const canonicalSource = fs.realpathSync(sourcePath);
-  const contentSha256 = sourceContentSha256(canonicalSource);
+  const source = comparableImportPath(fs.realpathSync(sourcePath));
+  const startedAtSeconds = Math.floor(importStartedAtMs / 1000);
   const records = Array.isArray(ledger?.records) ? ledger.records : [];
   const match = records
-    .filter(
-      (record) =>
-        record?.source_path === canonicalSource &&
-        record?.content_sha256 === contentSha256 &&
-        typeof record?.imported_thread_id === "string"
-    )
+    .filter((record) => {
+      if (typeof record?.imported_thread_id !== "string" || comparableImportPath(record.source_path) !== source) {
+        return false;
+      }
+      if (record.content_sha256 === contentSha256) {
+        return true;
+      }
+      const importedAt = ledgerTimeSeconds(record.imported_at);
+      return importedAt !== null && importedAt >= startedAtSeconds;
+    })
     .at(-1);
   return match?.imported_thread_id ?? null;
+}
+
+function summarizeSessionImport(completion) {
+  const results = Array.isArray(completion?.itemTypeResults) ? completion.itemTypeResults : [];
+  const sessions = results.filter((result) => result?.itemType === "SESSIONS");
+  const successes = sessions.flatMap((result) => (Array.isArray(result.successes) ? result.successes : []));
+  const failures = sessions.flatMap((result) => (Array.isArray(result.failures) ? result.failures : []));
+  return {
+    threadId: successes.map((success) => success?.target).filter((target) => typeof target === "string" && target.trim()).at(-1) ?? null,
+    failures: failures.map((failure) => failure?.message).filter((message) => typeof message === "string" && message.trim())
+  };
 }
 
 function externalAgentSessionMigration(sourcePath, cwd) {
@@ -734,31 +780,40 @@ function externalAgentSessionMigration(sourcePath, cwd) {
   };
 }
 
+// Resolves with the completion notification for this import. The import response carries the
+// import id; the notification can arrive before the response is read.
 async function requestExternalAgentSessionImport(client, params) {
   const previousHandler = client.notificationHandler;
+  const completions = [];
+  let onCompletion = null;
   let timeout = null;
-  let resolveCompleted;
-  let rejectCompleted;
-  const completed = new Promise((resolve, reject) => {
-    resolveCompleted = resolve;
-    rejectCompleted = reject;
-  });
-  void completed.catch(() => {});
-
   client.setNotificationHandler((message) => {
     if (message.method === EXTERNAL_AGENT_IMPORT_COMPLETED) {
-      resolveCompleted();
+      completions.push(message.params ?? {});
+      onCompletion?.();
       return;
     }
     previousHandler?.(message);
   });
-  timeout = setTimeout(() => {
-    rejectCompleted(new Error("Timed out waiting for Codex to finish importing the Claude session."));
-  }, EXTERNAL_AGENT_IMPORT_TIMEOUT_MS);
 
   try {
-    await client.request("externalAgentConfig/import", params);
-    await completed;
+    const response = await client.request("externalAgentConfig/import", params);
+    const importId = response?.importId ?? null;
+    const findCompletion = () =>
+      completions.find((completion) => !importId || !completion.importId || completion.importId === importId);
+    if (!findCompletion()) {
+      await new Promise((resolve, reject) => {
+        onCompletion = () => {
+          if (findCompletion()) {
+            resolve();
+          }
+        };
+        timeout = setTimeout(() => {
+          reject(new Error("Timed out waiting for Codex to finish importing the Claude session."));
+        }, EXTERNAL_AGENT_IMPORT_TIMEOUT_MS);
+      });
+    }
+    return findCompletion();
   } finally {
     clearTimeout(timeout);
     client.setNotificationHandler(previousHandler ?? null);
@@ -979,7 +1034,8 @@ export async function getCodexAuthStatus(cwd, options = {}) {
       env: options.env,
       reuseExistingBroker: true
     });
-    return await getCodexAuthStatusFromClient(client, cwd);
+    const status = await getCodexAuthStatusFromClient(client, cwd);
+    return { ...status, userAgent: client.serverInfo?.userAgent ?? null };
   } catch (error) {
     return buildAuthStatus({
       loggedIn: false,
@@ -990,6 +1046,19 @@ export async function getCodexAuthStatus(cwd, options = {}) {
     if (client) {
       await client.close().catch(() => {});
     }
+  }
+}
+
+export async function readCodexRateLimits(cwd) {
+  const availability = getCodexAvailability(cwd);
+  if (!availability.available) {
+    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/agent:codex-setup`.");
+  }
+  const client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
+  try {
+    return await client.request("account/rateLimits/read", {});
+  } finally {
+    await client.close().catch(() => {});
   }
 }
 
@@ -1105,8 +1174,11 @@ export async function importExternalAgentSession(cwd, options = {}) {
 
   return withDirectAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Importing Claude session into Codex.", "transferring");
+    const contentSha256 = sourceContentSha256(options.sourcePath);
+    const importStartedAtMs = Date.now();
+    let completion;
     try {
-      await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
+      completion = await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
     } catch (error) {
       if (error?.rpcCode === -32601) {
         throw new Error(
@@ -1116,8 +1188,13 @@ export async function importExternalAgentSession(cwd, options = {}) {
       }
       throw error;
     }
-    const threadId = importedThreadIdForSource(options.sourcePath);
+    const outcome = summarizeSessionImport(completion);
+    const threadId =
+      outcome.threadId ?? importedThreadIdFromLedger(options.sourcePath, { contentSha256, importStartedAtMs });
     if (!threadId) {
+      if (outcome.failures.length > 0) {
+        throw new Error(`Codex could not import the Claude session:\n${outcome.failures.map((message) => `- ${message}`).join("\n")}`);
+      }
       const stderr = cleanCodexStderr(client.stderr);
       throw new Error(
         `Codex reported that the Claude import completed, but did not record an imported thread.${stderr ? `\n${stderr}` : " Check the Codex app-server logs for the underlying import error."}`

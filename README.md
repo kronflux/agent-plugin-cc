@@ -14,6 +14,7 @@ they already have.
 - `/agent:codex-review` for a normal read-only Codex review
 - `/agent:codex-adversarial-review` for a steerable challenge review
 - `/agent:codex-rescue`, `/agent:codex-transfer`, `/agent:status`, `/agent:result`, and `/agent:cancel` to delegate work, hand off sessions, and manage background jobs
+- `/agent:codex-usage` to see how much of your Codex usage limits is left
 
 ## Requirements
 
@@ -126,7 +127,7 @@ Examples:
 /agent:codex-adversarial-review --background look for race conditions and question the chosen approach
 ```
 
-This command is read-only. It does not fix code.
+This command is read-only. It does not fix code. To have Codex fix what a review found, run `/agent:codex-rescue --from-last-review`.
 
 ### `/agent:codex-rescue`
 
@@ -142,7 +143,7 @@ Use it when you want Codex to:
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--resume`, `--fresh`, and `--from-last-review`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo. `--from-last-review` sends the findings of the newest finished `/agent:codex-review` or `/agent:codex-adversarial-review` run, preferring runs from the current Claude session; any text you add is sent with them.
 
 Examples:
 
@@ -153,6 +154,7 @@ Examples:
 /agent:codex-rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
 /agent:codex-rescue --model spark fix the issue quickly
 /agent:codex-rescue --background investigate the regression
+/agent:codex-rescue --from-last-review skip the style findings
 ```
 
 You can also just ask for a task to be delegated to Codex:
@@ -182,7 +184,7 @@ Examples:
 /agent:codex-transfer --source ~/.claude/projects/-Users-me-repo/<session-id>.jsonl
 ```
 
-The plugin's existing `SessionStart` hook supplies the current transcript path automatically; `--source` is available as a manual override. The transfer uses Codex's external-agent session importer, so it follows the same conversion rules as importing Claude history in the Codex App and creates visible turns that can be continued in the App or TUI. The source must be under `~/.claude/projects`, and older Codex versions that do not expose session import must be upgraded before using this command.
+The plugin's existing `SessionStart` hook supplies the current transcript path automatically; `--source` is available as a manual override. The transfer uses Codex's external-agent session importer, so it follows the same conversion rules as importing Claude history in the Codex App and creates visible turns that can be continued in the App or TUI. The source must be under `~/.claude/projects` or, when `CLAUDE_CONFIG_DIR` is set, under `$CLAUDE_CONFIG_DIR/projects`. Codex imports only from `~/.claude/projects`, so a transcript from `CLAUDE_CONFIG_DIR` is copied into a temporary directory there for the import and removed afterward. Older Codex versions that do not expose session import must be upgraded before using this command.
 
 ### `/agent:status`
 
@@ -224,9 +226,17 @@ Examples:
 /agent:cancel task-abc123
 ```
 
+### `/agent:codex-usage`
+
+Shows the usage limits of the Codex account you are signed in with: each limit window with the percentage used and when it resets, your plan, and your credit balance.
+
+```bash
+/agent:codex-usage
+```
+
 ### `/agent:codex-setup`
 
-Checks whether Codex is installed and authenticated.
+Checks whether Codex is installed and authenticated, and shows the version string of the Codex app server.
 If Codex is missing and npm is available, it can offer to install Codex for you.
 
 You can also use `/agent:codex-setup` to manage the optional review gate.
