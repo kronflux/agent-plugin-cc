@@ -1,0 +1,125 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test, { after } from "node:test";
+import assert from "node:assert/strict";
+import { fileURLToPath } from "node:url";
+
+import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
+import { initGitRepo, makeTempDir, run, stopTestBrokers } from "./helpers.mjs";
+import { isProcessAlive } from "../plugins/agent/scripts/lib/process.mjs";
+import { readTurnResultFromRollout } from "../plugins/agent/scripts/lib/rollout.mjs";
+import { readJobFile, resolveJobFile, writeJobFile } from "../plugins/agent/scripts/lib/state.mjs";
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const SCRIPT = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
+
+after(stopTestBrokers);
+
+function makeRepo(behavior) {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, behavior);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  return { repo, env: buildEnv(binDir) };
+}
+
+async function waitUntil(predicate, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return false;
+}
+
+function writeRollout(codexHome, threadId, records) {
+  const dir = path.join(codexHome, "sessions", "2026", "10", "02");
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `rollout-2026-10-02T10-00-00-${threadId}.jsonl`);
+  fs.writeFileSync(file, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+}
+
+test("a turn that stops sending events ends with the output it produced", () => {
+  const { repo, env } = makeRepo("stall-after-message");
+  const started = Date.now();
+  const result = run("node", [SCRIPT, "task", "--json", "investigate"], {
+    cwd: repo,
+    env: { ...env, CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "1500" }
+  });
+
+  assert.ok(Date.now() - started < 20000);
+  assert.notEqual(result.status, 0);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.rawOutput, "Partial answer before the stall.");
+  assert.match(payload.failureMessage, /sent no events for 2 s/);
+});
+
+test("cancel stops a worker whose turn ignores the interrupt", async () => {
+  const { repo, env } = makeRepo("interrupt-ignored");
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "long job"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+  const jobFile = resolveJobFile(repo, jobId);
+  assert.ok(await waitUntil(() => Boolean(readJobFile(jobFile).turnId), 15000), "the turn did not start");
+  const workerPid = readJobFile(jobFile).pid;
+
+  const started = Date.now();
+  const cancelled = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  assert.ok(Date.now() - started < 15000, `cancel took ${Date.now() - started} ms`);
+  assert.ok(await waitUntil(() => !isProcessAlive(workerPid), 5000), "the worker kept running");
+  assert.match(fs.readFileSync(readJobFile(jobFile).logFile, "utf8"), /still running 10 s after the interrupt/);
+});
+
+test("readTurnResultFromRollout reads only the requested turn", () => {
+  const codexHome = makeTempDir();
+  writeRollout(codexHome, "thr-1", [
+    { type: "event_msg", payload: { type: "task_started", turn_id: "turn-a" } },
+    { type: "event_msg", payload: { type: "task_complete", turn_id: "turn-a", last_agent_message: "Answer A" } },
+    { type: "event_msg", payload: { type: "task_started", turn_id: "turn-b" } },
+    { type: "event_msg", payload: { type: "item_completed", turn_id: "turn-b", item: { type: "AgentMessage", content: [{ type: "Text", text: "Half of B" }] } } },
+    "not json"
+  ]);
+
+  assert.deepEqual(
+    { ...readTurnResultFromRollout("thr-1", "turn-a", { codexHome }), file: undefined },
+    { text: "Answer A", complete: true, file: undefined }
+  );
+  assert.equal(readTurnResultFromRollout("thr-1", "turn-b", { codexHome }).text, "Half of B");
+  assert.equal(readTurnResultFromRollout("thr-1", "turn-b", { codexHome }).complete, false);
+  assert.equal(readTurnResultFromRollout("thr-1", "turn-c", { codexHome }), null);
+  assert.equal(readTurnResultFromRollout("thr-1", null, { codexHome }), null);
+});
+
+test("result prints a lost answer from the Codex transcript", () => {
+  const { repo, env } = makeRepo();
+  const codexHome = makeTempDir();
+  writeRollout(codexHome, "thr-lost", [
+    { type: "event_msg", payload: { type: "task_complete", turn_id: "turn-lost", last_agent_message: "The recovered answer." } }
+  ]);
+  writeJobFile(repo, "task-lost", {
+    id: "task-lost",
+    status: "failed",
+    title: "Codex Task",
+    jobClass: "task",
+    threadId: "thr-lost",
+    turnId: "turn-lost"
+  });
+
+  const result = run("node", [SCRIPT, "result", "task-lost"], { cwd: repo, env: { ...env, CODEX_HOME: codexHome } });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^Recovered from the Codex transcript\.\n/);
+  assert.match(result.stdout, /The recovered answer\./);
+});
+
+test("a missing Codex home yields no recovered result", () => {
+  assert.equal(readTurnResultFromRollout("no-such-thread", "no-turn", { codexHome: path.join(os.tmpdir(), "absent-codex-home") }), null);
+});

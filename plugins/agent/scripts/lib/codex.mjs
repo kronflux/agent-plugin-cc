@@ -558,9 +558,40 @@ function applyTurnNotification(state, message) {
   }
 }
 
+const DEFAULT_TURN_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
+
+// CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS sets how long a running turn may send no event before
+// it is ended with the output it produced so far. Zero turns the limit off.
+function readTurnIdleTimeoutMs() {
+  const raw = (process.env.CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS ?? "").trim();
+  return /^\d+$/.test(raw) ? Math.min(Number(raw), 2 ** 31 - 1) : DEFAULT_TURN_IDLE_TIMEOUT_MS;
+}
+
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
+  const idleTimeoutMs = options.idleTimeoutMs ?? readTurnIdleTimeoutMs();
+  let idleTimer = null;
+
+  // When Codex stops sending events without finishing the turn, the turn is interrupted and
+  // completed as failed, keeping the messages it produced.
+  function armIdleTimer() {
+    clearTimeout(idleTimer);
+    if (idleTimeoutMs <= 0 || state.completed || !state.turnId) {
+      return;
+    }
+    idleTimer = setTimeout(() => {
+      if (state.completed) {
+        return;
+      }
+      const seconds = Math.round(idleTimeoutMs / 1000);
+      state.error = { message: `Codex sent no events for ${seconds} s, so the turn was stopped. Its output so far is kept.` };
+      emitProgress(state.onProgress, state.error.message, "failed");
+      client.request("turn/interrupt", { threadId: state.threadId, turnId: state.turnId }).catch(() => {});
+      completeTurn(state, { id: state.turnId, status: "failed" });
+    }, idleTimeoutMs);
+    idleTimer.unref?.();
+  }
 
   client.setNotificationHandler((message) => {
     if (!state.turnId) {
@@ -581,6 +612,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
 
     applyTurnNotification(state, message);
+    armIdleTimer();
   });
 
   try {
@@ -604,9 +636,11 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     if (response.turn?.status && response.turn.status !== "inProgress") {
       completeTurn(state, response.turn);
     }
+    armIdleTimer();
 
     return await state.completion;
   } finally {
+    clearTimeout(idleTimer);
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
   }

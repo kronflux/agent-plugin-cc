@@ -25,7 +25,8 @@ import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { KNOWN_REASONING_EFFORTS } from "./lib/model-catalog.mjs";
-import { binaryAvailable } from "./lib/process.mjs";
+import { binaryAvailable, isProcessAlive } from "./lib/process.mjs";
+import { readTurnResultFromRollout } from "./lib/rollout.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -72,6 +73,8 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+// How long cancel waits for an interrupted worker to finish its turn and exit by itself.
+const INTERRUPT_EXIT_WAIT_MS = 10000;
 const VALID_REASONING_EFFORTS = new Set(KNOWN_REASONING_EFFORTS);
 const WRITE_SANDBOXES = ["workspace-write", "danger-full-access"];
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
@@ -976,13 +979,25 @@ async function handleResult(argv) {
   const reference = positionals[0] ?? "";
   await reconcileJobLiveness(cwd);
   const { workspaceRoot, job } = resolveResultJob(cwd, reference);
-  const storedJob = readStoredJob(workspaceRoot, job.id);
+  let storedJob = readStoredJob(workspaceRoot, job.id);
+  let recoveredNote = "";
+  const hasOutput = Boolean(storedJob?.result?.rawOutput || storedJob?.result?.codex?.stdout || storedJob?.rendered);
+  // A job that stopped without storing its output may still have it in the Codex transcript.
+  if (!hasOutput) {
+    const recovered = readTurnResultFromRollout(storedJob?.threadId ?? job.threadId, storedJob?.turnId ?? job.turnId);
+    if (recovered) {
+      storedJob = { ...storedJob, result: { ...(storedJob?.result ?? {}), rawOutput: recovered.text }, recovered };
+      recoveredNote = recovered.complete
+        ? "Recovered from the Codex transcript.\n\n"
+        : "Recovered from the Codex transcript. The turn did not finish; this is its last message.\n\n";
+    }
+  }
   const payload = {
     job,
     storedJob
   };
 
-  outputCommandResult(payload, renderStoredJobResult(job, storedJob), options.json);
+  outputCommandResult(payload, `${recoveredNote}${renderStoredJobResult(job, storedJob)}`, options.json);
 }
 
 async function handleTaskResumeCandidate(argv) {
@@ -1046,6 +1061,18 @@ async function handleCancel(argv) {
     );
   }
 
+  // An interrupted worker normally records the stopped turn and exits on its own; it is
+  // stopped by force only if it is still running after the wait.
+  const workerPid = existing.pid ?? job.pid ?? null;
+  if (interrupt.interrupted && Number.isInteger(workerPid)) {
+    const deadline = Date.now() + INTERRUPT_EXIT_WAIT_MS;
+    while (isProcessAlive(workerPid) && Date.now() < deadline) {
+      await sleep(100);
+    }
+    if (isProcessAlive(workerPid)) {
+      appendLogLine(job.logFile, `The worker was still running ${INTERRUPT_EXIT_WAIT_MS / 1000} s after the interrupt.`);
+    }
+  }
   const [termination] = terminateJobProcesses([{ ...job, ...existing }]);
   if (termination?.outcome === "pid-reused") {
     appendLogLine(job.logFile, `Process ${termination.pid} no longer belongs to this job; it was not stopped.`);

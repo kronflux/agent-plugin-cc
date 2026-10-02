@@ -617,6 +617,18 @@ rl.on("line", (line) => {
           }
         ];
 
+	        if (BEHAVIOR === "stall-after-message") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({
+	            method: "item/completed",
+	            params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text: "Partial answer before the stall.", phase: "commentary" } }
+	          });
+	          break;
+	        }
+	        if (BEHAVIOR === "interrupt-ignored") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          break;
+	        }
 	        if (BEHAVIOR === "interruptible-slow-task") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
