@@ -205,6 +205,17 @@ Use it to:
 - see the latest completed job
 - confirm whether a task is still running
 
+### Finished-job notices
+
+In an interactive session, the plugin's monitor tells Claude when a Codex job started from this
+Claude Code process finishes and no command has printed its result yet: for example a
+background task nobody waited for, or a new turn started by `/agent:send`. Claude then sees one
+line such as `Codex job task-abc123 completed: ... Run /agent:result task-abc123 for the output.`
+
+The monitor announces nothing else: no starts, progress, or cancellations. Each notice starts a
+Claude turn. The rescue subagent and foreground runs print their own results, so they produce no
+notice. Monitors do not run in non-interactive `claude -p` sessions.
+
 ### `/agent:result`
 
 Shows the final stored Codex output for a finished job.

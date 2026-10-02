@@ -689,6 +689,12 @@ rl.on("line", (line) => {
         }
 
         const items = [
+          ...(BEHAVIOR === "three-messages"
+            ? [
+                { completed: { type: "agentMessage", id: "msg_a_" + turnId, text: "First progress note.", phase: "commentary" } },
+                { completed: { type: "agentMessage", id: "msg_b_" + turnId, text: "Second progress note.", phase: "commentary" } }
+              ]
+            : []),
           ...(BEHAVIOR === "with-reasoning"
             ? [
                 {

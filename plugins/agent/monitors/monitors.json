@@ -1,0 +1,7 @@
+[
+  {
+    "name": "codex-jobs",
+    "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/job-monitor.mjs\" \"${CLAUDE_PROJECT_DIR}\"",
+    "description": "Codex jobs that finish without anyone waiting for them"
+  }
+]

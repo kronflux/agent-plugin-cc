@@ -34,6 +34,7 @@ import {
   getConfig,
   listJobs,
   markJobCancelled,
+  markJobResultDelivered,
   queueJobMessage,
   readJobMessageOutcome,
   takeJobMessages,
@@ -723,6 +724,7 @@ async function runForegroundCommand(job, runner, options = {}) {
   });
   const execution = await runTrackedJob(job, () => runner(progress), { logFile });
   outputResult(options.json ? execution.payload : execution.rendered, options.json);
+  markJobResultDelivered(job.workspaceRoot, job.id);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;
   }
@@ -1205,6 +1207,9 @@ async function handleResult(argv) {
   };
 
   outputCommandResult(payload, `${recoveredNote}${renderStoredJobResult(job, storedJob)}`, options.json);
+  if (!isActiveJobStatus(job.status)) {
+    markJobResultDelivered(workspaceRoot, job.id);
+  }
 }
 
 async function handleTaskResumeCandidate(argv) {

@@ -20,6 +20,7 @@ const MAX_FINISHED_JOBS = 50;
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
 const CANCELLED_MARKER_SUFFIX = ".cancelled";
 const REMOVED_MARKER_SUFFIX = ".removed";
+const DELIVERED_MARKER_SUFFIX = ".delivered";
 const REMOVED_MARKER_LIFETIME_MS = 60 * 60 * 1000;
 const REQUEST_FILE_SUFFIX = ".request.json";
 const MESSAGES_DIR_SUFFIX = ".messages";
@@ -431,6 +432,7 @@ export function listJobs(cwd) {
 function removeJobArtifacts(jobFile, record) {
   fs.rmSync(jobFile, { force: true });
   fs.rmSync(markerFile(jobFile, CANCELLED_MARKER_SUFFIX), { force: true });
+  fs.rmSync(markerFile(jobFile, DELIVERED_MARKER_SUFFIX), { force: true });
   fs.rmSync(requestFile(jobFile), { force: true });
   fs.rmSync(messagesDir(jobFile), { recursive: true, force: true });
   if (record?.logFile) {
@@ -479,6 +481,21 @@ function pruneFinishedJobs(cwd) {
 export function markJobCancelled(cwd, jobId) {
   const jobFile = resolveJobFile(cwd, jobId);
   fs.writeFileSync(markerFile(jobFile, CANCELLED_MARKER_SUFFIX), `${nowIso()}\n`, "utf8");
+}
+
+/**
+ * Records that a command printed the job's result. The marker is a separate file, so the record
+ * and its updatedAt, which orders the job listings, stay unchanged.
+ */
+export function markJobResultDelivered(cwd, jobId) {
+  const jobFile = resolveJobFile(cwd, jobId);
+  if (fs.existsSync(jobFile)) {
+    fs.writeFileSync(markerFile(jobFile, DELIVERED_MARKER_SUFFIX), `${nowIso()}\n`, "utf8");
+  }
+}
+
+export function isJobResultDelivered(cwd, jobId) {
+  return fs.existsSync(markerFile(resolveJobFile(cwd, jobId), DELIVERED_MARKER_SUFFIX));
 }
 
 /**

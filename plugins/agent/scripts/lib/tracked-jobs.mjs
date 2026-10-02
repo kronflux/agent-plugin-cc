@@ -68,10 +68,14 @@ export function createJobLogFile(workspaceRoot, jobId, title) {
 export function createJobRecord(base, options = {}) {
   const env = options.env ?? process.env;
   const sessionId = env[options.sessionIdEnv ?? SESSION_ID_ENV];
+  // CLAUDE_PID names the Claude Code process the job was started from; the job monitor of that
+  // process announces the job.
+  const claudePid = /^\d+$/.test(env.CLAUDE_PID ?? "") ? env.CLAUDE_PID : null;
   return {
     ...base,
     createdAt: nowIso(),
-    ...(sessionId ? { sessionId } : {})
+    ...(sessionId ? { sessionId } : {}),
+    ...(claudePid ? { claudePid } : {})
   };
 }
 
