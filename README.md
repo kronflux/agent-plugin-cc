@@ -164,7 +164,9 @@ Ask Codex to redesign the database connection to be more resilient.
 **Notes:**
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
+- `--effort` takes `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`; an effort the selected model does not support is rejected before Codex starts, with the efforts it does support
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
+- write-capable rescue runs use the `workspace-write` sandbox; `/agent:codex-setup --write-sandbox danger-full-access` turns the sandbox off for this repository, and `--write-sandbox workspace-write` turns it back on
 - follow-up rescue requests can continue the latest Codex task in the repo
 
 ### `/agent:codex-transfer`

@@ -43,6 +43,7 @@ import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
+import { validateModelSelection } from "./model-catalog.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
@@ -67,7 +68,8 @@ function buildThreadParams(cwd, options = {}) {
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only",
     serviceName: SERVICE_NAME,
-    ephemeral: options.ephemeral ?? true
+    ephemeral: options.ephemeral ?? true,
+    ...(options.config ? { config: options.config } : {})
   };
 }
 
@@ -1006,12 +1008,15 @@ export async function runAppServerReview(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
+    await validateModelSelection(client, { model: options.model, effort: options.effort });
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
+    // review/start takes no effort parameter, so the effort is set on the review's thread.
     const thread = await startThread(client, cwd, {
       model: options.model,
       sandbox: "read-only",
       ephemeral: true,
-      threadName: options.threadName
+      threadName: options.threadName,
+      config: options.effort ? { model_reasoning_effort: options.effort } : null
     });
     const sourceThreadId = thread.thread.id;
     emitProgress(options.onProgress, `Thread ready (${sourceThreadId}).`, "starting", {
@@ -1099,6 +1104,7 @@ export async function runAppServerTurn(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
+    await validateModelSelection(client, { model: options.model, effort: options.effort });
     let threadId;
 
     if (options.resumeThreadId) {

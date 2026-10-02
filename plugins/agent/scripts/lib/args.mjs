@@ -1,3 +1,9 @@
+/**
+ * Parses options and positionals. `--help` and `-h` set `options.help` only before the first
+ * positional, so they can appear in prompt or focus text. With `stopAtFirstPositional`, every
+ * token from the first positional on is a positional, which keeps option-like words in a
+ * prompt as text.
+ */
 export function parseArgs(argv, config = {}) {
   const valueOptions = new Set(config.valueOptions ?? []);
   const booleanOptions = new Set(config.booleanOptions ?? []);
@@ -21,6 +27,14 @@ export function parseArgs(argv, config = {}) {
 
     if (!token.startsWith("-") || token === "-") {
       positionals.push(token);
+      if (config.stopAtFirstPositional) {
+        passthrough = true;
+      }
+      continue;
+    }
+
+    if ((token === "--help" || token === "-h") && positionals.length === 0) {
+      options.help = true;
       continue;
     }
 
