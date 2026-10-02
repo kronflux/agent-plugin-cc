@@ -16,6 +16,8 @@ const readline = require("node:readline");
 	const STATE_PATH = ${JSON.stringify(statePath)};
 	const BEHAVIOR = ${JSON.stringify(behavior)};
 	const interruptibleTurns = new Map();
+	// Behaviors whose turns stay active for 5 s, so they can be interrupted or steered.
+	const SLOW_TURN_BEHAVIORS = new Set(["interruptible-slow-task", "steer-rejected", "steer-no-item", "steer-turn-ended"]);
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
@@ -716,7 +718,7 @@ rl.on("line", (line) => {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          break;
 	        }
-	        if (BEHAVIOR === "interruptible-slow-task") {
+	        if (SLOW_TURN_BEHAVIORS.has(BEHAVIOR)) {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
 	            if (!interruptibleTurns.has(turnId)) {
@@ -735,6 +737,34 @@ rl.on("line", (line) => {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
+	        }
+	        break;
+	      }
+
+	      case "turn/steer": {
+	        const params = message.params || {};
+	        state.steerAttempts = (state.steerAttempts || 0) + 1;
+	        const active = interruptibleTurns.get(params.expectedTurnId);
+	        if (BEHAVIOR === "steer-turn-ended") {
+	          saveState(state);
+	          send({ id: message.id, error: { code: -32600, message: "no active turn to steer" } });
+	          break;
+	        }
+	        if (BEHAVIOR === "steer-rejected" || !active || active.threadId !== params.threadId) {
+	          saveState(state);
+	          send({ id: message.id, error: { code: -32600, message: "expected active turn id " + params.expectedTurnId + " does not match the active turn" } });
+	          break;
+	        }
+	        const text = (params.input || []).map((part) => part.text || "").join("");
+	        state.steers = [...(state.steers || []), { threadId: params.threadId, expectedTurnId: params.expectedTurnId, clientUserMessageId: params.clientUserMessageId, text }];
+	        saveState(state);
+	        send({ id: message.id, result: { turnId: params.expectedTurnId } });
+	        if (BEHAVIOR !== "steer-no-item") {
+	          const item = { type: "userMessage", id: "user_" + state.steerAttempts, clientId: params.clientUserMessageId || null, content: params.input || [] };
+	          setTimeout(() => {
+	            send({ method: "item/started", params: { threadId: params.threadId, turnId: params.expectedTurnId, item } });
+	            send({ method: "item/completed", params: { threadId: params.threadId, turnId: params.expectedTurnId, item } });
+	          }, 300);
 	        }
 	        break;
 	      }

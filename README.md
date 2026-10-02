@@ -13,7 +13,7 @@ they already have.
 
 - `/agent:codex-review` for a normal read-only Codex review
 - `/agent:codex-adversarial-review` for a steerable challenge review
-- `/agent:codex-rescue`, `/agent:codex-transfer`, `/agent:status`, `/agent:result`, and `/agent:cancel` to delegate work, hand off sessions, and manage background jobs
+- `/agent:codex-rescue`, `/agent:codex-transfer`, `/agent:status`, `/agent:result`, `/agent:send`, and `/agent:cancel` to delegate work, hand off sessions, and manage background jobs
 - `/agent:codex-usage` to see how much of your Codex usage limits is left
 
 ## Requirements
@@ -92,7 +92,7 @@ Use it when you want:
 - a review of your current uncommitted changes
 - a review of your branch compared to a base branch like `main`
 
-Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/agent:codex-adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
+Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/agent:codex-adversarial-review`](#agentcodex-adversarial-review) when you want to challenge a specific decision or risk area.
 
 Examples:
 
@@ -102,7 +102,7 @@ Examples:
 /agent:codex-review --background
 ```
 
-This command is read-only and will not perform any changes. When run in the background you can use [`/agent:status`](#codexstatus) to check on the progress and [`/agent:cancel`](#codexcancel) to cancel the ongoing task.
+This command is read-only and will not perform any changes. When run in the background you can use [`/agent:status`](#agentstatus) to check on the progress and [`/agent:cancel`](#agentcancel) to cancel the ongoing task.
 
 ### `/agent:codex-adversarial-review`
 
@@ -139,6 +139,8 @@ Use it when you want Codex to:
 - try a fix
 - continue a previous Codex task
 - take a faster or cheaper pass with a smaller model
+
+The subagent starts Codex as a background job, waits until the job finishes, and returns Codex's result. It never returns only a job ID. While it waits, you can steer the job with [`/agent:send`](#agentsend) or stop it with [`/agent:cancel`](#agentcancel).
 
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
@@ -213,6 +215,20 @@ Examples:
 ```bash
 /agent:result
 /agent:result task-abc123
+```
+
+### `/agent:send`
+
+Sends a message to a Codex task job.
+
+- If the job is running, the message joins its current turn. Codex reads it at its next step, the way a message typed into a running Codex session does. The command reports success only after Codex confirms it received the message.
+- If the job has finished, the message starts a new turn on the same Codex thread as a new background job.
+
+Examples:
+
+```bash
+/agent:send task-abc123 stop exploring and summarize what you found
+/agent:send task-abc123 also update the tests for the new flag
 ```
 
 ### `/agent:cancel`
@@ -307,7 +323,7 @@ Check out the Codex docs for more [configuration options](https://developers.ope
 
 ### Moving The Work Over To Codex
 
-Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/agent:result` or `/agent:status` or by selecting it from the list.
+Delegated tasks and any [stop gate](#enabling-review-gate) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/agent:result` or `/agent:status` or by selecting it from the list.
 
 This way you can review the Codex work or continue the work there.
 

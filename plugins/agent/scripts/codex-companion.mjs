@@ -34,6 +34,11 @@ import {
   getConfig,
   listJobs,
   markJobCancelled,
+  queueJobMessage,
+  readJobMessageOutcome,
+  takeJobMessages,
+  withdrawJobMessage,
+  writeJobMessageOutcome,
   setConfig,
   takeJobRequest,
   writeJobFile
@@ -80,6 +85,11 @@ const INTERRUPT_EXIT_WAIT_MS = 10000;
 const VALID_REASONING_EFFORTS = new Set(KNOWN_REASONING_EFFORTS);
 const WRITE_SANDBOXES = ["workspace-write", "danger-full-access"];
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
+// How long send waits for Codex to confirm a message by default.
+const DEFAULT_SEND_TIMEOUT_MS = 60000;
+// result --wait exits with this code when the job is still running at the end of the wait.
+const STILL_RUNNING_EXIT_CODE = 75;
+const SEND_VALUE_OPTIONS = new Set(["--timeout-ms", "--cwd", "-C"]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 const EFFORT_USAGE = `<${KNOWN_REASONING_EFFORTS.join("|")}>`;
@@ -90,8 +100,9 @@ const SUBCOMMAND_USAGE = {
   task: `task [--background] [--write] [--resume-last|--resume|--resume-thread <thread-id>|--fresh] [--from-last-review] [--model <model|spark>] [--effort ${EFFORT_USAGE}] [--output-schema <file>] [--] [prompt]`,
   transfer: "transfer [--source <claude-jsonl>] [--json]",
   usage: "usage [--json]",
+  send: "send [--timeout-ms <ms>] [--json] <job-id> <message>",
   status: "status [job-id] [--wait] [--timeout-ms <ms>] [--all] [--json]",
-  result: "result [job-id] [--json]",
+  result: "result [job-id] [--wait] [--timeout-ms <ms>] [--json]",
   cancel: "cancel [job-id] [--json]"
 };
 
@@ -524,6 +535,12 @@ async function executeTaskRun(request) {
     sandbox: request.write ? getConfig(workspaceRoot).writeSandbox ?? "workspace-write" : "read-only",
     onProgress: request.onProgress,
     outputSchema: request.outputSchema ?? null,
+    messageInbox: request.jobId
+      ? {
+          take: () => takeJobMessages(workspaceRoot, request.jobId),
+          report: (messageId, outcome) => writeJobMessageOutcome(workspaceRoot, request.jobId, messageId, outcome)
+        }
+      : null,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
   });
@@ -544,6 +561,7 @@ async function executeTaskRun(request) {
   );
   const payload = {
     status: result.status,
+    jobId: request.jobId ?? null,
     threadId: result.threadId,
     rawOutput,
     ...(result.status !== 0 && failureMessage ? { failureMessage } : {}),
@@ -848,6 +866,131 @@ async function handleUsage(argv) {
   outputCommandResult(response, renderUsageReport(response), options.json);
 }
 
+// The slash command passes its arguments as one string. Options and the job id are split off
+// the front, and the rest is the message exactly as typed, so quotes and apostrophes survive.
+function splitSendArguments(argv) {
+  if (argv.length !== 1 || !/\s/.test(argv[0].trim())) {
+    return argv;
+  }
+  const tokens = [];
+  let rest = argv[0].trim();
+  while (rest) {
+    const match = rest.match(/^(\S+)\s*([\s\S]*)$/);
+    tokens.push(match[1]);
+    rest = match[2];
+    if (SEND_VALUE_OPTIONS.has(match[1]) && rest) {
+      const value = rest.match(/^(\S+)\s*([\s\S]*)$/);
+      tokens.push(value[1]);
+      rest = value[2];
+    } else if (!match[1].startsWith("-")) {
+      break;
+    }
+  }
+  const quoted = rest.match(/^(["'])([\s\S]*)\1$/);
+  return rest ? [...tokens, "--", quoted ? quoted[2] : rest] : tokens;
+}
+
+function renderSendResult(result) {
+  switch (result.status) {
+    case "applied":
+      return `Codex received the message in the running turn of ${result.jobId}.\n`;
+    case "sent":
+      return `Codex accepted the message for the running turn of ${result.jobId}. Codex applies it at its next step and had not confirmed it after ${Math.round(result.timeoutMs / 1000)} s. Check /agent:status ${result.jobId}.\n`;
+    case "unconfirmed":
+      return `Codex accepted the message, but the turn of ${result.jobId} ended before Codex confirmed it. Check /agent:result ${result.jobId}.\n`;
+    case "started":
+      return `${result.jobId} had finished, so the message started a new turn on its Codex thread as ${result.newJobId}. Check /agent:status ${result.newJobId} for progress.\n`;
+    default:
+      return `${result.detail}\n`;
+  }
+}
+
+function startTurnOnFinishedJob(cwd, workspaceRoot, job, text) {
+  if (!job.threadId) {
+    throw new Error(`${job.id} has no Codex thread to continue.`);
+  }
+  ensureCodexAvailable(cwd);
+  const write = Boolean(job.write);
+  const newJob = buildTaskJob(workspaceRoot, buildTaskRunMetadata({ prompt: text, resumeLast: true }), write);
+  const request = buildTaskRequest({
+    cwd,
+    prompt: text,
+    write,
+    resumeLast: false,
+    resumeThreadId: job.threadId,
+    jobId: newJob.id
+  });
+  enqueueBackgroundTask(cwd, newJob, request);
+  return { status: "started", jobId: job.id, newJobId: newJob.id, threadId: job.threadId };
+}
+
+async function waitForMessageOutcome(cwd, workspaceRoot, job, messageId, text, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let sent = null;
+  for (;;) {
+    const outcome = readJobMessageOutcome(workspaceRoot, job.id, messageId);
+    if (outcome?.status === "applied" || outcome?.status === "unconfirmed") {
+      return { status: outcome.status, jobId: job.id, turnId: outcome.turnId ?? null };
+    }
+    if (outcome?.status === "failed") {
+      throw new Error(`Codex rejected the message for ${job.id}: ${outcome.error}`);
+    }
+    if (outcome?.status === "turn-ended") {
+      return startTurnOnFinishedJob(cwd, workspaceRoot, readStoredJob(workspaceRoot, job.id) ?? job, text);
+    }
+    sent = outcome?.status === "sent" ? outcome : sent;
+    if (!outcome) {
+      const current = readStoredJob(workspaceRoot, job.id) ?? job;
+      if (!isActiveJobStatus(current.status) && withdrawJobMessage(workspaceRoot, job.id, messageId)) {
+        return startTurnOnFinishedJob(cwd, workspaceRoot, current, text);
+      }
+    }
+    if (Date.now() >= deadline) {
+      if (sent) {
+        return { status: "sent", jobId: job.id, turnId: sent.turnId ?? null, timeoutMs };
+      }
+      if (withdrawJobMessage(workspaceRoot, job.id, messageId)) {
+        throw new Error(`The worker of ${job.id} did not take the message within ${Math.round(timeoutMs / 1000)} s, so it was withdrawn.`);
+      }
+      return { status: "sent", jobId: job.id, turnId: null, timeoutMs };
+    }
+    await sleep(200);
+  }
+}
+
+async function handleSend(argv) {
+  const { options, positionals } = parseCommandInput(splitSendArguments(argv), {
+    valueOptions: ["cwd", "timeout-ms"],
+    booleanOptions: ["json"],
+    stopAtFirstPositional: true
+  });
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const [reference, ...words] = positionals.filter((value, index) => !(index === 1 && value === "--"));
+  const text = words.join(" ").trim() || readStdinIfPiped().trim();
+  if (!reference || !text) {
+    throw new Error("Provide a job id and a message: send <job-id> <message>.");
+  }
+  const timeoutMs = options["timeout-ms"] === undefined ? DEFAULT_SEND_TIMEOUT_MS : Number(options["timeout-ms"]);
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    throw new Error("--timeout-ms must be a number of milliseconds.");
+  }
+
+  await reconcileJobLiveness(cwd);
+  const job = listJobs(workspaceRoot).find((candidate) => candidate.id === reference);
+  if (!job) {
+    throw new Error(`No job ${reference} was found for this repository.`);
+  }
+  if (job.jobClass !== "task") {
+    throw new Error(`${job.id} is a ${job.jobClass ?? "non-task"} job. Messages can be sent only to task jobs.`);
+  }
+
+  const result = isActiveJobStatus(job.status)
+    ? await waitForMessageOutcome(cwd, workspaceRoot, job, queueJobMessage(workspaceRoot, job.id, text), text, timeoutMs)
+    : startTurnOnFinishedJob(cwd, workspaceRoot, readStoredJob(workspaceRoot, job.id) ?? job, text);
+  outputCommandResult(result, renderSendResult(result), options.json);
+}
+
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file", "output-schema", "resume-thread"],
@@ -1016,12 +1159,31 @@ async function handleStatus(argv) {
 
 async function handleResult(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json"]
+    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
+    booleanOptions: ["json", "wait"]
   });
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
+  if (options.wait) {
+    if (!reference) {
+      throw new Error("`result --wait` requires a job id.");
+    }
+    const snapshot = await waitForSingleJobSnapshot(cwd, reference, {
+      timeoutMs: options["timeout-ms"],
+      pollIntervalMs: options["poll-interval-ms"]
+    });
+    if (snapshot.waitTimedOut) {
+      const seconds = Math.round(snapshot.timeoutMs / 1000);
+      outputCommandResult(
+        { job: snapshot.job, waitTimedOut: true },
+        `Job ${snapshot.job.id} is still running after ${seconds} s. Run the same command again to keep waiting.\n`,
+        options.json
+      );
+      process.exitCode = STILL_RUNNING_EXIT_CODE;
+      return;
+    }
+  }
   await reconcileJobLiveness(cwd);
   const { workspaceRoot, job } = resolveResultJob(cwd, reference);
   let storedJob = readStoredJob(workspaceRoot, job.id);
@@ -1191,6 +1353,9 @@ async function runSubcommand(subcommand, argv) {
       break;
     case "usage":
       await handleUsage(argv);
+      break;
+    case "send":
+      await handleSend(argv);
       break;
     case "task-worker":
       await handleTaskWorker(argv);

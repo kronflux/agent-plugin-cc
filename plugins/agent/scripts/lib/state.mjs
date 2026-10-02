@@ -22,6 +22,7 @@ const CANCELLED_MARKER_SUFFIX = ".cancelled";
 const REMOVED_MARKER_SUFFIX = ".removed";
 const REMOVED_MARKER_LIFETIME_MS = 60 * 60 * 1000;
 const REQUEST_FILE_SUFFIX = ".request.json";
+const MESSAGES_DIR_SUFFIX = ".messages";
 const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const DEFAULT_CONFIG = Object.freeze({ stopReviewGate: false });
@@ -171,6 +172,11 @@ function applyCancelMarker(record, jobFile) {
   return { ...record, status: "cancelled", phase: "cancelled", pid: null };
 }
 
+// Messages for a running job wait in a private directory next to its record, one file each.
+function messagesDir(jobFile) {
+  return jobFile.replace(/\.json$/, MESSAGES_DIR_SUFFIX);
+}
+
 function requestFile(jobFile) {
   return jobFile.replace(/\.json$/, REQUEST_FILE_SUFFIX);
 }
@@ -297,6 +303,66 @@ export function takeJobRequest(cwd, jobId) {
   return request;
 }
 
+/** Queues `text` for the worker running the job and returns the message id. */
+export function queueJobMessage(cwd, jobId, text) {
+  const dir = messagesDir(resolveJobFile(cwd, jobId));
+  const id = `msg-${Date.now().toString(36)}-${randomBytes(4).toString("hex")}`;
+  writeJsonAtomic(path.join(dir, `${id}.pending.json`), { id, text, queuedAt: nowIso() });
+  return id;
+}
+
+// A queued message is claimed by renaming its file, so the worker and a sender that withdraws
+// it can never both take it.
+function claimMessage(dir, id, suffix) {
+  const pending = path.join(dir, `${id}.pending.json`);
+  const claimed = path.join(dir, `${id}.${suffix}.json`);
+  try {
+    fs.renameSync(pending, claimed);
+  } catch {
+    return null;
+  }
+  try {
+    return readJsonFile(claimed);
+  } finally {
+    fs.rmSync(claimed, { force: true });
+  }
+}
+
+/** Takes the job's queued messages, oldest first. Each message is returned once. */
+export function takeJobMessages(cwd, jobId) {
+  const dir = messagesDir(resolveJobFile(cwd, jobId));
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  return names
+    .filter((name) => name.endsWith(".pending.json"))
+    .sort()
+    .map((name) => claimMessage(dir, name.slice(0, -".pending.json".length), "taken"))
+    .filter((message) => typeof message?.text === "string");
+}
+
+/** Takes back a queued message no worker has taken. Returns false when it was already taken. */
+export function withdrawJobMessage(cwd, jobId, messageId) {
+  return claimMessage(messagesDir(resolveJobFile(cwd, jobId)), messageId, "withdrawn") !== null;
+}
+
+export function writeJobMessageOutcome(cwd, jobId, messageId, outcome) {
+  const dir = messagesDir(resolveJobFile(cwd, jobId));
+  writeJsonAtomic(path.join(dir, `${messageId}.outcome.json`), { ...outcome, at: nowIso() });
+}
+
+export function readJobMessageOutcome(cwd, jobId, messageId) {
+  const file = path.join(messagesDir(resolveJobFile(cwd, jobId)), `${messageId}.outcome.json`);
+  try {
+    return readJsonFile(file);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Merges `jobPatch` into the job's record, creating it when absent. With `onlyIf`, the patch
  * is applied only when the current record satisfies it; otherwise null is returned.
@@ -366,6 +432,7 @@ function removeJobArtifacts(jobFile, record) {
   fs.rmSync(jobFile, { force: true });
   fs.rmSync(markerFile(jobFile, CANCELLED_MARKER_SUFFIX), { force: true });
   fs.rmSync(requestFile(jobFile), { force: true });
+  fs.rmSync(messagesDir(jobFile), { recursive: true, force: true });
   if (record?.logFile) {
     fs.rmSync(record.logFile, { force: true });
   }

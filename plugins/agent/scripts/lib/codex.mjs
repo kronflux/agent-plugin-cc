@@ -567,11 +567,95 @@ function readTurnIdleTimeoutMs() {
   return /^\d+$/.test(raw) ? Math.min(Number(raw), 2 ** 31 - 1) : DEFAULT_TURN_IDLE_TIMEOUT_MS;
 }
 
+const MESSAGE_INBOX_POLL_MS = 500;
+
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
   const idleTimeoutMs = options.idleTimeoutMs ?? readTurnIdleTimeoutMs();
   let idleTimer = null;
+  const inbox = options.messageInbox ?? null;
+  const sentMessages = new Map();
+  let inboxTimer = null;
+  let inboxBusy = false;
+
+  function reportMessage(id, outcome) {
+    try {
+      inbox.report(id, outcome);
+    } catch {
+      // The sender reads a missing outcome as not confirmed.
+    }
+  }
+
+  // A queued message joins the running turn through turn/steer. Codex applies it at its next
+  // step and then emits a userMessage item carrying the message id as its clientId; only that
+  // item confirms the message. A rejected steer is retried once with the current turn id. Codex
+  // answers "no active turn to steer" once the turn has ended, which is reported as turn-ended.
+  async function steerTurn(queued) {
+    let lastError = null;
+    let turnEnded = false;
+    for (let attempt = 0; attempt < 2 && !state.completed && !turnEnded; attempt += 1) {
+      const expectedTurnId = state.turnId;
+      sentMessages.set(queued.id, queued);
+      try {
+        await client.request("turn/steer", {
+          threadId: state.threadId,
+          expectedTurnId,
+          clientUserMessageId: queued.id,
+          input: buildTurnInput(queued.text)
+        });
+        if (sentMessages.has(queued.id)) {
+          reportMessage(queued.id, { status: "sent", turnId: expectedTurnId });
+        }
+        emitProgress(state.onProgress, `Message sent to the running turn: ${shorten(queued.text, 96)}`);
+        return;
+      } catch (error) {
+        sentMessages.delete(queued.id);
+        lastError = error;
+        turnEnded = /no active turn/i.test(String(error?.message ?? ""));
+      }
+    }
+    reportMessage(
+      queued.id,
+      state.completed || turnEnded ? { status: "turn-ended" } : { status: "failed", error: lastError?.message ?? "turn/steer failed." }
+    );
+  }
+
+  async function deliverQueuedMessages() {
+    if (!inbox || inboxBusy || state.completed || !state.turnId) {
+      return;
+    }
+    inboxBusy = true;
+    try {
+      let queued = [];
+      try {
+        queued = inbox.take();
+      } catch {
+        queued = [];
+      }
+      for (const message of queued) {
+        await steerTurn(message);
+      }
+    } finally {
+      inboxBusy = false;
+    }
+  }
+
+  function confirmMessage(item) {
+    const text = (Array.isArray(item.content) ? item.content : [])
+      .map((part) => (typeof part?.text === "string" ? part.text : ""))
+      .join("")
+      .trim();
+    const match =
+      (item.clientId && sentMessages.get(item.clientId)) ||
+      [...sentMessages.values()].find((message) => message.text.trim() === text);
+    if (!match) {
+      return;
+    }
+    sentMessages.delete(match.id);
+    reportMessage(match.id, { status: "applied", turnId: state.turnId });
+    emitProgress(state.onProgress, `Codex received the message: ${shorten(match.text, 96)}`);
+  }
 
   // When Codex stops sending events without finishing the turn, the turn is interrupted and
   // completed as failed, keeping the messages it produced.
@@ -612,6 +696,13 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
 
     applyTurnNotification(state, message);
+    if (
+      inbox &&
+      (message.method === "item/started" || message.method === "item/completed") &&
+      message.params?.item?.type === "userMessage"
+    ) {
+      confirmMessage(message.params.item);
+    }
     armIdleTimer();
   });
 
@@ -637,9 +728,18 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
     armIdleTimer();
+    if (inbox && !state.completed) {
+      void deliverQueuedMessages();
+      inboxTimer = setInterval(() => void deliverQueuedMessages(), MESSAGE_INBOX_POLL_MS);
+      inboxTimer.unref?.();
+    }
 
     return await state.completion;
   } finally {
+    clearInterval(inboxTimer);
+    for (const id of sentMessages.keys()) {
+      reportMessage(id, { status: "unconfirmed" });
+    }
     clearTimeout(idleTimer);
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
@@ -1257,7 +1357,7 @@ export async function runAppServerTurn(cwd, options = {}) {
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null
         }),
-      { onProgress: options.onProgress }
+      { onProgress: options.onProgress, messageInbox: options.messageInbox ?? null }
     );
 
     return {
