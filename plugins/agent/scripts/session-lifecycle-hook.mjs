@@ -17,28 +17,40 @@ import {
 import { terminateJobProcesses } from "./lib/job-control.mjs";
 import { listJobs, removeJob } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
+import { readHookInputJson } from "./lib/fs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 
-function readHookInput() {
-  const raw = fs.readFileSync(0, "utf8").trim();
-  if (!raw) {
-    return {};
-  }
-  return JSON.parse(raw);
-}
-
 function shellEscape(value) {
   return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
 }
 
+// SessionStart runs again on resume, clear, and compaction. A line is appended only when the
+// variable's last export in the file has a different value, so repeated runs add nothing.
+// The file is only appended to, because other hooks may be appending at the same time.
 function appendEnvVar(name, value) {
-  if (!process.env.CLAUDE_ENV_FILE || value == null || value === "") {
+  const envFile = process.env.CLAUDE_ENV_FILE;
+  if (!envFile || value == null || value === "") {
     return;
   }
-  fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
+  const line = `export ${name}=${shellEscape(value)}`;
+  let existing = "";
+  try {
+    existing = fs.readFileSync(envFile, "utf8");
+  } catch {
+    // A missing file is created by the append below.
+  }
+  const lastExport = existing
+    .split(/\r?\n/)
+    .filter((candidate) => candidate.startsWith(`export ${name}=`))
+    .at(-1);
+  if (lastExport === line) {
+    return;
+  }
+  const separator = existing && !existing.endsWith("\n") ? "\n" : "";
+  fs.appendFileSync(envFile, `${separator}${line}\n`, "utf8");
 }
 
 function cleanupSessionJobs(cwd, sessionId) {
@@ -119,7 +131,7 @@ async function handleSessionEnd(input) {
 }
 
 async function main() {
-  const input = readHookInput();
+  const input = readHookInputJson();
   const eventName = process.argv[2] ?? input.hook_event_name ?? "";
 
   if (eventName === "SessionStart") {

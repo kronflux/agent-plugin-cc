@@ -19,7 +19,10 @@ they already have.
 
 - **ChatGPT subscription (incl. Free) or OpenAI API key.**
   - Usage will contribute to your Codex usage limits. [Learn more](https://developers.openai.com/codex/pricing).
-- **Node.js 18.18 or later**
+- **Node.js 18.18 or later**, findable as `node` on the PATH that Claude Code gives its hooks.
+  When Claude Code is started from a desktop launcher or an IDE, that PATH can lack a Node
+  installed through nvm, fnm, asdf, mise, or Homebrew. Add Node's directory in your Claude Code
+  settings, for example `"env": { "PATH": "/home/me/.nvm/versions/node/v22.12.0/bin:/usr/local/bin:/usr/bin:/bin" }`.
 
 ## Install
 
