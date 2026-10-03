@@ -87,20 +87,28 @@ export function parseArgs(argv, config = {}) {
   return { options, positionals };
 }
 
+// A backslash escapes only a quote, whitespace, or another backslash, so Windows paths such as
+// C:\work\notes.json keep their separators.
+function isEscapable(character) {
+  return character === "\"" || character === "'" || character === "\\" || /\s/.test(character ?? "");
+}
+
 export function splitRawArgumentString(raw) {
   const tokens = [];
   let current = "";
   let quote = null;
   let escaping = false;
+  const characters = [...raw];
 
-  for (const character of raw) {
+  for (let index = 0; index < characters.length; index += 1) {
+    const character = characters[index];
     if (escaping) {
       current += character;
       escaping = false;
       continue;
     }
 
-    if (character === "\\") {
+    if (character === "\\" && isEscapable(characters[index + 1])) {
       escaping = true;
       continue;
     }

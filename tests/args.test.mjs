@@ -6,7 +6,19 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run, stopTestBrokers } from "./helpers.mjs";
-import { parseArgs } from "../plugins/agent/scripts/lib/args.mjs";
+import { parseArgs, splitRawArgumentString } from "../plugins/agent/scripts/lib/args.mjs";
+
+test("the raw argument splitter keeps Windows path separators", () => {
+  assert.deepEqual(splitRawArgumentString(String.raw`--source C:\work\notes.json`), ["--source", String.raw`C:\work\notes.json`]);
+  assert.deepEqual(splitRawArgumentString(String.raw`"C:\work dir\m.json" --x`), [String.raw`C:\work dir\m.json`, "--x"]);
+  assert.deepEqual(splitRawArgumentString(String.raw`\\server\share`), [String.raw`\server\share`]);
+});
+
+test("the raw argument splitter still escapes quotes and spaces", () => {
+  assert.deepEqual(splitRawArgumentString(String.raw`say \"hi\" a\ b`), ["say", `"hi"`, "a b"]);
+  assert.deepEqual(splitRawArgumentString(String.raw`it\'s`), ["it's"]);
+  assert.deepEqual(splitRawArgumentString("end\\\\"), ["end\\"]);
+});
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
