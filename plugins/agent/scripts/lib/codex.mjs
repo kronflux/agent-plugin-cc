@@ -669,8 +669,9 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
         return;
       }
       const seconds = Math.round(idleTimeoutMs / 1000);
-      state.error = { message: `Codex sent no events for ${seconds} s, so the turn was stopped. Its output so far is kept.` };
-      emitProgress(state.onProgress, state.error.message, "failed");
+      const message = `Codex sent no events for ${seconds} s, so the turn was stopped. Its output so far is kept.`;
+      state.error = { message };
+      emitProgress(state.onProgress, message, "failed");
       client.request("turn/interrupt", { threadId: state.threadId, turnId: state.turnId }).catch(() => {});
       completeTurn(state, { id: state.turnId, status: "failed" });
     }, idleTimeoutMs);
