@@ -87,6 +87,12 @@ export function ensureGitRepository(cwd) {
   return result.stdout.trim();
 }
 
+/** Creates a worktree at `worktreePath` on the new branch `branch`, starting from HEAD. */
+export function createWorktree(repoRoot, worktreePath, branch) {
+  fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+  gitChecked(repoRoot, ["worktree", "add", "-b", branch, worktreePath, "HEAD"]);
+}
+
 export function getRepoRoot(cwd) {
   return gitChecked(cwd, ["rev-parse", "--show-toplevel"]).stdout.trim();
 }

@@ -24,7 +24,7 @@ import {
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath, stageClaudeSessionForImport } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
-import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { collectReviewContext, createWorktree, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { KNOWN_REASONING_EFFORTS } from "./lib/model-catalog.mjs";
 import { binaryAvailable, isProcessAlive } from "./lib/process.mjs";
 import { readTurnResultFromRollout } from "./lib/rollout.mjs";
@@ -37,6 +37,7 @@ import {
   markJobResultDelivered,
   queueJobMessage,
   readJobMessageOutcome,
+  resolveStateDir,
   takeJobMessages,
   withdrawJobMessage,
   writeJobMessageOutcome,
@@ -98,7 +99,7 @@ const SUBCOMMAND_USAGE = {
   setup: `setup [--enable-review-gate|--disable-review-gate] [--write-sandbox <${WRITE_SANDBOXES.join("|")}>] [--json]`,
   review: `review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark>] [--effort ${EFFORT_USAGE}]`,
   "adversarial-review": `adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark>] [--effort ${EFFORT_USAGE}] [focus text]`,
-  task: `task [--background] [--write] [--resume-last|--resume|--resume-thread <thread-id>|--fresh] [--from-last-review] [--model <model|spark>] [--effort ${EFFORT_USAGE}] [--output-schema <file>] [--] [prompt]`,
+  task: `task [--background] [--write] [--worktree] [--resume-last|--resume|--resume-thread <thread-id>|--fresh] [--from-last-review] [--model <model|spark>] [--effort ${EFFORT_USAGE}] [--output-schema <file>] [--manifest <file.json>] [--] [prompt]`,
   transfer: "transfer [--source <claude-jsonl>] [--json]",
   usage: "usage [--json]",
   send: "send [--timeout-ms <ms>] [--json] <job-id> <message>",
@@ -536,6 +537,7 @@ async function executeTaskRun(request) {
     sandbox: request.write ? getConfig(workspaceRoot).writeSandbox ?? "workspace-write" : "read-only",
     onProgress: request.onProgress,
     outputSchema: request.outputSchema ?? null,
+    threadCwd: request.worktreePath ?? null,
     messageInbox: request.jobId
       ? {
           take: () => takeJobMessages(workspaceRoot, request.jobId),
@@ -557,12 +559,15 @@ async function executeTaskRun(request) {
     {
       title: taskMetadata.title,
       jobId: request.jobId ?? null,
-      write: Boolean(request.write)
+      write: Boolean(request.write),
+      worktreePath: request.worktreePath ?? null,
+      worktreeBranch: request.worktreeBranch ?? null
     }
   );
   const payload = {
     status: result.status,
     jobId: request.jobId ?? null,
+    ...(request.worktreePath ? { worktreePath: request.worktreePath, worktreeBranch: request.worktreeBranch } : {}),
     threadId: result.threadId,
     rawOutput,
     ...(result.status !== 0 && failureMessage ? { failureMessage } : {}),
@@ -608,7 +613,8 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
 }
 
 function renderQueuedTaskLaunch(payload) {
-  return `${payload.title} started in the background as ${payload.jobId}. Check /agent:status ${payload.jobId} for progress.\n`;
+  const worktree = payload.worktreePath ? ` It runs in the worktree ${payload.worktreePath} (branch ${payload.worktreeBranch}).` : "";
+  return `${payload.title} started in the background as ${payload.jobId}.${worktree} Check /agent:status ${payload.jobId} for progress.\n`;
 }
 
 function getJobKindLabel(kind, jobClass) {
@@ -655,7 +661,16 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, resumeThreadId = null, jobId, outputSchema = null }) {
+// A worktree job gets its own checkout of HEAD under the state directory, on the new branch
+// agent/<job-id>. The job's record stays with the repository; only Codex works in the worktree.
+function attachWorktree(job) {
+  const worktreePath = path.join(resolveStateDir(job.workspaceRoot), "worktrees", job.id);
+  const worktreeBranch = `agent/${job.id}`;
+  createWorktree(job.workspaceRoot, worktreePath, worktreeBranch);
+  return { ...job, worktreePath, worktreeBranch };
+}
+
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, resumeThreadId = null, jobId, outputSchema = null, worktreePath = null, worktreeBranch = null }) {
   return {
     cwd,
     model,
@@ -665,7 +680,9 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, resum
     resumeLast,
     resumeThreadId,
     jobId,
-    outputSchema
+    outputSchema,
+    worktreePath,
+    worktreeBranch
   };
 }
 
@@ -777,7 +794,8 @@ function enqueueBackgroundTask(cwd, job, request) {
       status: "queued",
       title: job.title,
       summary: job.summary,
-      logFile
+      logFile,
+      ...(job.worktreePath ? { worktreePath: job.worktreePath, worktreeBranch: job.worktreeBranch } : {})
     },
     logFile
   };
@@ -993,10 +1011,113 @@ async function handleSend(argv) {
   outputCommandResult(result, renderSendResult(result), options.json);
 }
 
+const MANIFEST_FIELDS = new Set(["label", "prompt", "model", "effort", "write", "worktree"]);
+const MANIFEST_SHAPE = "a JSON array of {label, prompt, model?, effort?, write?, worktree?}";
+
+// Reads and checks every manifest entry before any job starts.
+function readTaskManifest(cwd, file) {
+  let entries;
+  try {
+    entries = JSON.parse(fs.readFileSync(path.resolve(cwd, file), "utf8"));
+  } catch (error) {
+    throw new Error(`Could not read the manifest ${file}: ${error.message}`);
+  }
+  if (!Array.isArray(entries) || entries.length === 0) {
+    throw new Error(`The manifest must be ${MANIFEST_SHAPE}.`);
+  }
+  const labels = new Set();
+  return entries.map((entry, index) => {
+    const position = `Manifest entry ${index + 1}`;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`${position} is not an object. The manifest must be ${MANIFEST_SHAPE}.`);
+    }
+    const unknown = Object.keys(entry).filter((key) => !MANIFEST_FIELDS.has(key));
+    if (unknown.length > 0) {
+      throw new Error(`${position} has unknown fields: ${unknown.join(", ")}.`);
+    }
+    const label = typeof entry.label === "string" ? entry.label.trim() : "";
+    const prompt = typeof entry.prompt === "string" ? entry.prompt.trim() : "";
+    if (!label || !prompt) {
+      throw new Error(`${position} needs a label and a prompt.`);
+    }
+    if (labels.has(label)) {
+      throw new Error(`${position} repeats the label "${label}".`);
+    }
+    labels.add(label);
+    for (const flag of ["write", "worktree"]) {
+      if (entry[flag] !== undefined && typeof entry[flag] !== "boolean") {
+        throw new Error(`${position}: ${flag} must be true or false.`);
+      }
+    }
+    return {
+      label,
+      prompt,
+      model: entry.model == null ? undefined : normalizeRequestedModel(String(entry.model)),
+      effort: entry.effort == null ? undefined : normalizeReasoningEffort(String(entry.effort)),
+      write: entry.write,
+      worktree: entry.worktree
+    };
+  });
+}
+
+// Starts one background task per manifest entry. Command-line --model, --effort, --write, and
+// --worktree apply to entries that do not set them.
+function launchManifestTasks(cwd, workspaceRoot, options, positionals, defaults) {
+  const conflicting = ["prompt-file", "resume-last", "resume", "resume-thread", "fresh", "from-last-review", "output-schema"].filter(
+    (name) => options[name] !== undefined && options[name] !== false
+  );
+  if (positionals.length > 0 || conflicting.length > 0) {
+    throw new Error(
+      `--manifest takes its prompts from the file. Remove ${[...conflicting.map((name) => `--${name}`), ...(positionals.length > 0 ? ["the prompt text"] : [])].join(", ")}.`
+    );
+  }
+  const entries = readTaskManifest(cwd, options.manifest);
+  ensureCodexAvailable(cwd);
+
+  const launched = [];
+  const failed = [];
+  for (const entry of entries) {
+    try {
+      const write = entry.write ?? Boolean(options.write);
+      const metadata = { ...buildTaskRunMetadata({ prompt: entry.prompt }), title: `Codex Task: ${entry.label}` };
+      const baseJob = buildTaskJob(workspaceRoot, metadata, write);
+      const job = entry.worktree ?? options.worktree ? attachWorktree(baseJob) : baseJob;
+      const request = buildTaskRequest({
+        cwd,
+        model: entry.model ?? defaults.model,
+        effort: entry.effort ?? defaults.effort,
+        prompt: entry.prompt,
+        write,
+        resumeLast: false,
+        jobId: job.id,
+        worktreePath: job.worktreePath ?? null,
+        worktreeBranch: job.worktreeBranch ?? null
+      });
+      enqueueBackgroundTask(cwd, job, request);
+      launched.push({ label: entry.label, jobId: job.id, ...(job.worktreePath ? { worktreePath: job.worktreePath } : {}) });
+    } catch (error) {
+      failed.push({ label: entry.label, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  const lines = [`Started ${launched.length} of ${entries.length} Codex tasks in the background:`];
+  for (const job of launched) {
+    lines.push(`- ${job.label}: ${job.jobId}${job.worktreePath ? ` (worktree ${job.worktreePath})` : ""}`);
+  }
+  for (const job of failed) {
+    lines.push(`- ${job.label}: not started. ${job.error}`);
+  }
+  lines.push("Check /agent:status for progress.");
+  outputCommandResult({ jobs: launched, failed }, `${lines.join("\n")}\n`, options.json);
+  if (failed.length > 0) {
+    process.exitCode = 1;
+  }
+}
+
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file", "output-schema", "resume-thread"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "from-last-review"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "output-schema", "resume-thread", "manifest"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "from-last-review", "worktree"],
     stopAtFirstPositional: true,
     aliasMap: {
       m: "model"
@@ -1007,6 +1128,10 @@ async function handleTask(argv) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
+  if (options.manifest) {
+    launchManifestTasks(cwd, workspaceRoot, options, positionals, { model, effort });
+    return;
+  }
   const requestText = readTaskPrompt(cwd, options, positionals);
   const prompt = options["from-last-review"] ? buildReviewHandoffPrompt(workspaceRoot, requestText) : requestText;
   const outputSchema = options["output-schema"] ? readOutputSchema(path.resolve(cwd, options["output-schema"])) : null;
@@ -1027,7 +1152,8 @@ async function handleTask(argv) {
     ensureCodexAvailable(cwd);
     requireTaskRequest(prompt, resumeLast || Boolean(resumeThreadId));
 
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+    const baseJob = buildTaskJob(workspaceRoot, taskMetadata, write);
+    const job = options.worktree ? attachWorktree(baseJob) : baseJob;
     const request = buildTaskRequest({
       cwd,
       model,
@@ -1037,14 +1163,17 @@ async function handleTask(argv) {
       resumeLast,
       resumeThreadId,
       jobId: job.id,
-      outputSchema
+      outputSchema,
+      worktreePath: job.worktreePath ?? null,
+      worktreeBranch: job.worktreeBranch ?? null
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const baseJob = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const job = options.worktree ? attachWorktree(baseJob) : baseJob;
   await runForegroundCommand(
     job,
     (progress) =>
@@ -1058,6 +1187,8 @@ async function handleTask(argv) {
         resumeThreadId,
         jobId: job.id,
         outputSchema,
+        worktreePath: job.worktreePath ?? null,
+        worktreeBranch: job.worktreeBranch ?? null,
         onProgress: progress
       }),
     { json: options.json }

@@ -41,6 +41,7 @@ Forwarding rules:
 - Treat `--effort <value>` and `--model <value>` as runtime controls and do not include them in the task text you pass through.
 - Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
 - Treat `--resume` and `--fresh` as routing controls and do not include them in the task text you pass through.
+- If the request includes `--worktree`, add `--worktree` to the `task` call and do not include it in the task text. Codex then works in a new git worktree, and the result names its path.
 - If the request includes `--from-last-review`, add `--from-last-review` to the `task` call and do not include it in the task text. The companion adds the review findings to the prompt.
 - `--resume` means add `--resume-last`.
 - `--fresh` means do not add `--resume-last`.

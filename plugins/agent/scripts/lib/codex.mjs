@@ -1315,13 +1315,15 @@ export async function runAppServerTurn(cwd, options = {}) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/agent:codex-setup`.");
   }
 
+  // The app server is the repository's; the thread can run in another directory, such as a worktree.
+  const threadCwd = options.threadCwd ?? cwd;
   return withAppServer(cwd, async (client) => {
     await validateModelSelection(client, { model: options.model, effort: options.effort });
     let threadId;
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
-      const response = await resumeThread(client, options.resumeThreadId, cwd, {
+      const response = await resumeThread(client, options.resumeThreadId, threadCwd, {
         model: options.model,
         sandbox: options.sandbox,
         ephemeral: false
@@ -1329,7 +1331,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       threadId = response.thread.id;
     } else {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
-      const response = await startThread(client, cwd, {
+      const response = await startThread(client, threadCwd, {
         model: options.model,
         sandbox: options.sandbox,
         ephemeral: options.persistThread ? false : true,

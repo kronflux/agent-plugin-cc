@@ -23,11 +23,33 @@ const readline = require("node:readline");
 	  if (!fs.existsSync(STATE_PATH)) {
 	    return { nextThreadId: 1, nextTurnId: 1, appServerStarts: 0, threads: [], capabilities: null, lastInterrupt: null };
 	  }
-	  return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
+	  // Parallel jobs can run several fake app servers on one state file.
+	  for (let attempt = 0; ; attempt += 1) {
+	    try {
+	      return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
+	    } catch (error) {
+	      if (attempt >= 20) {
+	        throw error;
+	      }
+	      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+	    }
+	  }
 	}
 
 function saveState(state) {
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
+  const tempFile = STATE_PATH + "." + process.pid + ".tmp";
+  fs.writeFileSync(tempFile, JSON.stringify(state, null, 2));
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.renameSync(tempFile, STATE_PATH);
+      return;
+    } catch (error) {
+      if (attempt >= 50) {
+        throw error;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
 }
 
 function requiresExperimental(field, message, state) {
@@ -562,6 +584,9 @@ rl.on("line", (line) => {
           .join("\\n");
         const turnId = nextTurnId(state);
         thread.updatedAt = now();
+        if (BEHAVIOR === "edit-file") {
+          fs.writeFileSync(path.join(thread.cwd, "codex-edit.txt"), "edited by fake codex\\n");
+        }
 	        state.lastTurnStart = {
 	          threadId: message.params.threadId,
 	          turnId,

@@ -313,14 +313,21 @@ export function renderNativeReviewResult(result, meta) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+function renderWorktreeNote(meta) {
+  if (!meta?.worktreePath) {
+    return "";
+  }
+  return `\nWorktree: ${meta.worktreePath} (branch ${meta.worktreeBranch}). Codex worked there, not in your checkout. When you are done with it, run: git worktree remove "${meta.worktreePath}"\n`;
+}
+
 export function renderTaskResult(parsedResult, meta) {
   const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
   if (rawOutput) {
-    return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
+    return `${rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`}${renderWorktreeNote(meta)}`;
   }
 
   const message = String(parsedResult?.failureMessage ?? "").trim() || "Codex did not return a final message.";
-  return `${message}\n`;
+  return `${message}\n${renderWorktreeNote(meta)}`;
 }
 
 export function renderStatusReport(report) {
@@ -389,6 +396,13 @@ export function renderJobStatusReport(job) {
 }
 
 export function renderStoredJobResult(job, storedJob) {
+  return `${renderStoredJobBody(job, storedJob)}${renderWorktreeNote({
+    worktreePath: storedJob?.worktreePath ?? job.worktreePath,
+    worktreeBranch: storedJob?.worktreeBranch ?? job.worktreeBranch
+  })}`;
+}
+
+function renderStoredJobBody(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
