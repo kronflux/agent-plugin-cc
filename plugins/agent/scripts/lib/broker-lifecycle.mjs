@@ -188,7 +188,52 @@ async function isBrokerEndpointReady(endpoint, timeoutMs = QUICK_PROBE_MS) {
   }
 }
 
+const START_LOCK_STALE_MS = 30000;
+const START_LOCK_WAIT_MS = 15000;
+
+function removeStaleStartLock(lockFile) {
+  try {
+    if (Date.now() - fs.statSync(lockFile).mtimeMs > START_LOCK_STALE_MS) {
+      fs.rmSync(lockFile, { force: true });
+    }
+  } catch {
+    // The lock was released in the meantime.
+  }
+}
+
+// Parallel jobs can find no broker at the same moment. Only the process holding the start lock,
+// a file created exclusively next to the broker state, starts one; the others wait and then use
+// the broker it started. After START_LOCK_WAIT_MS a waiting process goes ahead without the lock.
 export async function ensureBrokerSession(cwd, options = {}) {
+  const lockFile = `${resolveBrokerStateFile(cwd)}.lock`;
+  const deadline = Date.now() + (options.startLockWaitMs ?? START_LOCK_WAIT_MS);
+  for (;;) {
+    let acquired = false;
+    try {
+      fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+      fs.closeSync(fs.openSync(lockFile, "wx"));
+      acquired = true;
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        return startOrReuseBroker(cwd, options);
+      }
+    }
+    if (acquired) {
+      try {
+        return await startOrReuseBroker(cwd, options);
+      } finally {
+        fs.rmSync(lockFile, { force: true });
+      }
+    }
+    removeStaleStartLock(lockFile);
+    if (Date.now() >= deadline) {
+      return startOrReuseBroker(cwd, options);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+async function startOrReuseBroker(cwd, options) {
   const existing = loadBrokerSession(cwd);
   const probe = options.probeEndpoint ?? isBrokerEndpointReady;
   if (existing && (await probe(existing.endpoint, QUICK_PROBE_MS))) {

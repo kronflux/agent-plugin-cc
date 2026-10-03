@@ -199,3 +199,31 @@ test(
     assert.equal(isProcessAlive(session.pid), true, "the broker was stopped with the worker");
   }
 );
+
+test("processes that need a broker at the same moment share one", async (t) => {
+  const workspace = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const source =
+    `import { ensureBrokerSession } from ${JSON.stringify(LIFECYCLE_MODULE)};\n` +
+    `const session = await ensureBrokerSession(${JSON.stringify(workspace)});\n` +
+    "process.stdout.write(JSON.stringify(session));\n";
+  const runOne = () =>
+    new Promise((resolve) => {
+      const child = spawn(process.execPath, ["--input-type=module", "-e", source], {
+        env: buildEnv(binDir),
+        stdio: ["ignore", "pipe", "inherit"]
+      });
+      let output = "";
+      child.stdout.on("data", (chunk) => {
+        output += chunk;
+      });
+      child.on("exit", () => resolve(JSON.parse(output)));
+    });
+
+  const sessions = await Promise.all([runOne(), runOne(), runOne()]);
+  t.after(() => Promise.all([...new Set(sessions.map((session) => session.endpoint))].map((endpoint) => sendBrokerShutdown(endpoint))));
+
+  assert.equal(new Set(sessions.map((session) => session.endpoint)).size, 1);
+  assert.equal(new Set(sessions.map((session) => session.pid)).size, 1);
+});
