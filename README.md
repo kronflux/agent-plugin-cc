@@ -1,5 +1,11 @@
 # Agent plugin for Claude Code
 
+This plugin is a fork of the Codex plugin for Claude Code
+([openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc)). It keeps the same Codex
+integration and adds Windows support, background jobs that report back on their own, messages
+to running tasks, parallel tasks in separate worktrees, usage limits, and stricter handling of
+prompts and job state. See [the changelog](plugins/agent/CHANGELOG.md) for the full list.
+
 Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex. Commands are
 provided by the `agent` plugin and prefixed with the agent they drive, for example
 `/agent:codex-review`.
@@ -15,6 +21,7 @@ they already have.
 - `/agent:codex-adversarial-review` for a steerable challenge review
 - `/agent:codex-rescue`, `/agent:codex-transfer`, `/agent:status`, `/agent:result`, `/agent:send`, and `/agent:cancel` to delegate work, hand off sessions, and manage background jobs
 - `/agent:codex-usage` to see how much of your Codex usage limits is left
+- `/agent:codex-fanout` to start several Codex tasks at once from a manifest
 
 ## Requirements
 
@@ -145,7 +152,7 @@ The subagent starts Codex as a background job, waits until the job finishes, and
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, `--fresh`, and `--from-last-review`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo. `--from-last-review` sends the findings of the newest finished `/agent:codex-review` or `/agent:codex-adversarial-review` run, preferring runs from the current Claude session; any text you add is sent with them.
+It supports `--background`, `--wait`, `--resume`, `--fresh`, `--worktree`, and `--from-last-review`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo. `--from-last-review` sends the findings of the newest finished `/agent:codex-review` or `/agent:codex-adversarial-review` run, preferring runs from the current Claude session; any text you add is sent with them.
 
 Examples:
 
@@ -157,7 +164,13 @@ Examples:
 /agent:codex-rescue --model spark fix the issue quickly
 /agent:codex-rescue --background investigate the regression
 /agent:codex-rescue --from-last-review skip the style findings
+/agent:codex-rescue --worktree try a rewrite of the cache layer
 ```
+
+With `--worktree`, Codex works in a new git worktree on the branch `agent/<job-id>`, created from
+your last commit, so your checkout stays untouched. Uncommitted changes in your checkout are not
+in the worktree. The result names the worktree path. Review or merge the branch, then remove the
+worktree with `git worktree remove <path>`.
 
 You can also just ask for a task to be delegated to Codex:
 
@@ -226,6 +239,29 @@ Examples:
 ```bash
 /agent:result
 /agent:result task-abc123
+```
+
+### `/agent:codex-fanout`
+
+Starts one background Codex task per entry of a JSON manifest and prints the job IDs.
+
+```json
+[
+  { "label": "lint", "prompt": "fix the lint errors in src/" },
+  { "label": "docs", "prompt": "update the README for the new flags", "effort": "low" },
+  { "label": "cache", "prompt": "try a rewrite of the cache layer", "write": true, "worktree": true }
+]
+```
+
+Each entry needs a `label` and a `prompt`; `model`, `effort`, `write`, and `worktree` are
+optional. `--write`, `--worktree`, `--model`, and `--effort` on the command apply to entries
+that do not set them. Every entry is checked before any task starts. Give write tasks
+`worktree: true` so parallel edits do not collide. Use a path relative to the repository, or
+quote a path that contains spaces.
+
+```bash
+/agent:codex-fanout tasks.json
+/agent:codex-fanout tasks.json --write --worktree
 ```
 
 ### `/agent:send`
