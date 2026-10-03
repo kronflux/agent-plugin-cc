@@ -15,19 +15,20 @@ import {
     getCodexAvailability,
     getSessionRuntimeStatus,
     importExternalAgentSession,
-    interruptAppServerTurn,
     parseStructuredOutput,
     readCodexRateLimits,
     readOutputSchema,
     runAppServerReview,
     runAppServerTurn
-  } from "./lib/codex.mjs";
-import { resolveClaudeSessionPath, stageClaudeSessionForImport } from "./lib/claude-session-transfer.mjs";
+  } from "./providers/codex/runtime.mjs";
+import { resolveClaudeSessionPath, stageClaudeSessionForImport } from "./providers/codex/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, createWorktree, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { KNOWN_REASONING_EFFORTS } from "./lib/model-catalog.mjs";
+import { KNOWN_REASONING_EFFORTS } from "./providers/codex/model-catalog.mjs";
 import { binaryAvailable, isProcessAlive } from "./lib/process.mjs";
-import { readTurnResultFromRollout } from "./lib/rollout.mjs";
+import { codexProvider } from "./providers/codex/index.mjs";
+import { renderSetupReport, renderUsageReport } from "./providers/codex/render.mjs";
+import { providerForJob } from "./lib/providers.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -72,10 +73,8 @@ import {
   renderStoredJobResult,
   renderCancelReport,
   renderJobStatusReport,
-  renderSetupReport,
   renderStatusReport,
-  renderTaskResult,
-  renderUsageReport
+  renderTaskResult
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -627,6 +626,7 @@ function getJobKindLabel(kind, jobClass) {
 function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false }) {
   return createJobRecord({
     id: generateJobId(prefix),
+    provider: codexProvider.id,
     kind,
     kindLabel: getJobKindLabel(kind, jobClass),
     title,
@@ -643,6 +643,7 @@ function createTrackedProgress(job, options = {}) {
     logFile,
     progress: createProgressReporter({
       stderr: Boolean(options.stderr),
+      label: providerForJob(job).progressLabel,
       logFile,
       onEvent: createJobProgressUpdater(job.workspaceRoot, job.id)
     })
@@ -1004,6 +1005,10 @@ async function handleSend(argv) {
   if (job.jobClass !== "task") {
     throw new Error(`${job.id} is a ${job.jobClass ?? "non-task"} job. Messages can be sent only to task jobs.`);
   }
+  const provider = providerForJob(job);
+  if (isActiveJobStatus(job.status) && !provider.capabilities.steer) {
+    throw new Error(`${provider.label} cannot take a message during a running turn. Send it after ${job.id} finishes.`);
+  }
 
   const result = isActiveJobStatus(job.status)
     ? await waitForMessageOutcome(cwd, workspaceRoot, job, queueJobMessage(workspaceRoot, job.id, text), text, timeoutMs)
@@ -1324,12 +1329,16 @@ async function handleResult(argv) {
   const hasOutput = Boolean(storedJob?.result?.rawOutput || storedJob?.result?.codex?.stdout || storedJob?.rendered);
   // A job that stopped without storing its output may still have it in the Codex transcript.
   if (!hasOutput) {
-    const recovered = readTurnResultFromRollout(storedJob?.threadId ?? job.threadId, storedJob?.turnId ?? job.turnId);
+    const provider = providerForJob(job);
+    const recovered = provider.recoverTurnResult?.({
+      threadId: storedJob?.threadId ?? job.threadId,
+      turnId: storedJob?.turnId ?? job.turnId
+    });
     if (recovered) {
       storedJob = { ...storedJob, result: { ...(storedJob?.result ?? {}), rawOutput: recovered.text }, recovered };
       recoveredNote = recovered.complete
-        ? "Recovered from the Codex transcript.\n\n"
-        : "Recovered from the Codex transcript. The turn did not finish; this is its last message.\n\n";
+        ? `Recovered from the ${provider.label} transcript.\n\n`
+        : `Recovered from the ${provider.label} transcript. The turn did not finish; this is its last message.\n\n`;
     }
   }
   const payload = {
@@ -1394,13 +1403,14 @@ async function handleCancel(argv) {
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
 
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  const provider = providerForJob(job);
+  const interrupt = await provider.interruptTurn(cwd, { threadId, turnId });
   if (interrupt.attempted) {
     appendLogLine(
       job.logFile,
       interrupt.interrupted
-        ? `Requested Codex turn interrupt for ${turnId} on ${threadId}.`
-        : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
+        ? `Requested ${provider.label} turn interrupt for ${turnId} on ${threadId}.`
+        : `${provider.label} turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
     );
   }
 

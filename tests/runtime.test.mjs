@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run, stopTestBrokers } from "./helpers.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/agent/scripts/lib/broker-lifecycle.mjs";
+import { loadBrokerSession, saveBrokerSession } from "../plugins/agent/scripts/providers/codex/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/agent/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { ensureAbsolutePath } from "./fs.mjs";
+import { ensureAbsolutePath } from "../../lib/fs.mjs";
 
 export const TRANSCRIPT_PATH_ENV = "CODEX_COMPANION_TRANSCRIPT_PATH";
 const STAGING_DIR_PREFIX = ".agent-plugin-transfer-";

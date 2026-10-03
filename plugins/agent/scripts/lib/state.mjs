@@ -90,7 +90,7 @@ export function resolveJobsDir(cwd) {
   return path.join(resolveStateDir(cwd), JOBS_DIR_NAME);
 }
 
-// State directories hold prompts and Codex output, so on POSIX systems they are readable by
+// State directories hold prompts and agent output, so on POSIX systems they are readable by
 // their owner only, including directories created before this mode was applied.
 const privateDirs = new Set();
 

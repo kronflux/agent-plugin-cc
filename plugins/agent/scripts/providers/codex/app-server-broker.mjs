@@ -5,9 +5,9 @@ import net from "node:net";
 import path from "node:path";
 import process from "node:process";
 
-import { parseArgs } from "./lib/args.mjs";
-import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
-import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { parseArgs } from "../../lib/args.mjs";
+import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./app-server.mjs";
+import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 const THREAD_LOADING_METHODS = new Set(["thread/start", "thread/resume", "thread/fork"]);
@@ -66,7 +66,7 @@ function writePidFile(pidFile) {
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (subcommand !== "serve") {
-    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>]");
+    throw new Error("Usage: node scripts/providers/codex/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>]");
   }
 
   const { options } = parseArgs(argv, {

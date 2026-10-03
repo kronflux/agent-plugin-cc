@@ -6,8 +6,8 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { isProcessAlive, readProcessCommandLines } from "./process.mjs";
-import { resolveStateDir } from "./state.mjs";
+import { isProcessAlive, readProcessCommandLines } from "../../lib/process.mjs";
+import { resolveStateDir } from "../../lib/state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
@@ -268,7 +268,7 @@ async function startOrReuseBroker(cwd, options) {
   const logFile = path.join(sessionDir, "broker.log");
   const scriptPath =
     options.scriptPath ??
-    fileURLToPath(new URL("../app-server-broker.mjs", import.meta.url));
+    fileURLToPath(new URL("./app-server-broker.mjs", import.meta.url));
 
   const child = spawnBrokerProcess({
     scriptPath,

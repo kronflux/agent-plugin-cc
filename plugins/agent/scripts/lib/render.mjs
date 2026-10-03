@@ -1,3 +1,10 @@
+import { getProvider, providerForJob } from "./providers.mjs";
+
+// Results name the provider that produced them; callers pass its label.
+function labelFor(meta) {
+  return meta?.providerLabel ?? getProvider().label;
+}
+
 function severityRank(severity) {
   switch (severity) {
     case "critical":
@@ -99,11 +106,12 @@ function escapeMarkdownCell(value) {
     .trim();
 }
 
-function formatCodexResumeCommand(job) {
+function formatResumeLine(job) {
   if (!job?.threadId) {
     return null;
   }
-  return `codex resume ${job.threadId}`;
+  const provider = providerForJob(job);
+  return `Resume in ${provider.label}: ${provider.resumeCommand(job.threadId)}`;
 }
 
 function appendActiveJobsTable(lines, jobs) {
@@ -136,11 +144,11 @@ function pushJobDetails(lines, job, options = {}) {
     lines.push(`  Duration: ${job.duration}`);
   }
   if (job.threadId) {
-    lines.push(`  Codex session ID: ${job.threadId}`);
+    lines.push(`  ${providerForJob(job).label} session ID: ${job.threadId}`);
   }
-  const resumeCommand = formatCodexResumeCommand(job);
-  if (resumeCommand) {
-    lines.push(`  Resume in Codex: ${resumeCommand}`);
+  const resumeLine = formatResumeLine(job);
+  if (resumeLine) {
+    lines.push(`  ${resumeLine}`);
   }
   if (job.logFile && options.showLog) {
     lines.push(`  Log: ${job.logFile}`);
@@ -152,8 +160,9 @@ function pushJobDetails(lines, job, options = {}) {
     lines.push(`  Result: /agent:result ${job.id}`);
   }
   if (job.status !== "queued" && job.status !== "running" && job.jobClass === "task" && job.write && options.showReviewHint) {
-    lines.push("  Review changes: /agent:codex-review --wait");
-    lines.push("  Stricter review: /agent:codex-adversarial-review --wait");
+    const { reviewCommands } = providerForJob(job);
+    lines.push(`  Review changes: ${reviewCommands.review} --wait`);
+    lines.push(`  Stricter review: ${reviewCommands.adversarialReview} --wait`);
   }
   if (job.progressPreview?.length) {
     lines.push("  Progress:");
@@ -174,47 +183,12 @@ function appendReasoningSection(lines, reasoningSummary) {
   }
 }
 
-export function renderSetupReport(report) {
-  const lines = [
-    "# Codex Setup",
-    "",
-    `Status: ${report.ready ? "ready" : "needs attention"}`,
-    "",
-    "Checks:",
-    `- node: ${report.node.detail}`,
-    `- npm: ${report.npm.detail}`,
-    `- codex: ${report.codex.detail}`,
-    `- auth: ${report.auth.detail}`,
-    ...(report.appServer ? [`- app server: ${report.appServer}`] : []),
-    `- session runtime: ${report.sessionRuntime.label}`,
-    `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
-    ""
-  ];
-
-  if (report.actionsTaken.length > 0) {
-    lines.push("Actions taken:");
-    for (const action of report.actionsTaken) {
-      lines.push(`- ${action}`);
-    }
-    lines.push("");
-  }
-
-  if (report.nextSteps.length > 0) {
-    lines.push("Next steps:");
-    for (const step of report.nextSteps) {
-      lines.push(`- ${step}`);
-    }
-  }
-
-  return `${lines.join("\n").trimEnd()}\n`;
-}
-
 export function renderReviewResult(parsedResult, meta) {
   if (!parsedResult.parsed) {
     const lines = [
-      `# Codex ${meta.reviewLabel}`,
+      `# ${labelFor(meta)} ${meta.reviewLabel}`,
       "",
-      "Codex did not return valid structured JSON.",
+      `${labelFor(meta)} did not return valid structured JSON.`,
       "",
       `- Parse error: ${parsedResult.parseError}`
     ];
@@ -231,10 +205,10 @@ export function renderReviewResult(parsedResult, meta) {
   const validationError = validateReviewResultShape(parsedResult.parsed);
   if (validationError) {
     const lines = [
-      `# Codex ${meta.reviewLabel}`,
+      `# ${labelFor(meta)} ${meta.reviewLabel}`,
       "",
       `Target: ${meta.targetLabel}`,
-      "Codex returned JSON with an unexpected review shape.",
+      `${labelFor(meta)} returned JSON with an unexpected review shape.`,
       "",
       `- Validation error: ${validationError}`
     ];
@@ -251,7 +225,7 @@ export function renderReviewResult(parsedResult, meta) {
   const data = normalizeReviewResultData(parsedResult.parsed);
   const findings = [...data.findings].sort((left, right) => severityRank(left.severity) - severityRank(right.severity));
   const lines = [
-    `# Codex ${meta.reviewLabel}`,
+    `# ${labelFor(meta)} ${meta.reviewLabel}`,
     "",
     `Target: ${meta.targetLabel}`,
     `Verdict: ${data.verdict}`,
@@ -290,7 +264,7 @@ export function renderNativeReviewResult(result, meta) {
   const stdout = result.stdout.trim();
   const stderr = result.stderr.trim();
   const lines = [
-    `# Codex ${meta.reviewLabel}`,
+    `# ${labelFor(meta)} ${meta.reviewLabel}`,
     "",
     `Target: ${meta.targetLabel}`,
     ""
@@ -299,9 +273,9 @@ export function renderNativeReviewResult(result, meta) {
   if (stdout) {
     lines.push(stdout);
   } else if (result.status === 0) {
-    lines.push("Codex review completed without any stdout output.");
+    lines.push(`${labelFor(meta)} review completed without any stdout output.`);
   } else {
-    lines.push("Codex review failed.");
+    lines.push(`${labelFor(meta)} review failed.`);
   }
 
   if (stderr) {
@@ -317,7 +291,7 @@ function renderWorktreeNote(meta) {
   if (!meta?.worktreePath) {
     return "";
   }
-  return `\nWorktree: ${meta.worktreePath} (branch ${meta.worktreeBranch}). Codex worked there, not in your checkout. When you are done with it, run: git worktree remove "${meta.worktreePath}"\n`;
+  return `\nWorktree: ${meta.worktreePath} (branch ${meta.worktreeBranch}). ${labelFor(meta)} worked there, not in your checkout. When you are done with it, run: git worktree remove "${meta.worktreePath}"\n`;
 }
 
 export function renderTaskResult(parsedResult, meta) {
@@ -326,7 +300,7 @@ export function renderTaskResult(parsedResult, meta) {
     return `${rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`}${renderWorktreeNote(meta)}`;
   }
 
-  const message = String(parsedResult?.failureMessage ?? "").trim() || "Codex did not return a final message.";
+  const message = String(parsedResult?.failureMessage ?? "").trim() || `${labelFor(meta)} did not return a final message.`;
   return `${message}\n${renderWorktreeNote(meta)}`;
 }
 
@@ -403,26 +377,29 @@ export function renderStoredJobResult(job, storedJob) {
 }
 
 function renderStoredJobBody(job, storedJob) {
+  const provider = providerForJob(job);
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
-  const resumeCommand = threadId ? `codex resume ${threadId}` : null;
+  const sessionLines = threadId
+    ? `${provider.label} session ID: ${threadId}\nResume in ${provider.label}: ${provider.resumeCommand(threadId)}\n`
+    : "";
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
     if (!threadId) {
       return output;
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return `${output}\n${sessionLines}`;
   }
 
   const rawOutput =
     (typeof storedJob?.result?.rawOutput === "string" && storedJob.result.rawOutput) ||
-    (typeof storedJob?.result?.codex?.stdout === "string" && storedJob.result.codex.stdout) ||
+    provider.storedOutputText(storedJob) ||
     "";
   if (rawOutput) {
     const output = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
     if (!threadId) {
       return output;
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return `${output}\n${sessionLines}`;
   }
 
   if (storedJob?.rendered) {
@@ -430,7 +407,7 @@ function renderStoredJobBody(job, storedJob) {
     if (!threadId) {
       return output;
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return `${output}\n${sessionLines}`;
   }
 
   const lines = [
@@ -441,8 +418,8 @@ function renderStoredJobBody(job, storedJob) {
   ];
 
   if (threadId) {
-    lines.push(`Codex session ID: ${threadId}`);
-    lines.push(`Resume in Codex: ${resumeCommand}`);
+    lines.push(`${provider.label} session ID: ${threadId}`);
+    lines.push(`Resume in ${provider.label}: ${provider.resumeCommand(threadId)}`);
   }
 
   if (job.summary) {
@@ -477,94 +454,4 @@ export function renderCancelReport(job) {
   lines.push("- Check `/agent:status` for the updated queue.");
 
   return `${lines.join("\n").trimEnd()}\n`;
-}
-
-function formatWindowLabel(minutes) {
-  if (!Number.isFinite(minutes) || minutes <= 0) {
-    return "Usage window";
-  }
-  if (minutes % 1440 === 0) {
-    return `${minutes / 1440}-day window`;
-  }
-  if (minutes % 60 === 0) {
-    return `${minutes / 60}-hour window`;
-  }
-  return `${minutes}-minute window`;
-}
-
-function formatTimeUntil(seconds) {
-  if (seconds <= 0) {
-    return "now";
-  }
-  const minutes = Math.ceil(seconds / 60);
-  const days = Math.floor(minutes / 1440);
-  const hours = Math.floor((minutes % 1440) / 60);
-  const rest = minutes % 60;
-  if (days > 0) {
-    return `in ${days} d ${hours} h`;
-  }
-  return hours > 0 ? `in ${hours} h ${rest} min` : `in ${rest} min`;
-}
-
-function formatUsageWindow(window, nowMs) {
-  const parts = [`${formatWindowLabel(window.windowDurationMins)}: ${window.usedPercent}% used`];
-  if (Number.isFinite(window.resetsAt)) {
-    const resetsAt = new Date(window.resetsAt * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
-    parts.push(`resets ${resetsAt} (${formatTimeUntil(window.resetsAt - nowMs / 1000)})`);
-  }
-  return `- ${parts.join(", ")}`;
-}
-
-function formatCredits(credits) {
-  if (!credits) {
-    return null;
-  }
-  if (credits.unlimited) {
-    return "unlimited";
-  }
-  if (!credits.hasCredits) {
-    return "none";
-  }
-  return credits.balance ?? "available";
-}
-
-/**
- * Renders the `account/rateLimits/read` response. Each metered limit is listed once; the
- * top-level `rateLimits` snapshot mirrors one of them.
- */
-export function renderUsageReport(response, options = {}) {
-  const nowMs = options.now ?? Date.now();
-  const main = response?.rateLimits ?? {};
-  const byId = response?.rateLimitsByLimitId && typeof response.rateLimitsByLimitId === "object" ? response.rateLimitsByLimitId : {};
-  const buckets = Object.values(byId).filter(Boolean);
-  if (!buckets.some((bucket) => bucket.limitId && bucket.limitId === main.limitId)) {
-    buckets.unshift(main);
-  }
-
-  const lines = ["# Codex Usage", ""];
-  lines.push(`Plan: ${main.planType ?? "unknown"}`);
-  const credits = formatCredits(main.credits);
-  if (credits) {
-    lines.push(`Credits: ${credits}`);
-  }
-  const resetCredits = response?.rateLimitResetCredits?.availableCount;
-  if (Number.isFinite(resetCredits) && resetCredits > 0) {
-    lines.push(`Limit reset credits available: ${resetCredits}`);
-  }
-
-  for (const bucket of buckets) {
-    const windows = [bucket.primary, bucket.secondary].filter(Boolean);
-    lines.push("", `${bucket.limitName ?? bucket.limitId ?? "Codex"}:`);
-    if (windows.length === 0) {
-      lines.push("- No usage window reported.");
-    }
-    for (const window of windows) {
-      lines.push(formatUsageWindow(window, nowMs));
-    }
-    if (bucket.rateLimitReachedType) {
-      lines.push(`- Limit reached: ${bucket.rateLimitReachedType}`);
-    }
-  }
-
-  return `${lines.join("\n")}\n`;
 }

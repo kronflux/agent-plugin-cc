@@ -9,16 +9,16 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { makeTempDir } from "./helpers.mjs";
-import { parseBrokerEndpoint } from "../plugins/agent/scripts/lib/broker-endpoint.mjs";
+import { parseBrokerEndpoint } from "../plugins/agent/scripts/providers/codex/broker-endpoint.mjs";
 import {
   ensureBrokerSession,
   requestBrokerShutdownIfIdle,
   sendBrokerShutdown
-} from "../plugins/agent/scripts/lib/broker-lifecycle.mjs";
+} from "../plugins/agent/scripts/providers/codex/broker-lifecycle.mjs";
 import { isProcessAlive } from "../plugins/agent/scripts/lib/process.mjs";
 
 const LIFECYCLE_MODULE = pathToFileURL(
-  path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "agent", "scripts", "lib", "broker-lifecycle.mjs")
+  path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "agent", "scripts", "providers", "codex", "broker-lifecycle.mjs")
 ).href;
 
 async function waitUntil(predicate, timeoutMs = 10000) {

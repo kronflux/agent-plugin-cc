@@ -39,10 +39,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { readJsonFile } from "./fs.mjs";
+import { readJsonFile } from "../../lib/fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
-import { binaryAvailable } from "./process.mjs";
+import { binaryAvailable } from "../../lib/process.mjs";
 import { validateModelSelection } from "./model-catalog.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";

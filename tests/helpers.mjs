@@ -4,7 +4,7 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
-import { loadBrokerSession, sendBrokerShutdown } from "../plugins/agent/scripts/lib/broker-lifecycle.mjs";
+import { loadBrokerSession, sendBrokerShutdown } from "../plugins/agent/scripts/providers/codex/broker-lifecycle.mjs";
 
 const gitRepos = new Set();
 

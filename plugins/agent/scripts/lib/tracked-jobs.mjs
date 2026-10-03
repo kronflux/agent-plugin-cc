@@ -7,10 +7,9 @@ import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 // Text that the command line of a job's process contains. A background worker has its job id
 // in its arguments; a foreground run is identified by the companion script name.
-export const DEFAULT_PROCESS_MARKER = "codex-companion.mjs";
 
 function processMarkerFor(jobId) {
-  return process.argv.includes(jobId) ? jobId : path.basename(process.argv[1] ?? "") || DEFAULT_PROCESS_MARKER;
+  return process.argv.includes(jobId) ? jobId : path.basename(process.argv[1] ?? "") || null;
 }
 
 export function nowIso() {
@@ -115,7 +114,7 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
   };
 }
 
-export function createProgressReporter({ stderr = false, logFile = null, onEvent = null } = {}) {
+export function createProgressReporter({ stderr = false, logFile = null, onEvent = null, label = "agent" } = {}) {
   if (!stderr && !logFile && !onEvent) {
     return null;
   }
@@ -124,7 +123,7 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
     const event = normalizeProgressEvent(eventOrMessage);
     const stderrMessage = event.stderrMessage ?? event.message;
     if (stderr && stderrMessage) {
-      process.stderr.write(`[codex] ${stderrMessage}\n`);
+      process.stderr.write(`[${label}] ${stderrMessage}\n`);
     }
     appendLogLine(logFile, event.message);
     appendLogBlock(logFile, event.logTitle, event.logBody);

@@ -51,7 +51,7 @@ function quoteForCmd(value) {
 /**
  * Returns how to spawn `command` without a shell choosing the interpreter. On Windows the
  * command is looked up through PATH and PATHEXT: an executable runs directly with its
- * argument array, and a batch file (such as an npm-installed `codex.cmd`) runs through
+ * argument array, and a batch file (such as the `.cmd` shim of an npm-installed CLI) runs through
  * `%ComSpec%`, because Node refuses to start batch files without one. `SHELL` is never read.
  */
 export function resolveCommand(command, args = [], env = process.env, platform = process.platform) {

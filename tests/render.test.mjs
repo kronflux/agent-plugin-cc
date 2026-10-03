@@ -3,10 +3,9 @@ import assert from "node:assert/strict";
 
 import {
   renderReviewResult,
-  renderSetupReport,
-  renderStoredJobResult,
-  renderUsageReport
+  renderStoredJobResult
 } from "../plugins/agent/scripts/lib/render.mjs";
+import { renderSetupReport, renderUsageReport } from "../plugins/agent/scripts/providers/codex/render.mjs";
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
   const output = renderReviewResult(

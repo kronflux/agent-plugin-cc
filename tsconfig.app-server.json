@@ -10,14 +10,16 @@
     "noImplicitAny": false,
     "useUnknownInCatchVariables": false,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ]
   },
   "include": [
-    "plugins/agent/scripts/lib/app-server.mjs",
-    "plugins/agent/scripts/lib/codex.mjs",
+    "plugins/agent/scripts/providers/codex/app-server.mjs",
+    "plugins/agent/scripts/providers/codex/runtime.mjs",
     "plugins/agent/scripts/lib/fs.mjs",
     "plugins/agent/scripts/lib/process.mjs",
-    "plugins/agent/scripts/lib/app-server-protocol.d.ts",
+    "plugins/agent/scripts/providers/codex/app-server-protocol.d.ts",
     "plugins/agent/.generated/app-server-types/**/*.ts"
   ]
 }

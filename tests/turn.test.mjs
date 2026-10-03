@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run, stopTestBrokers } from "./helpers.mjs";
 import { isProcessAlive } from "../plugins/agent/scripts/lib/process.mjs";
-import { readTurnResultFromRollout } from "../plugins/agent/scripts/lib/rollout.mjs";
+import { readTurnResultFromRollout } from "../plugins/agent/scripts/providers/codex/rollout.mjs";
 import { readJobFile, resolveJobFile, writeJobFile } from "../plugins/agent/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");

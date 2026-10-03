@@ -1,13 +1,8 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 export function ensureAbsolutePath(cwd, maybePath) {
   return path.isAbsolute(maybePath) ? maybePath : path.resolve(cwd, maybePath);
-}
-
-export function createTempDir(prefix = "codex-plugin-") {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
 export function readJsonFile(filePath) {

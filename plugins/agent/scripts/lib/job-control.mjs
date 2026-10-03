@@ -1,10 +1,9 @@
 import fs from "node:fs";
 
-import { loadBrokerSession } from "./broker-lifecycle.mjs";
-import { getSessionRuntimeStatus, interruptAppServerTurn } from "./codex.mjs";
+import { getProvider, providerForJob } from "./providers.mjs";
 import { isProcessAlive, readProcessCommandLines, terminateProcessTree } from "./process.mjs";
 import { getConfig, listJobs, readJobFile, resolveJobFile, upsertJob } from "./state.mjs";
-import { DEFAULT_PROCESS_MARKER, nowIso, SESSION_ID_ENV } from "./tracked-jobs.mjs";
+import { nowIso, SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
@@ -15,13 +14,9 @@ function isActiveJob(job) {
   return job.status === "queued" || job.status === "running";
 }
 
-// A dead worker's turn keeps running in a shared broker, so it is interrupted there. Without
-// a broker the turn ran in an app-server owned by the worker and ended with it.
-async function interruptOrphanedTurn(workspaceRoot, job) {
-  if (!loadBrokerSession(workspaceRoot)) {
-    return;
-  }
-  await interruptAppServerTurn(workspaceRoot, { threadId: job.threadId, turnId: job.turnId });
+// The job's provider decides whether a dead worker's turn can still be running elsewhere.
+function interruptOrphanedTurn(workspaceRoot, job) {
+  return providerForJob(job).interruptOrphanedTurn(workspaceRoot, job);
 }
 
 /**
@@ -85,7 +80,7 @@ export function terminateJobProcesses(jobs, options = {}) {
     if (commandLines && !commandLines.has(job.pid)) {
       return { jobId: job.id, pid: job.pid, outcome: "not-running" };
     }
-    const marker = job.processMarker ?? DEFAULT_PROCESS_MARKER;
+    const marker = job.processMarker ?? providerForJob(job).processMarker;
     if (commandLines && !commandLines.get(job.pid).includes(marker)) {
       return { jobId: job.id, pid: job.pid, outcome: "pid-reused" };
     }
@@ -212,7 +207,7 @@ function inferLegacyJobPhase(job, progressPreview = []) {
 
   for (let index = progressPreview.length - 1; index >= 0; index -= 1) {
     const line = progressPreview[index].toLowerCase();
-    if (line.startsWith("starting codex") || line.startsWith("thread ready") || line.startsWith("turn started")) {
+    if (/^starting \S+ (task|review) thread/.test(line) || line.startsWith("thread ready") || line.startsWith("turn started")) {
       return "starting";
     }
     if (line.startsWith("reviewer started") || line.includes("review mode")) {
@@ -240,7 +235,7 @@ function inferLegacyJobPhase(job, progressPreview = []) {
     if (line.startsWith("turn completed")) {
       return "finalizing";
     }
-    if (line.startsWith("codex error:") || line.startsWith("failed:")) {
+    if (/^\S+ error:/.test(line) || line.startsWith("failed:")) {
       return "failed";
     }
   }
@@ -321,7 +316,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
   return {
     workspaceRoot,
     config,
-    sessionRuntime: getSessionRuntimeStatus(options.env, workspaceRoot),
+    sessionRuntime: getProvider().sessionRuntimeStatus(options.env, workspaceRoot),
     running,
     latestFinished,
     recent,

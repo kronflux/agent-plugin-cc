@@ -4,7 +4,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { terminateProcessTree } from "./lib/process.mjs";
-import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
+import { BROKER_ENDPOINT_ENV } from "./providers/codex/app-server.mjs";
 import {
   clearBrokerSession,
   isBrokerProcess,
@@ -13,10 +13,10 @@ import {
   PID_FILE_ENV,
   requestBrokerShutdownIfIdle,
   teardownBrokerSession
-} from "./lib/broker-lifecycle.mjs";
+} from "./providers/codex/broker-lifecycle.mjs";
 import { terminateJobProcesses } from "./lib/job-control.mjs";
 import { listJobs, removeJob } from "./lib/state.mjs";
-import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
+import { TRANSCRIPT_PATH_ENV } from "./providers/codex/claude-session-transfer.mjs";
 import { readHookInputJson } from "./lib/fs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
