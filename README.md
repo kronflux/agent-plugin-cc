@@ -22,6 +22,7 @@ they already have.
 - `/agent:codex-rescue`, `/agent:codex-transfer`, `/agent:status`, `/agent:result`, `/agent:send`, and `/agent:cancel` to delegate work, hand off sessions, and manage background jobs
 - `/agent:codex-usage` to see how much of your Codex usage limits is left
 - `/agent:codex-fanout` to start several Codex tasks at once from a manifest
+- `/agent:agy-rescue`, `/agent:agy-review`, and `/agent:agy-setup` to do the same with Antigravity (`agy`)
 
 ## Requirements
 
@@ -318,6 +319,27 @@ After three blocks in a row in one Claude session, the next stop is allowed. Set
 
 > [!WARNING]
 > The review gate can create a long-running Claude/Codex loop and may drain usage limits quickly. Only enable it when you plan to actively monitor the session.
+
+## Antigravity
+
+The plugin also drives the Antigravity CLI (`agy`). Its jobs appear in `/agent:status`, and
+`/agent:result`, `/agent:send`, and `/agent:cancel` work on them as on Codex jobs.
+
+- `/agent:agy-setup` checks that `agy` is installed and signed in. agy has no sign-in status
+  command, so the check lists the available models with `agy models`.
+- `/agent:agy-rescue` hands a task to Antigravity through the `agent:agy-rescue` subagent. It
+  supports `--background`, `--wait`, `--resume`, `--fresh`, `--model`, and `--effort`
+  (`low`, `medium`, or `high`).
+- `/agent:agy-review` runs a review of your changes and returns structured findings. It takes
+  the same target options as `/agent:codex-review` and optional focus text.
+
+Each job runs its own `agy` process. Read-only runs use agy's plan mode with terminal
+restrictions (`--mode plan --sandbox`); write runs keep the terminal restrictions
+(`--sandbox`), and `/agent:codex-setup --write-sandbox danger-full-access` lifts them for both
+agents. A message sent with `/agent:send` while a turn runs waits until that turn finishes and
+then runs as the next turn; agy does not interrupt the running turn. agy has no way to
+interrupt a turn, so `/agent:cancel` stops the job's processes. An agy process is stopped after
+30 minutes; set `AGY_COMPANION_TURN_TIMEOUT_MS` to change the limit.
 
 ## Typical Flows
 

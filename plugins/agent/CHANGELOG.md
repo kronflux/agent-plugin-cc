@@ -7,6 +7,14 @@ agent they drive: `/agent:codex-review`, `/agent:codex-adversarial-review`,
 `/agent:codex-rescue`, `/agent:codex-transfer`, `/agent:codex-setup`, `/agent:codex-usage`,
 `/agent:status`, `/agent:result`, `/agent:send`, and `/agent:cancel`.
 
+### Antigravity
+
+- `/agent:agy-rescue`, `/agent:agy-review`, `/agent:agy-setup`, and the `agent:agy-rescue`
+  subagent drive the Antigravity CLI (`agy`). agy jobs work with `/agent:status`,
+  `/agent:result`, `/agent:send`, and `/agent:cancel`.
+- Agent CLIs are providers behind one registry; jobs record their provider, and job views name
+  the provider of each job.
+
 ### Delegation
 
 - The rescue subagent starts Codex as a background job, waits for it, and returns Codex's
