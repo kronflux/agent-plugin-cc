@@ -1,33 +1,37 @@
 # Agent plugin for Claude Code
 
+Hand code reviews and coding tasks from Claude Code to other agent CLIs: OpenAI Codex and
+Google Antigravity (`agy`). The agents run on your own machine with your own subscriptions, and
+their jobs report back into your Claude Code session.
+
 This plugin is a fork of the Codex plugin for Claude Code
 ([openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc)). It keeps the same Codex
-integration and adds Windows support, background jobs that report back on their own, messages
-to running tasks, parallel tasks in separate worktrees, usage limits, and stricter handling of
-prompts and job state. See [the changelog](plugins/agent/CHANGELOG.md) for the full list.
+integration and adds Antigravity, Windows support, background jobs that report back on their
+own, messages to running tasks, parallel tasks in separate worktrees, usage limits, and stricter
+handling of prompts and job state. See [the changelog](plugins/agent/CHANGELOG.md) for the full
+list.
 
-Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex. Commands are
-provided by the `agent` plugin and prefixed with the agent they drive, for example
-`/agent:codex-review`.
-
-This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
-they already have.
-
-<video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
+All commands come from the `agent` plugin. Commands for one agent carry its name, for example
+`/agent:codex-review` and `/agent:agy-review`; the job commands `/agent:status`,
+`/agent:result`, `/agent:send`, and `/agent:cancel` work for both agents.
 
 ## What You Get
 
 - `/agent:codex-review` for a normal read-only Codex review
 - `/agent:codex-adversarial-review` for a steerable challenge review
-- `/agent:codex-rescue`, `/agent:codex-transfer`, `/agent:status`, `/agent:result`, `/agent:send`, and `/agent:cancel` to delegate work, hand off sessions, and manage background jobs
+- `/agent:codex-rescue` and `/agent:codex-transfer` to delegate work to Codex and hand off sessions
+- `/agent:status`, `/agent:result`, `/agent:send`, and `/agent:cancel` to manage the background jobs of both agents
 - `/agent:codex-usage` to see how much of your Codex usage limits is left
 - `/agent:codex-fanout` to start several Codex tasks at once from a manifest
 - `/agent:agy-rescue`, `/agent:agy-review`, and `/agent:agy-setup` to do the same with Antigravity (`agy`)
 
 ## Requirements
 
-- **ChatGPT subscription (incl. Free) or OpenAI API key.**
+- **For Codex: a ChatGPT subscription (incl. Free) or an OpenAI API key**, and the Codex CLI.
   - Usage will contribute to your Codex usage limits. [Learn more](https://developers.openai.com/codex/pricing).
+- **For Antigravity: the Antigravity CLI (`agy`)**, signed in with your Google account. Usage
+  counts against your Antigravity limits. You need only the agents you plan to use.
+- **Git**, for reviews and worktree tasks.
 - **Node.js 18.18 or later**, findable as `node` on the PATH that Claude Code gives its hooks.
   When Claude Code is started from a desktop launcher or an IDE, that PATH can lack a Node
   installed through nvm, fnm, asdf, mise, or Homebrew. Add Node's directory in your Claude Code
@@ -53,10 +57,11 @@ Reload plugins:
 /reload-plugins
 ```
 
-Then run:
+Then run the setup command of each agent you use:
 
 ```bash
 /agent:codex-setup
+/agent:agy-setup
 ```
 
 `/agent:codex-setup` will tell you whether Codex is ready. If Codex is missing and npm is available, it can offer to install Codex for you.
@@ -73,10 +78,26 @@ If Codex is installed but not logged in yet, run:
 !codex login
 ```
 
+If `agy` is installed but not signed in, run `!agy` once and sign in.
+
 After install, you should see:
 
 - the slash commands listed below
-- the `agent:codex-rescue` subagent in `/agents`
+- the `agent:codex-rescue` and `agent:agy-rescue` subagents in `/agents`
+
+To try the plugin from a local checkout instead of the published marketplace, start Claude Code
+with the plugin directory for one session:
+
+```bash
+claude --plugin-dir /path/to/agent-plugin-cc/plugins/agent
+```
+
+or add the checkout as a marketplace and install from it:
+
+```bash
+/plugin marketplace add /path/to/agent-plugin-cc
+/plugin install agent@agent-plugin-cc
+```
 
 One simple first run is:
 
@@ -204,7 +225,8 @@ The plugin's existing `SessionStart` hook supplies the current transcript path a
 
 ### `/agent:status`
 
-Shows running and recent Codex jobs for the current repository.
+Shows running and recent jobs of both agents for the current repository. Each job shows its
+session ID and the command that resumes it in its own CLI.
 
 Examples:
 
@@ -221,7 +243,7 @@ Use it to:
 
 ### Finished-job notices
 
-In an interactive session, the plugin's monitor tells Claude when a Codex job started from this
+In an interactive session, the plugin's monitor tells Claude when a job started from this
 Claude Code process finishes and no command has printed its result yet: for example a
 background task nobody waited for, or a new turn started by `/agent:send`. Claude then sees one
 line such as `Codex job task-abc123 completed: ... Run /agent:result task-abc123 for the output.`
@@ -232,8 +254,9 @@ notice. Monitors do not run in non-interactive `claude -p` sessions.
 
 ### `/agent:result`
 
-Shows the final stored Codex output for a finished job.
-When available, it also includes the Codex session ID so you can reopen that run directly in Codex with `codex resume <session-id>`.
+Shows the final stored output of a finished job of either agent.
+When available, it also includes the session ID and the command that reopens the run in its own
+CLI: `codex resume <session-id>` for Codex, `agy --conversation <id>` for Antigravity.
 
 Examples:
 
@@ -267,10 +290,11 @@ quote a path that contains spaces.
 
 ### `/agent:send`
 
-Sends a message to a Codex task job.
+Sends a message to a task job of either agent.
 
-- If the job is running, the message joins its current turn. Codex reads it at its next step, the way a message typed into a running Codex session does. The command reports success only after Codex confirms it received the message.
-- If the job has finished, the message starts a new turn on the same Codex thread as a new background job.
+- If a Codex job is running, the message joins its current turn. Codex reads it at its next step, the way a message typed into a running Codex session does. The command reports success only after Codex confirms it received the message.
+- If an Antigravity job is running, the message runs as the next turn once the current turn finishes. The command reports success when that turn starts.
+- If the job has finished, the message starts a new turn on the same thread or conversation as a new background job.
 
 Examples:
 
@@ -281,7 +305,8 @@ Examples:
 
 ### `/agent:cancel`
 
-Cancels an active background Codex job.
+Cancels an active background job of either agent. A Codex turn is interrupted first; an
+Antigravity job has its processes stopped.
 
 Examples:
 
@@ -349,10 +374,18 @@ interrupt a turn, so `/agent:cancel` stops the job's processes. An agy process i
 /agent:codex-review
 ```
 
-### Hand A Problem To Codex
+### Hand A Problem To Codex Or Antigravity
 
 ```bash
 /agent:codex-rescue investigate why the build is failing in CI
+/agent:agy-rescue investigate why the build is failing in CI
+```
+
+### Get A Second Opinion
+
+```bash
+/agent:codex-review
+/agent:agy-review
 ```
 
 ### Start Something Long-Running
@@ -397,6 +430,11 @@ Delegated tasks and any [stop gate](#enabling-review-gate) run can also be direc
 This way you can review the Codex work or continue the work there.
 
 ## FAQ
+
+### Does Antigravity need its own sign-in?
+
+Yes. The plugin uses your local `agy` CLI and its sign-in. Run `!agy` once to sign in, then
+`/agent:agy-setup` to check it.
 
 ### Do I need a separate Codex account for this plugin?
 
