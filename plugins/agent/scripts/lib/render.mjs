@@ -116,7 +116,7 @@ function formatResumeLine(job) {
 
 function appendActiveJobsTable(lines, jobs) {
   lines.push("Active jobs:");
-  lines.push("| Job | Kind | Status | Phase | Elapsed | Codex Session ID | Summary | Actions |");
+  lines.push("| Job | Kind | Status | Phase | Elapsed | Session ID | Summary | Actions |");
   lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const job of jobs) {
     const actions = [`/agent:status ${job.id}`];
@@ -306,7 +306,7 @@ export function renderTaskResult(parsedResult, meta) {
 
 export function renderStatusReport(report) {
   const lines = [
-    "# Codex Status",
+    "# Agent Status",
     "",
     `Session runtime: ${report.sessionRuntime.label}`,
     `Review gate: ${report.config.stopReviewGate ? "enabled" : "disabled"}`,
@@ -357,7 +357,7 @@ export function renderStatusReport(report) {
 }
 
 export function renderJobStatusReport(job) {
-  const lines = ["# Codex Job Status", ""];
+  const lines = ["# Job Status", ""];
   pushJobDetails(lines, job, {
     showElapsed: job.status === "queued" || job.status === "running",
     showDuration: job.status !== "queued" && job.status !== "running",
@@ -411,7 +411,7 @@ function renderStoredJobBody(job, storedJob) {
   }
 
   const lines = [
-    `# ${job.title ?? "Codex Result"}`,
+    `# ${job.title ?? "Job Result"}`,
     "",
     `Job: ${job.id}`,
     `Status: ${job.status}`
@@ -439,7 +439,7 @@ function renderStoredJobBody(job, storedJob) {
 
 export function renderCancelReport(job) {
   const lines = [
-    "# Codex Cancel",
+    "# Cancel",
     "",
     `Cancelled ${job.id}.`,
     ""

@@ -37,13 +37,13 @@ test("a job without a provider field is a Codex job", () => {
 });
 
 test("an unknown provider is an error that names the known ones", () => {
-  assert.throws(() => getProvider("nope"), /Unknown agent provider "nope"\. Known providers: codex\./);
+  assert.throws(() => getProvider("nope"), /Unknown agent provider "nope"\. Known providers: codex, agy\./);
 });
 
 test("the shared library names a provider only in the registry", () => {
   const offenders = fs
     .readdirSync(LIB)
     .filter((name) => name !== "providers.mjs")
-    .filter((name) => /codex/.test(fs.readFileSync(path.join(LIB, name), "utf8")));
+    .filter((name) => /codex|\bagy\b/.test(fs.readFileSync(path.join(LIB, name), "utf8")));
   assert.deepEqual(offenders, []);
 });

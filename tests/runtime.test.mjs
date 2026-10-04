@@ -947,7 +947,7 @@ test("review accepts --background while still running as a tracked review job", 
   });
 
   assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /# Codex Status/);
+  assert.match(status.stdout, /# Agent Status/);
   assert.match(status.stdout, /Codex Review/);
   assert.match(status.stdout, /completed/);
 });
@@ -1033,7 +1033,7 @@ test("status shows phases, hints, and the latest finished job", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Active jobs:/);
-  assert.match(result.stdout, /\| Job \| Kind \| Status \| Phase \| Elapsed \| Codex Session ID \| Summary \| Actions \|/);
+  assert.match(result.stdout, /\| Job \| Kind \| Status \| Phase \| Elapsed \| Session ID \| Summary \| Actions \|/);
   assert.match(result.stdout, /\| review-live \| review \| running \| reviewing \| .* \| thr_1 \| Review working tree diff \|/);
   assert.match(result.stdout, /`\/agent:status review-live`<br>`\/agent:cancel review-live`/);
   assert.match(result.stdout, /Live details:/);
@@ -1575,7 +1575,7 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
     env
   });
   assert.equal(cancel.status, 1);
-  assert.match(cancel.stderr, /No active Codex jobs to cancel for this session\./);
+  assert.match(cancel.stderr, /No active jobs to cancel for this session\./);
 
   const state = readJobsState(stateDir);
   assert.equal(state.jobs[0].status, "running");

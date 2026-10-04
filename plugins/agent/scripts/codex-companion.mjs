@@ -1,12 +1,11 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
@@ -58,15 +57,24 @@ import {
 } from "./lib/job-control.mjs";
 import {
   appendLogLine,
-  createJobLogFile,
-  createJobProgressUpdater,
   createJobRecord,
-  createProgressReporter,
   nowIso,
   runTrackedJob,
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import {
+  enqueueBackgroundTask,
+  HelpRequested,
+  outputCommandResult,
+  outputResult,
+  parseCommandInput,
+  resolveCommandCwd,
+  resolveCommandWorkspace,
+  runForegroundCommand,
+  createTrackedProgress,
+  sleep
+} from "./lib/companion-cli.mjs";
 import {
   renderNativeReviewResult,
   renderReviewResult,
@@ -78,6 +86,7 @@ import {
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+const COMPANION_SCRIPT = fileURLToPath(import.meta.url);
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
@@ -86,7 +95,7 @@ const INTERRUPT_EXIT_WAIT_MS = 10000;
 const VALID_REASONING_EFFORTS = new Set(KNOWN_REASONING_EFFORTS);
 const WRITE_SANDBOXES = ["workspace-write", "danger-full-access"];
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
-// How long send waits for Codex to confirm a message by default.
+// How long send waits for the agent to confirm a message by default.
 const DEFAULT_SEND_TIMEOUT_MS = 60000;
 // result --wait exits with this code when the job is still running at the end of the wait.
 const STILL_RUNNING_EXIT_CODE = 75;
@@ -107,24 +116,9 @@ const SUBCOMMAND_USAGE = {
   cancel: "cancel [job-id] [--json]"
 };
 
-// Thrown by parseCommandInput when --help is given, so no command work starts.
-class HelpRequested extends Error {}
-
 function printUsage(subcommand = null) {
   const names = subcommand && SUBCOMMAND_USAGE[subcommand] ? [subcommand] : Object.keys(SUBCOMMAND_USAGE);
   console.log(["Usage:", ...names.map((name) => `  node scripts/codex-companion.mjs ${SUBCOMMAND_USAGE[name]}`)].join("\n"));
-}
-
-function outputResult(value, asJson) {
-  if (asJson) {
-    console.log(JSON.stringify(value, null, 2));
-  } else {
-    process.stdout.write(value);
-  }
-}
-
-function outputCommandResult(payload, rendered, asJson) {
-  outputResult(asJson ? payload : rendered, asJson);
 }
 
 function normalizeRequestedModel(model) {
@@ -150,43 +144,6 @@ function normalizeReasoningEffort(effort) {
     throw new Error(`Unsupported reasoning effort "${effort}". Use one of: ${KNOWN_REASONING_EFFORTS.join(", ")}.`);
   }
   return normalized;
-}
-
-function normalizeArgv(argv) {
-  if (argv.length === 1) {
-    const [raw] = argv;
-    if (!raw || !raw.trim()) {
-      return [];
-    }
-    return splitRawArgumentString(raw);
-  }
-  return argv;
-}
-
-function parseCommandInput(argv, config = {}) {
-  const parsed = parseArgs(normalizeArgv(argv), {
-    ...config,
-    aliasMap: {
-      C: "cwd",
-      ...(config.aliasMap ?? {})
-    }
-  });
-  if (parsed.options.help) {
-    throw new HelpRequested();
-  }
-  return parsed;
-}
-
-function resolveCommandCwd(options = {}) {
-  return options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
-}
-
-function resolveCommandWorkspace(options = {}) {
-  return resolveWorkspaceRoot(resolveCommandCwd(options));
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function shorten(text, limit = 96) {
@@ -281,6 +238,7 @@ async function handleSetup(argv) {
 function buildAdversarialReviewPrompt(context, focusText) {
   const template = loadPromptTemplate(ROOT_DIR, "adversarial-review");
   return interpolateTemplate(template, {
+    AGENT_NAME: codexProvider.label,
     REVIEW_KIND: "Adversarial Review",
     TARGET_LABEL: context.target.label,
     USER_FOCUS: focusText || "No extra focus provided.",
@@ -637,19 +595,6 @@ function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summ
   });
 }
 
-function createTrackedProgress(job, options = {}) {
-  const logFile = options.logFile ?? createJobLogFile(job.workspaceRoot, job.id, job.title);
-  return {
-    logFile,
-    progress: createProgressReporter({
-      stderr: Boolean(options.stderr),
-      label: providerForJob(job).progressLabel,
-      logFile,
-      onEvent: createJobProgressUpdater(job.workspaceRoot, job.id)
-    })
-  };
-}
-
 function buildTaskJob(workspaceRoot, taskMetadata, write) {
   return createCompanionJob({
     prefix: "task",
@@ -733,73 +678,6 @@ function requireTaskRequest(prompt, resumeLast) {
   if (!prompt && !resumeLast) {
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
   }
-}
-
-async function runForegroundCommand(job, runner, options = {}) {
-  const { logFile, progress } = createTrackedProgress(job, {
-    logFile: options.logFile,
-    stderr: !options.json
-  });
-  const execution = await runTrackedJob(job, () => runner(progress), { logFile });
-  outputResult(options.json ? execution.payload : execution.rendered, options.json);
-  markJobResultDelivered(job.workspaceRoot, job.id);
-  if (execution.exitStatus !== 0) {
-    process.exitCode = execution.exitStatus;
-  }
-  return execution;
-}
-
-function spawnDetachedTaskWorker(cwd, jobId) {
-  const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
-  const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
-    cwd,
-    env: process.env,
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true
-  });
-  child.unref();
-  return child;
-}
-
-function enqueueBackgroundTask(cwd, job, request) {
-  const { logFile } = createTrackedProgress(job);
-  appendLogLine(logFile, "Queued for background execution.");
-
-  // The record exists before the worker starts, because the worker reads its request from it.
-  // The worker records its own PID when it starts running.
-  const queuedRecord = {
-    ...job,
-    status: "queued",
-    phase: "queued",
-    pid: null,
-    logFile,
-    request
-  };
-  writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  const child = spawnDetachedTaskWorker(cwd, job.id);
-  if (!child.pid) {
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...queuedRecord,
-      status: "failed",
-      phase: "failed",
-      errorMessage: "The background worker could not be started.",
-      completedAt: nowIso()
-    });
-    throw new Error("The background worker could not be started.");
-  }
-
-  return {
-    payload: {
-      jobId: job.id,
-      status: "queued",
-      title: job.title,
-      summary: job.summary,
-      logFile,
-      ...(job.worktreePath ? { worktreePath: job.worktreePath, worktreeBranch: job.worktreeBranch } : {})
-    },
-    logFile
-  };
 }
 
 async function handleReviewCommand(argv, config) {
@@ -911,14 +789,14 @@ function splitSendArguments(argv) {
   return rest ? [...tokens, "--", quoted ? quoted[2] : rest] : tokens;
 }
 
-function renderSendResult(result) {
+function renderSendResult(result, label) {
   switch (result.status) {
     case "applied":
-      return `Codex received the message in the running turn of ${result.jobId}.\n`;
+      return `${label} received the message in the running turn of ${result.jobId}.\n`;
     case "sent":
-      return `Codex accepted the message for the running turn of ${result.jobId}. Codex applies it at its next step and had not confirmed it after ${Math.round(result.timeoutMs / 1000)} s. Check /agent:status ${result.jobId}.\n`;
+      return `${label} accepted the message for the running turn of ${result.jobId} and had not confirmed it after ${Math.round(result.timeoutMs / 1000)} s. Check /agent:status ${result.jobId}.\n`;
     case "unconfirmed":
-      return `Codex accepted the message, but the turn of ${result.jobId} ended before Codex confirmed it. Check /agent:result ${result.jobId}.\n`;
+      return `${label} accepted the message, but the turn of ${result.jobId} ended before ${label} confirmed it. Check /agent:result ${result.jobId}.\n`;
     case "started":
       return `${result.jobId} had finished, so the message started a new turn on its Codex thread as ${result.newJobId}. Check /agent:status ${result.newJobId} for progress.\n`;
     default:
@@ -926,9 +804,28 @@ function renderSendResult(result) {
   }
 }
 
+// Another provider's follow-up turn is started by that provider's companion as a new
+// background task on the same thread.
+function startTurnWithProviderCompanion(cwd, provider, job, text) {
+  const result = spawnSync(
+    process.execPath,
+    [provider.companionScript, "task", "--background", "--json", "--cwd", cwd, "--resume-thread", job.threadId, ...(job.write ? ["--write"] : []), "--", text],
+    { cwd, env: process.env, encoding: "utf8", windowsHide: true }
+  );
+  if (result.status !== 0) {
+    throw new Error(String(result.stderr || result.error?.message || `${provider.label} could not start the turn.`).trim());
+  }
+  const newJobId = JSON.parse(result.stdout).jobId;
+  return { status: "started", jobId: job.id, newJobId, threadId: job.threadId };
+}
+
 function startTurnOnFinishedJob(cwd, workspaceRoot, job, text) {
+  const provider = providerForJob(job);
   if (!job.threadId) {
-    throw new Error(`${job.id} has no Codex thread to continue.`);
+    throw new Error(`${job.id} has no ${provider.label} thread to continue.`);
+  }
+  if (provider.id !== codexProvider.id) {
+    return startTurnWithProviderCompanion(cwd, provider, job, text);
   }
   ensureCodexAvailable(cwd);
   const write = Boolean(job.write);
@@ -941,7 +838,7 @@ function startTurnOnFinishedJob(cwd, workspaceRoot, job, text) {
     resumeThreadId: job.threadId,
     jobId: newJob.id
   });
-  enqueueBackgroundTask(cwd, newJob, request);
+  enqueueBackgroundTask(cwd, newJob, request, { workerScript: COMPANION_SCRIPT });
   return { status: "started", jobId: job.id, newJobId: newJob.id, threadId: job.threadId };
 }
 
@@ -954,7 +851,7 @@ async function waitForMessageOutcome(cwd, workspaceRoot, job, messageId, text, t
       return { status: outcome.status, jobId: job.id, turnId: outcome.turnId ?? null };
     }
     if (outcome?.status === "failed") {
-      throw new Error(`Codex rejected the message for ${job.id}: ${outcome.error}`);
+      throw new Error(`${providerForJob(job).label} rejected the message for ${job.id}: ${outcome.error}`);
     }
     if (outcome?.status === "turn-ended") {
       return startTurnOnFinishedJob(cwd, workspaceRoot, readStoredJob(workspaceRoot, job.id) ?? job, text);
@@ -1013,7 +910,7 @@ async function handleSend(argv) {
   const result = isActiveJobStatus(job.status)
     ? await waitForMessageOutcome(cwd, workspaceRoot, job, queueJobMessage(workspaceRoot, job.id, text), text, timeoutMs)
     : startTurnOnFinishedJob(cwd, workspaceRoot, readStoredJob(workspaceRoot, job.id) ?? job, text);
-  outputCommandResult(result, renderSendResult(result), options.json);
+  outputCommandResult(result, renderSendResult(result, provider.label), options.json);
 }
 
 const MANIFEST_FIELDS = new Set(["label", "prompt", "model", "effort", "write", "worktree"]);
@@ -1098,7 +995,7 @@ function launchManifestTasks(cwd, workspaceRoot, options, positionals, defaults)
         worktreePath: job.worktreePath ?? null,
         worktreeBranch: job.worktreeBranch ?? null
       });
-      enqueueBackgroundTask(cwd, job, request);
+      enqueueBackgroundTask(cwd, job, request, { workerScript: COMPANION_SCRIPT });
       launched.push({ label: entry.label, jobId: job.id, ...(job.worktreePath ? { worktreePath: job.worktreePath } : {}) });
     } catch (error) {
       failed.push({ label: entry.label, error: error instanceof Error ? error.message : String(error) });
@@ -1172,7 +1069,7 @@ async function handleTask(argv) {
       worktreePath: job.worktreePath ?? null,
       worktreeBranch: job.worktreeBranch ?? null
     });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
+    const { payload } = enqueueBackgroundTask(cwd, job, request, { workerScript: COMPANION_SCRIPT });
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }

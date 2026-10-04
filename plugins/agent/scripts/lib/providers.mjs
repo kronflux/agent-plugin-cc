@@ -1,8 +1,12 @@
+import { agyProvider } from "../providers/agy/index.mjs";
 import { codexProvider } from "../providers/codex/index.mjs";
 
 // The registry of agent CLI providers. Jobs record the id of the provider that runs them; a
 // record without one was written by the Codex-only plugin.
-const PROVIDERS = new Map([[codexProvider.id, codexProvider]]);
+const PROVIDERS = new Map([
+  [codexProvider.id, codexProvider],
+  [agyProvider.id, agyProvider]
+]);
 
 export const DEFAULT_PROVIDER_ID = codexProvider.id;
 

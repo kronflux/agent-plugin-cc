@@ -1,3 +1,5 @@
+import { fileURLToPath } from "node:url";
+
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { readTurnResultFromRollout } from "./rollout.mjs";
 import { getSessionRuntimeStatus, interruptAppServerTurn } from "./runtime.mjs";
@@ -10,6 +12,8 @@ export const codexProvider = Object.freeze({
   // The script whose command line identifies a foreground Codex job's process.
   processMarker: "codex-companion.mjs",
   progressLabel: "codex",
+  // The companion that starts and runs this provider's jobs.
+  companionScript: fileURLToPath(new URL("../../codex-companion.mjs", import.meta.url)),
   capabilities: Object.freeze({
     structuredOutput: true,
     resume: true,

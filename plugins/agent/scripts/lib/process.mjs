@@ -86,6 +86,7 @@ export function runCommand(command, args = [], options = {}) {
     encoding: "utf8",
     input: options.input,
     maxBuffer: options.maxBuffer,
+    timeout: options.timeout,
     stdio: options.stdio ?? "pipe",
     ...spawnPlan.options,
     windowsHide: true

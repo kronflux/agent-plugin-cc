@@ -360,7 +360,7 @@ export function resolveResultJob(cwd, reference) {
     throw new Error(`No finished job found for "${reference}". Run /agent:status to inspect active jobs.`);
   }
 
-  throw new Error("No finished Codex jobs found for this repository yet.");
+  throw new Error("No finished jobs found for this repository yet.");
 }
 
 export function resolveCancelableJob(cwd, reference, options = {}) {
@@ -382,12 +382,12 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
     return { workspaceRoot, job: sessionScopedActiveJobs[0] };
   }
   if (sessionScopedActiveJobs.length > 1) {
-    throw new Error("Multiple Codex jobs are active. Pass a job id to /agent:cancel.");
+    throw new Error("Multiple jobs are active. Pass a job id to /agent:cancel.");
   }
 
   if (getCurrentSessionId(options)) {
-    throw new Error("No active Codex jobs to cancel for this session.");
+    throw new Error("No active jobs to cancel for this session.");
   }
 
-  throw new Error("No active Codex jobs to cancel.");
+  throw new Error("No active jobs to cancel.");
 }
