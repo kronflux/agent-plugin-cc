@@ -9,6 +9,7 @@
 import process from "node:process";
 
 import { isProcessAlive } from "./lib/process.mjs";
+import { providerForJob } from "./lib/providers.mjs";
 import { isJobResultDelivered, listJobs } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -27,13 +28,22 @@ function shorten(text, limit = 120) {
   return normalized.length <= limit ? normalized : `${normalized.slice(0, limit - 3)}...`;
 }
 
+function agentLabel(job) {
+  try {
+    return providerForJob(job).label;
+  } catch {
+    return "Agent";
+  }
+}
+
 function announcement(job) {
+  const label = agentLabel(job);
   if (job.status === "completed") {
     const summary = shorten(job.summary || job.title);
-    return `Codex job ${job.id} completed${summary ? `: ${summary}` : ""}. Run /agent:result ${job.id} for the output.`;
+    return `${label} job ${job.id} completed${summary ? `: ${summary}` : ""}. Run /agent:result ${job.id} for the output.`;
   }
   const reason = shorten(job.errorMessage || job.summary || job.title);
-  return `Codex job ${job.id} failed${reason ? `: ${reason}` : ""}. Run /agent:result ${job.id} for details.`;
+  return `${label} job ${job.id} failed${reason ? `: ${reason}` : ""}. Run /agent:result ${job.id} for details.`;
 }
 
 function main() {
