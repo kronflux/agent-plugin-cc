@@ -23,8 +23,9 @@ function readPositiveInt(value, fallback) {
   return /^\d+$/.test(String(value ?? "")) && Number(value) > 0 ? Number(value) : fallback;
 }
 
+// The notice adds its own period, so a trailing one is dropped here.
 function shorten(text, limit = 120) {
-  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
+  const normalized = String(text ?? "").trim().replace(/\s+/g, " ").replace(/\.+$/, "");
   return normalized.length <= limit ? normalized : `${normalized.slice(0, limit - 3)}...`;
 }
 
