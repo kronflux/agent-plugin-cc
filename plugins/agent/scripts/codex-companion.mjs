@@ -795,9 +795,10 @@ function renderSendResult(result, label) {
       return `${label} received the message in the running turn of ${result.jobId}.\n`;
     case "sent":
       return `${label} accepted the message for the running turn of ${result.jobId} and had not confirmed it after ${Math.round(result.timeoutMs / 1000)} s. Check /agent:status ${result.jobId}.\n`;
-    case "unconfirmed":
-      return `${label} accepted the message, but the turn of ${result.jobId} ended before ${label} confirmed it. Check /agent:result ${result.jobId}.\n`;
     case "started":
+      if (result.reason === "unapplied") {
+        return `The turn of ${result.jobId} ended before ${label} applied the message, so it started a new turn on the same thread as ${result.newJobId}. Check /agent:status ${result.newJobId} for progress.\n`;
+      }
       return `${result.jobId} had finished, so the message started a new turn on its Codex thread as ${result.newJobId}. Check /agent:status ${result.newJobId} for progress.\n`;
     default:
       return `${result.detail}\n`;
@@ -847,8 +848,16 @@ async function waitForMessageOutcome(cwd, workspaceRoot, job, messageId, text, t
   let sent = null;
   for (;;) {
     const outcome = readJobMessageOutcome(workspaceRoot, job.id, messageId);
-    if (outcome?.status === "applied" || outcome?.status === "unconfirmed") {
+    if (outcome?.status === "applied") {
       return { status: outcome.status, jobId: job.id, turnId: outcome.turnId ?? null };
+    }
+    // The turn ended without applying the message: Codex applies a sent message only at its
+    // next model request, so a message that arrives during the final answer is not applied.
+    if (outcome?.status === "unconfirmed") {
+      return {
+        ...startTurnOnFinishedJob(cwd, workspaceRoot, readStoredJob(workspaceRoot, job.id) ?? job, text),
+        reason: "unapplied"
+      };
     }
     if (outcome?.status === "failed") {
       throw new Error(`${providerForJob(job).label} rejected the message for ${job.id}: ${outcome.error}`);

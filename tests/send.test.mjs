@@ -175,3 +175,34 @@ test("the rescue agent's task call keeps option-like text after -- as the prompt
   assert.equal(done.status, 0, done.stderr);
   assert.equal(fakeState(ctx.binDir).lastTurnStart.prompt, "fix --model handling");
 });
+
+test("send starts a new turn with a message the turn ended without applying", async () => {
+  const ctx = makeRepo("steer-no-item");
+  const { jobId, turnId } = await startRunningTask(ctx);
+
+  const result = run("node", [SCRIPT, "send", "--json", jobId, "apply", "this", "later"], { cwd: ctx.repo, env: ctx.env });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.status, "started");
+  assert.equal(payload.reason, "unapplied");
+  assert.notEqual(payload.newJobId, jobId);
+  const turn = await waitUntil(() => {
+    const last = fakeState(ctx.binDir).lastTurnStart;
+    return last?.prompt === "apply this later" ? last : null;
+  }, 20000);
+  assert.ok(turn, "the follow-up turn did not start");
+  assert.notEqual(turn.turnId, turnId);
+});
+
+test("cancel names a job that has already finished", () => {
+  const ctx = makeRepo();
+  const done = run("node", [SCRIPT, "task", "--json", "quick"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(done.status, 0, done.stderr);
+  const { jobId } = JSON.parse(done.stdout);
+
+  const cancelled = run("node", [SCRIPT, "cancel", jobId], { cwd: ctx.repo, env: ctx.env });
+
+  assert.notEqual(cancelled.status, 0);
+  assert.match(cancelled.stderr, new RegExp(`Job ${jobId} has already completed, so there is nothing to cancel\.`));
+});

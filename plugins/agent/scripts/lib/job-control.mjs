@@ -369,9 +369,12 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
   const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
 
   if (reference) {
-    const selected = matchJobReference(activeJobs, reference);
+    const selected = matchJobReference(jobs, reference);
     if (!selected) {
       throw new Error(`No active job found for "${reference}".`);
+    }
+    if (selected.status !== "queued" && selected.status !== "running") {
+      throw new Error(`Job ${selected.id} has already ${selected.status === "completed" ? "completed" : `ended (${selected.status})`}, so there is nothing to cancel.`);
     }
     return { workspaceRoot, job: selected };
   }
