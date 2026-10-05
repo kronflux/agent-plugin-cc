@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run, stopTestBrokers } from "./helpers.mjs";
 import { listJobs } from "../plugins/agent/scripts/lib/state.mjs";
+import { loadBrokerSession, sendBrokerShutdown } from "../plugins/agent/scripts/providers/codex/broker-lifecycle.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "agent");
@@ -134,9 +135,24 @@ test("the plugin registers the job monitor", () => {
   );
 });
 
-test("the monitor reads jobs from the plugin data directory it is given", async () => {
+test("the monitor reads jobs from the plugin data directory it is given", async (t) => {
   const ctx = makeRepo();
   const pluginData = makeTempDir();
+  // The job's broker is recorded under the plugin data directory, where the shared cleanup
+  // does not look.
+  t.after(async () => {
+    const previous = process.env.CLAUDE_PLUGIN_DATA;
+    process.env.CLAUDE_PLUGIN_DATA = pluginData;
+    const session = loadBrokerSession(ctx.repo);
+    if (previous === undefined) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+    if (session?.endpoint) {
+      await sendBrokerShutdown(session.endpoint);
+    }
+  });
   // The session's commands get CLAUDE_PLUGIN_DATA from the SessionStart hook; the monitor
   // process does not, and receives the directory as an argument instead.
   const sessionEnv = { ...ctx.env, CLAUDE_PLUGIN_DATA: pluginData };
