@@ -1,6 +1,6 @@
 ---
 description: Run an Antigravity review of local git changes that challenges the implementation and design
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <model>] [--effort <low|medium|high>] [focus ...]'
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <model>] [--effort <effort>] [focus ...]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*), Bash(git:*)
 ---

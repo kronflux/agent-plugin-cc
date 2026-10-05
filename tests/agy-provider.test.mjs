@@ -155,12 +155,16 @@ test("setup reports sign-in from the model list", () => {
   assert.match(failed.login.detail, /not signed in/);
 });
 
-test("agy rejects an effort it does not know before starting", () => {
+test("agy accepts the efforts its help lists and rejects others before starting", () => {
   const ctx = makeRepo();
-  const result = run("node", [AGY, "task", "--effort", "xhigh", "do it"], { cwd: ctx.repo, env: ctx.env });
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /agy does not support reasoning effort "xhigh"\. Use one of: low, medium, high/);
+  const rejected = run("node", [AGY, "task", "--effort", "max", "do it"], { cwd: ctx.repo, env: ctx.env });
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /agy does not support reasoning effort "max"\. Use one of: low, medium, high, xhigh/);
   assert.equal(readFakeAgyState(ctx.binDir).runs.length, 0);
+
+  const accepted = run("node", [AGY, "task", "--effort", "xhigh", "do it"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(accepted.status, 0, accepted.stderr);
+  assert.match(readFakeAgyState(ctx.binDir).runs[0].args.join(" "), /--effort xhigh/);
 });
 
 test("status shows an agy job's conversation and resume command", async () => {

@@ -37,6 +37,12 @@ if (args[0] === "--version") {
   process.exit(0);
 }
 
+if (args[0] === "--help") {
+  console.log("Usage of agy:");
+  console.log("  --effort                        Reasoning effort for the current CLI session (low|medium|high|xhigh)");
+  process.exit(0);
+}
+
 if (args[0] === "models") {
   if (BEHAVIOR === "models-fail") {
     console.error("not signed in");

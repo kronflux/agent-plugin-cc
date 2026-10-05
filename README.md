@@ -353,8 +353,8 @@ The plugin also drives the Antigravity CLI (`agy`). Its jobs appear in `/agent:s
 - `/agent:agy-setup` checks that `agy` is installed and signed in. agy has no sign-in status
   command, so the check lists the available models with `agy models`.
 - `/agent:agy-rescue` hands a task to Antigravity through the `agent:agy-rescue` subagent. It
-  supports `--background`, `--wait`, `--resume`, `--fresh`, `--model`, and `--effort`
-  (`low`, `medium`, or `high`).
+  supports `--background`, `--wait`, `--resume`, `--fresh`, `--model`, and `--effort` (the
+  efforts the installed agy lists in `agy --help`, such as `low`, `medium`, and `high`).
 - `/agent:agy-review` runs a review of your changes and returns structured findings. It takes
   the same target options as `/agent:codex-review` and optional focus text.
 

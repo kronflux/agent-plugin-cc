@@ -32,17 +32,16 @@ import {
 import { createJobRecord, nowIso, runTrackedJob, SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import { agyProvider } from "./providers/agy/index.mjs";
-import { getAgyAvailability, readAgyModels, runAgyTurn } from "./providers/agy/runtime.mjs";
+import { getAgyAvailability, readAgyEfforts, readAgyModels, runAgyTurn } from "./providers/agy/runtime.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const COMPANION_SCRIPT = fileURLToPath(import.meta.url);
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
-const AGY_EFFORTS = ["low", "medium", "high"];
 
 const SUBCOMMAND_USAGE = {
   setup: "setup [--json]",
-  task: "task [--background] [--write] [--resume-last|--resume-thread <conversation-id>|--fresh] [--model <model>] [--effort <low|medium|high>] [--] [prompt]",
-  review: "review [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>] [focus text]"
+  task: "task [--background] [--write] [--resume-last|--resume-thread <conversation-id>|--fresh] [--model <model>] [--effort <effort>] [--] [prompt]",
+  review: "review [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <effort>] [focus text]"
 };
 
 function printUsage(subcommand = null) {
@@ -50,13 +49,14 @@ function printUsage(subcommand = null) {
   console.log(["Usage:", ...names.map((name) => `  node scripts/agy-companion.mjs ${SUBCOMMAND_USAGE[name]}`)].join("\n"));
 }
 
-function normalizeEffort(effort) {
+function normalizeEffort(effort, cwd) {
   if (effort == null || !String(effort).trim()) {
     return null;
   }
   const normalized = String(effort).trim().toLowerCase();
-  if (!AGY_EFFORTS.includes(normalized)) {
-    throw new Error(`agy does not support reasoning effort "${effort}". Use one of: ${AGY_EFFORTS.join(", ")}.`);
+  const efforts = readAgyEfforts(cwd);
+  if (!efforts.includes(normalized)) {
+    throw new Error(`agy does not support reasoning effort "${effort}". Use one of: ${efforts.join(", ")}.`);
   }
   return normalized;
 }
@@ -203,7 +203,7 @@ async function handleTask(argv) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeModel(options.model);
-  const effort = normalizeEffort(options.effort);
+  const effort = normalizeEffort(options.effort, cwd);
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
   let resumeThreadId = options["resume-thread"] ? String(options["resume-thread"]).trim() : null;
@@ -299,7 +299,7 @@ async function handleReview(argv) {
   ensureGitRepository(cwd);
   ensureAgyAvailable(cwd);
   const model = normalizeModel(options.model);
-  const effort = normalizeEffort(options.effort);
+  const effort = normalizeEffort(options.effort, cwd);
   const focusText = positionals.join(" ").trim();
   const target = resolveReviewTarget(cwd, { base: options.base, scope: options.scope });
   const job = createAgyJob({

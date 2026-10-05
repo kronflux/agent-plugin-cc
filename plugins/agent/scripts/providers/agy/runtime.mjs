@@ -19,6 +19,19 @@ export function readAgyTurnTimeoutMs(env = process.env) {
   return /^\d+$/.test(raw) && Number(raw) > 0 ? Math.min(Number(raw), 2 ** 31 - 1) : DEFAULT_TURN_TIMEOUT_MS;
 }
 
+const FALLBACK_EFFORTS = ["low", "medium", "high"];
+
+/**
+ * Returns the reasoning efforts the installed agy accepts, read from the --effort line of
+ * `agy --help`, for example "(low|medium|high|xhigh|max)". The list differs between agy
+ * versions; when it cannot be read, the efforts every known version accepts are returned.
+ */
+export function readAgyEfforts(cwd) {
+  const result = runCommand("agy", ["--help"], { cwd, timeout: 30000 });
+  const match = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.match(/--effort[^\n]*\(([a-z|]+)\)/);
+  return match ? match[1].split("|").filter(Boolean) : FALLBACK_EFFORTS;
+}
+
 export function getAgyAvailability(cwd) {
   return binaryAvailable("agy", ["--version"], { cwd });
 }

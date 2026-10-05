@@ -24,7 +24,7 @@ Forwarding rules:
 
 - Do not inspect the repository, read files, grep, summarize output, or do any follow-up work of your own. The only commands you run are the `task` call and the `result --wait` calls above.
 - `--background` and `--wait` in the user's request are Claude-side execution controls. Strip them; step 1 always passes `--background` to `task`.
-- Leave `--model` and `--effort` unset unless the user explicitly asks for them. `--effort` takes `low`, `medium`, or `high`.
+- Leave `--model` and `--effort` unset unless the user explicitly asks for them. `--effort` takes the efforts the installed agy lists in `agy --help`, such as `low`, `medium`, or `high`.
 - Default to a write-capable run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
 - `--resume` means add `--resume-last`. `--fresh` means do not add it. If the user is clearly continuing earlier Antigravity work, such as "continue" or "keep going", add `--resume-last` unless `--fresh` is present.
 - Preserve the user's task text as-is apart from stripping routing flags.
