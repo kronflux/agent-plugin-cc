@@ -112,8 +112,8 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /AskUserQuestion/);
   assert.match(rescue, /Continue current Codex thread/);
   assert.match(rescue, /Start a new Codex thread/);
-  assert.match(rescue, /run the `agent:codex-rescue` subagent in the background/i);
-  assert.match(rescue, /default to foreground/i);
+  assert.match(rescue, /run the `agent:codex-rescue` subagent in the background in every case/i);
+  assert.match(rescue, /present its output and stop/i);
   assert.match(rescue, /Do not forward them to `task`/i);
   assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
   assert.match(rescue, /Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort/i);

@@ -13,9 +13,8 @@ $ARGUMENTS
 
 Execution mode:
 
-- If the request includes `--background`, run the `agent:codex-rescue` subagent in the background.
-- If the request includes `--wait`, run the `agent:codex-rescue` subagent in the foreground.
-- If neither flag is present, default to foreground.
+- Claude Code runs plugin subagents in the background, so run the `agent:codex-rescue` subagent in the background in every case. Its result arrives as the agent's completion notification.
+- If the request includes `--wait`, tell the user in one sentence that the result will arrive when the agent finishes, and start no other work in this turn.
 - `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
 - `--worktree` runs Codex in a new git worktree on its own branch instead of in this checkout. Preserve it for the forwarded `task` call, but do not treat it as part of the natural-language task text.
@@ -42,6 +41,7 @@ Operating rules:
 
 - The subagent is a thin forwarder only. It starts the Codex job with `task --background`, waits for it with `result <job-id> --wait`, and returns that command's stdout as-is. It never returns only a job ID.
 - Return the Codex companion stdout verbatim to the user.
+- When the subagent returns, present its output and stop. Do not run git, tests, or any other command to check its work.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
 - Do not ask the subagent to inspect files, poll `/agent:status`, call `/agent:cancel`, summarize output, or do follow-up work of its own.
 - While a Codex job runs, `/agent:send <job-id> <message>` adds a message to its running turn, and `/agent:cancel <job-id>` stops it.

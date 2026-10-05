@@ -13,9 +13,8 @@ $ARGUMENTS
 
 Execution mode:
 
-- If the request includes `--background`, run the `agent:agy-rescue` subagent in the background.
-- If the request includes `--wait`, run the `agent:agy-rescue` subagent in the foreground.
-- If neither flag is present, default to foreground.
+- Claude Code runs plugin subagents in the background, so run the `agent:agy-rescue` subagent in the background in every case. Its result arrives as the agent's completion notification.
+- If the request includes `--wait`, tell the user in one sentence that the result will arrive when the agent finishes, and start no other work in this turn.
 - `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
 - `--model`, `--effort`, `--resume`, and `--fresh` are runtime flags. Preserve them for the forwarded request, but do not treat them as part of the natural-language task text.
 
@@ -23,6 +22,7 @@ Operating rules:
 
 - The subagent is a thin forwarder only. It starts the Antigravity job with `task --background`, waits for it with `result <job-id> --wait`, and returns that command's stdout as-is. It never returns only a job ID.
 - Return the subagent's output verbatim to the user. Do not paraphrase, summarize, rewrite, or add commentary before or after it.
+- When the subagent returns, present its output and stop. Do not run git, tests, or any other command to check its work.
 - While an Antigravity job runs, `/agent:send <job-id> <message>` adds a message to it, and `/agent:cancel <job-id>` stops it.
 - If the helper reports that agy is missing or not signed in, stop and tell the user to run `/agent:agy-setup`.
 - If the user did not supply a request, ask what Antigravity should investigate or fix.
