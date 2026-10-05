@@ -33,8 +33,8 @@ function makeRepo(behavior) {
   return { repo, env: { ...buildEnv(binDir), CLAUDE_PID: String(process.pid) } };
 }
 
-function startMonitor(repo, env, { graceMs = 300 } = {}) {
-  const child = spawn(process.execPath, [MONITOR, repo], {
+function startMonitor(repo, env, { graceMs = 300, pluginData = null } = {}) {
+  const child = spawn(process.execPath, [MONITOR, repo, ...(pluginData ? [pluginData] : [])], {
     env: { ...env, CODEX_COMPANION_MONITOR_POLL_MS: "100", CODEX_COMPANION_MONITOR_GRACE_MS: String(graceMs) },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true
@@ -128,5 +128,21 @@ test("the monitor exits when its Claude process is gone", async () => {
 test("the plugin registers the job monitor", () => {
   const monitorsFile = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "monitors", "monitors.json"), "utf8"));
   assert.deepEqual(Object.keys(monitorsFile[0]).sort(), ["command", "description", "name"]);
-  assert.match(monitorsFile[0].command, /^node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/job-monitor\.mjs" "\$\{CLAUDE_PROJECT_DIR\}"$/);
+  assert.match(
+    monitorsFile[0].command,
+    /^node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/job-monitor\.mjs" "\$\{CLAUDE_PROJECT_DIR\}" "\$\{CLAUDE_PLUGIN_DATA\}"$/
+  );
+});
+
+test("the monitor reads jobs from the plugin data directory it is given", async () => {
+  const ctx = makeRepo();
+  const pluginData = makeTempDir();
+  // The session's commands get CLAUDE_PLUGIN_DATA from the SessionStart hook; the monitor
+  // process does not, and receives the directory as an argument instead.
+  const sessionEnv = { ...ctx.env, CLAUDE_PLUGIN_DATA: pluginData };
+  const { output } = startMonitor(ctx.repo, ctx.env, { pluginData });
+  const jobId = launchBackgroundTask(ctx, sessionEnv);
+
+  assert.ok(await waitUntil(() => output.text.includes(jobId), 20000), `no announcement: ${output.text}`);
+  assert.ok(listJobs(ctx.repo).every((job) => job.id !== jobId), "the job was stored outside the plugin data directory");
 });

@@ -48,6 +48,11 @@ function announcement(job) {
 }
 
 function main() {
+  // Claude Code substitutes ${CLAUDE_PLUGIN_DATA} into the monitor command but does not export it,
+  // while the session's commands get it from the SessionStart hook and keep their jobs there.
+  if (process.argv[3]) {
+    process.env.CLAUDE_PLUGIN_DATA = process.argv[3];
+  }
   const workspaceRoot = resolveWorkspaceRoot(process.argv[2] || process.cwd());
   const ownerPid = /^\d+$/.test(process.env.CLAUDE_PID ?? "") ? process.env.CLAUDE_PID : null;
   const startedAt = Date.now();
