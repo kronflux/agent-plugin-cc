@@ -4,7 +4,7 @@
 // provider default.
 
 import { delegationSetting } from "./settings.mjs";
-import { getConfig, setConfig } from "./state.mjs";
+import { getConfig, getUserConfig, setConfig } from "./state.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 // Sources whose catalog entry also names the effort used when none is given.
@@ -167,50 +167,65 @@ export async function resolveModelSelection(provider, options = {}, catalog = pr
 }
 
 /**
- * Stores the delegation default of `provider` from `--model` and `--effort` in the workspace
- * config, after checking that a delegation could use it. `--model default` clears the setting to
- * null, so the provider default and its own effort apply; an `--effort` given with it is not
- * stored. `--effort` alone keeps the stored model, or applies to the default model when none is
- * stored. `--model` alone clears the stored effort, so the model's own default effort applies.
+ * Works out the delegation default of `provider` from `--model` and `--effort`, after checking
+ * that a delegation could use it, without writing it. `scope` is `project` (the workspace config)
+ * or `user` (the user config); the current entry of that scope is the base. `--model default`
+ * clears the setting to null, so the provider default and its own effort apply; an `--effort`
+ * given with it is not stored. `--effort` alone keeps the stored model, or applies to the default
+ * model when none is stored. `--model` alone clears the stored effort, so the model's own default
+ * effort applies.
  *
- * Returns `{ action, warnings }`, or null when neither option was given. `warnings` are the
- * resolution's warning lines, such as the one for a model no catalog could check; the action then
- * says the model was stored without a check.
+ * Returns `{ value, action, warnings }`, or null when neither option was given. `value` is the new
+ * entry for `models.<provider>`. `warnings` are the resolution's warning lines, such as the one
+ * for a model no catalog could check; the action then says the model was stored without a check.
  */
-export async function storeDelegationSetting(provider, workspaceRoot, cwd, options) {
+export async function planDelegationSetting(provider, workspaceRoot, cwd, options, { scope = "project" } = {}) {
   const hasModel = options.model !== undefined && String(options.model).trim() !== "";
   const hasEffort = options.effort !== undefined && String(options.effort).trim() !== "";
   if (!hasModel && !hasEffort) {
     return null;
   }
-  const models = getConfig(workspaceRoot).models ?? {};
+  const models = (scope === "user" ? getUserConfig().models : getConfig(workspaceRoot).models) ?? {};
   const current = models[provider.id] ?? null;
+  const where = scope === "user" ? "in every workspace without its own setting" : `in ${workspaceRoot}`;
   if (hasModel && String(options.model).trim().toLowerCase() === "default") {
-    setConfig(workspaceRoot, "models", { ...models, [provider.id]: null });
     const ignored = hasEffort ? " --effort was not stored, because --model default clears the setting." : "";
-    return { action: `Delegations now use the default model in ${workspaceRoot}.${ignored}`, warnings: [] };
+    return { value: null, action: `Delegations now use the default model ${where}.${ignored}`, warnings: [] };
   }
   const model = hasModel ? String(options.model).trim() : current?.model ?? null;
   const effort = hasEffort ? String(options.effort).trim() : hasModel ? null : current?.effort ?? null;
   // The values are resolved as a delegation would resolve them, so a bad choice is never stored.
   const checked = await resolveModelSelection(provider, { model, effort, setting: null, cwd });
   const stored = model || effort ? { model, effort: effort ? checked.effort : null } : null;
-  setConfig(workspaceRoot, "models", { ...models, [provider.id]: stored });
   const withEffort = stored?.effort ? ` with effort ${stored.effort}` : "";
   let action;
   if (!stored) {
-    action = `Delegations now use the default model in ${workspaceRoot}.`;
+    action = `Delegations now use the default model ${where}.`;
   } else if (stored.model && checked.warnings.length > 0) {
-    action = `Stored model ${stored.model}${withEffort} for delegations in ${workspaceRoot} without checking it.`;
+    action = `Stored model ${stored.model}${withEffort} for delegations ${where} without checking it.`;
   } else {
     const modelText = !stored.model
       ? "the default model"
       : stored.model.toLowerCase() === "configured"
         ? `the model set in the ${provider.label} configuration`
         : `model ${stored.model}`;
-    action = `Delegations now use ${modelText}${withEffort} in ${workspaceRoot}.`;
+    action = `Delegations now use ${modelText}${withEffort} ${where}.`;
   }
-  return { action, warnings: checked.warnings };
+  return { value: stored, action, warnings: checked.warnings };
+}
+
+/**
+ * Stores the delegation default of `provider` in the workspace config, as `planDelegationSetting`
+ * works it out. Returns `{ action, warnings }`, or null when neither option was given.
+ */
+export async function storeDelegationSetting(provider, workspaceRoot, cwd, options) {
+  const planned = await planDelegationSetting(provider, workspaceRoot, cwd, options);
+  if (!planned) {
+    return null;
+  }
+  const models = getConfig(workspaceRoot).models ?? {};
+  setConfig(workspaceRoot, "models", { ...models, [provider.id]: planned.value });
+  return { action: planned.action, warnings: planned.warnings };
 }
 
 /**
@@ -236,14 +251,18 @@ export async function describeDelegation(provider, workspaceRoot, cwd) {
   }
 }
 
+// The report words for a job source that names where a setting came from.
+const SOURCE_LABELS = { explicit: "flag", setting: "project setting", "user-setting": "user setting" };
+
 /** The check lines that name the delegation model and effort. */
 export function delegationLines(delegation, { chosenBy, modelName = null }) {
   if (delegation.error) {
     return [`- delegation model: unavailable (${delegation.error})`];
   }
   const model = delegation.model ?? modelName ?? `chosen by ${chosenBy}`;
+  const label = (source) => SOURCE_LABELS[source] ?? source;
   return [
-    `- delegation model: ${model} (${delegation.modelSource})`,
-    `- delegation effort: ${delegation.effort ?? "default"} (${delegation.effortSource})`
+    `- delegation model: ${model} (${label(delegation.modelSource)})`,
+    `- delegation effort: ${delegation.effort ?? "default"} (${label(delegation.effortSource)})`
   ];
 }

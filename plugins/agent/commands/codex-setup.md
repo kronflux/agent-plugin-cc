@@ -1,6 +1,6 @@
 ---
 description: Check whether the local Codex CLI is ready, set the delegation model and effort, and toggle the stop-time review gate
-argument-hint: '[--model <id|family|default|configured>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--write-sandbox workspace-write|danger-full-access] [--enable-review-gate|--disable-review-gate]'
+argument-hint: '[--scope project|user] [--model <id|family|default|configured>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--write-sandbox workspace-write|danger-full-access] [--enable-review-gate|--disable-review-gate]'
 allowed-tools: Bash(node:*), Bash(npm:*), AskUserQuestion
 ---
 

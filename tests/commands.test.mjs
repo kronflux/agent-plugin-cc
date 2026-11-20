@@ -178,7 +178,7 @@ test("setup command can offer Codex install and still points users to codex logi
   const setup = read("commands/codex-setup.md");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
 
-  assert.match(setup, /argument-hint:\s*'\[--model <id\|family\|default\|configured>\] \[--effort <[a-z|]+>\] \[--write-sandbox workspace-write\|danger-full-access\] \[--enable-review-gate\|--disable-review-gate\]'/);
+  assert.match(setup, /argument-hint:\s*'\[--scope project\|user\] \[--model <id\|family\|default\|configured>\] \[--effort <[a-z|]+>\] \[--write-sandbox workspace-write\|danger-full-access\] \[--enable-review-gate\|--disable-review-gate\]'/);
   assert.match(setup, /AskUserQuestion/);
   assert.match(setup, /npm install -g @openai\/codex/);
   assert.match(setup, /codex-companion\.mjs" setup "--json \$ARGUMENTS"/);
@@ -186,6 +186,12 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(readme, /offer to install Codex for you/i);
   assert.match(readme, /\/agent:codex-setup --enable-review-gate/);
   assert.match(readme, /\/agent:codex-setup --disable-review-gate/);
+});
+
+test("both setup commands offer --scope project|user", () => {
+  for (const name of ["agy-setup", "codex-setup"]) {
+    assert.match(read(`commands/${name}.md`), /argument-hint:\s*'\[--scope project\|user\] /, name);
+  }
 });
 
 const COMMAND_NAMES = [

@@ -1,17 +1,18 @@
 import process from "node:process";
 
 import { outputResult, parseCommandInput, resolveCommandCwd, resolveCommandWorkspace } from "../../../lib/companion-cli.mjs";
-import { describeDelegation, storeDelegationSetting } from "../../../lib/model-selection.mjs";
+import { describeDelegation, planDelegationSetting } from "../../../lib/model-selection.mjs";
 import { binaryAvailable } from "../../../lib/process.mjs";
-import { getConfig, setConfig } from "../../../lib/state.mjs";
+import { checkWriteSandbox, parseSetupArguments, resolveSetting, settingSources, WRITE_SANDBOXES } from "../../../lib/settings.mjs";
+import { getConfig, setConfig, updateUserConfig } from "../../../lib/state.mjs";
 import { resolveWorkspaceRoot } from "../../../lib/workspace.mjs";
 import { codexProvider } from "../index.mjs";
 import { renderSetupReport } from "../render.mjs";
 import { getCodexAuthStatus, getCodexAvailability, getSessionRuntimeStatus } from "../runtime.mjs";
 
-export const WRITE_SANDBOXES = ["workspace-write", "danger-full-access"];
+export { checkWriteSandbox, WRITE_SANDBOXES };
 
-export const usage = `setup [--model <id|family|default|configured>] [--effort <level>] [--write-sandbox <${WRITE_SANDBOXES.join("|")}>] [--enable-review-gate|--disable-review-gate] [--json]`;
+export const usage = `setup [--scope project|user] [--model <id|family|default|configured>] [--effort <level>] [--write-sandbox <${WRITE_SANDBOXES.join("|")}>] [--enable-review-gate|--disable-review-gate] [--json]`;
 
 export async function buildSetupReport(cwd, actionsTaken = []) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
@@ -21,6 +22,7 @@ export async function buildSetupReport(cwd, actionsTaken = []) {
   const authStatus = await getCodexAuthStatus(cwd);
   const config = getConfig(workspaceRoot);
   const delegation = await describeDelegation(codexProvider, workspaceRoot, cwd);
+  const writeSandbox = resolveSetting("writeSandbox", { workspaceRoot });
 
   const nextSteps = [];
   if (!codexStatus.available) {
@@ -43,23 +45,18 @@ export async function buildSetupReport(cwd, actionsTaken = []) {
     appServer: authStatus.userAgent ?? null,
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
-    writeSandbox: config.writeSandbox ?? "workspace-write",
+    writeSandbox: writeSandbox.value,
+    sources: settingSources(delegation, writeSandbox.source),
     delegation,
     actionsTaken,
     nextSteps
   };
 }
 
-export function checkWriteSandbox(value) {
-  const sandbox = String(value).trim();
-  if (!WRITE_SANDBOXES.includes(sandbox)) {
-    throw new Error(`Unsupported write sandbox "${sandbox}". Use one of: ${WRITE_SANDBOXES.join(", ")}.`);
-  }
-  return sandbox;
-}
-
 export async function handleSetup(argv) {
-  const { options } = parseCommandInput(argv, {
+  const options = parseSetupArguments(argv, {
+    parse: parseCommandInput,
+    usage,
     valueOptions: ["cwd", "write-sandbox", "model", "effort"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
   });
@@ -73,12 +70,24 @@ export async function handleSetup(argv) {
   const actionsTaken = [];
   const sandbox = options["write-sandbox"] !== undefined ? checkWriteSandbox(options["write-sandbox"]) : null;
 
-  const delegation = await storeDelegationSetting(codexProvider, workspaceRoot, cwd, options);
-  if (delegation) {
-    for (const warning of delegation.warnings) {
-      process.stderr.write(`${warning}\n`);
-    }
-    actionsTaken.push(delegation.action);
+  const planned = await planDelegationSetting(codexProvider, workspaceRoot, cwd, options, { scope: options.scope });
+  for (const warning of planned?.warnings ?? []) {
+    process.stderr.write(`${warning}\n`);
+  }
+  // At user scope every change of this call is written in one update of the user config; the
+  // review gate always belongs to the workspace.
+  const userScope = options.scope === "user";
+  if (userScope && (planned || sandbox)) {
+    updateUserConfig((config) => ({
+      ...config,
+      ...(planned ? { models: { ...config.models, [codexProvider.id]: planned.value } } : {}),
+      ...(sandbox ? { writeSandbox: sandbox } : {})
+    }));
+  } else if (!userScope && planned) {
+    setConfig(workspaceRoot, "models", { ...(getConfig(workspaceRoot).models ?? {}), [codexProvider.id]: planned.value });
+  }
+  if (planned) {
+    actionsTaken.push(planned.action);
   }
 
   if (options["enable-review-gate"]) {
@@ -90,8 +99,11 @@ export async function handleSetup(argv) {
   }
 
   if (sandbox) {
-    setConfig(workspaceRoot, "writeSandbox", sandbox);
-    actionsTaken.push(`Write-capable tasks now run with the ${sandbox} sandbox in ${workspaceRoot}.`);
+    if (!userScope) {
+      setConfig(workspaceRoot, "writeSandbox", sandbox);
+    }
+    const where = userScope ? "in every workspace without its own setting" : `in ${workspaceRoot}`;
+    actionsTaken.push(`Write-capable tasks now run with the ${sandbox} sandbox ${where}.`);
   }
 
   const finalReport = await buildSetupReport(cwd, actionsTaken);

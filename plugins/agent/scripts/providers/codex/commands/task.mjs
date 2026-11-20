@@ -13,13 +13,13 @@ import { readStdinIfPiped } from "../../../lib/fs.mjs";
 import { readRequesterIdentity } from "../../../lib/host.mjs";
 import { reconcileStore } from "../../../lib/job-control.mjs";
 import { delegationOptions, resolveModelSelection, storedSelection } from "../../../lib/model-selection.mjs";
+import { writeSandboxFor } from "../../../lib/settings.mjs";
 import { providerForJob } from "../../../lib/providers.mjs";
 import { renderTaskResult } from "../../../lib/render.mjs";
 import {
   createJob,
   decideNext,
   generateJobId,
-  getConfig,
   listJobViews,
   readJobView,
   resolveStateDir
@@ -209,7 +209,7 @@ export async function handleTask(argv) {
     prompt: prompt || (resumeThreadId ? DEFAULT_CONTINUE_PROMPT : ""),
     title: runMetadata.title,
     write,
-    sandbox: write ? getConfig(workspaceRoot).writeSandbox ?? "workspace-write" : "read-only",
+    sandbox: writeSandboxFor(workspaceRoot, write),
     worktree: null,
     // The repository a --worktree job gets its worktree from; the worktree is named after the job,
     // so it is created once the job exists.

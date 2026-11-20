@@ -3,9 +3,12 @@ import path from "node:path";
 import process from "node:process";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
-import { makeTempDir } from "./helpers.mjs";
+import { installFakeAgy, readFakeAgyState } from "./fake-agy-fixture.mjs";
+import { installFakeCodex } from "./fake-codex-fixture.mjs";
+import { makeCommittedRepo, makeTempDir } from "./helpers.mjs";
 import * as state from "../plugins/agent/scripts/lib/state.mjs";
 import { delegationSetting, resolveSetting, writeSandboxFor } from "../plugins/agent/scripts/lib/settings.mjs";
 
@@ -133,4 +136,135 @@ test("a read-only job never takes the write sandbox setting", (t) => {
   state.setUserConfig("writeSandbox", "danger-full-access");
   assert.equal(writeSandboxFor(workspaceRoot, false), "read-only");
   assert.equal(writeSandboxFor(workspaceRoot, true), "danger-full-access");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Setup commands, against the fake agy and the fake Codex.
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const AGY = path.join(ROOT, "plugins", "agent", "scripts", "agy-companion.mjs");
+const CODEX = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
+const SANDBOX_HINT = "Use --write-sandbox workspace-write or --write-sandbox danger-full-access.";
+
+// A git workspace with a fake agy and a fake Codex on PATH, and a home folder without agy
+// settings. `binDir` reuses the fakes of another workspace.
+function makeWorkspace(t, binDir = null) {
+  const repo = makeCommittedRepo(t);
+  const bin = binDir ?? makeTempDir(t);
+  if (!binDir) {
+    installFakeAgy(bin, "ok");
+    installFakeCodex(bin, "catalog-default");
+  }
+  const home = makeTempDir(t);
+  const sep = process.platform === "win32" ? ";" : ":";
+  const env = { ...process.env, HOME: home, USERPROFILE: home, PATH: `${bin}${sep}${process.env.PATH}`, AGENT_PLUGIN_TEST_AGY_ENTRY: path.join(bin, "agy") };
+  return { repo, binDir: bin, env };
+}
+
+function companion(script, ctx, args) {
+  return spawnSync(process.execPath, [script, ...args], { cwd: ctx.repo, env: ctx.env, encoding: "utf8", timeout: 60000, windowsHide: true });
+}
+
+function configBytes(repo) {
+  const file = path.join(state.resolveStateDir(repo), "config.json");
+  return fs.existsSync(file) ? fs.readFileSync(file) : null;
+}
+
+for (const [name, script] of [["agy", AGY], ["codex", CODEX]]) {
+  test(`${name} setup refuses an unknown option or a positional and changes nothing`, (t) => {
+    usePluginData(t);
+    const ctx = makeWorkspace(t);
+    assert.equal(companion(script, ctx, ["setup", "--write-sandbox", "workspace-write"]).status, 0);
+    const before = configBytes(ctx.repo);
+    for (const word of ["--danger-full-access", "danger-full-access"]) {
+      const result = companion(script, ctx, ["setup", "--model", "default", word]);
+      assert.equal(result.status, 1, result.stderr);
+      assert.ok(result.stderr.startsWith(`Unknown argument "${word}" for setup. Usage: setup [--scope project|user]`), result.stderr);
+      assert.deepEqual(configBytes(ctx.repo), before);
+    }
+    assert.equal(fs.existsSync(state.userConfigFile()), false);
+  });
+
+  test(`${name} setup refuses a missing --write-sandbox value with the sandbox hint`, (t) => {
+    usePluginData(t);
+    const ctx = makeWorkspace(t);
+    for (const args of [["--write-sandbox"], ["--write-sandbox", "--json"]]) {
+      const result = companion(script, ctx, ["setup", ...args]);
+      assert.equal(result.status, 1, result.stderr);
+      assert.equal(result.stderr, `Missing value for --write-sandbox\n${SANDBOX_HINT}\n`);
+      assert.equal(configBytes(ctx.repo), null);
+    }
+  });
+}
+
+test("agy setup --scope user applies in every workspace without a project setting", (t) => {
+  usePluginData(t);
+  const first = makeWorkspace(t);
+  const second = makeWorkspace(t, first.binDir);
+  const stored = companion(AGY, first, ["setup", "--scope", "user", "--model", "fake-model-low", "--write-sandbox", "danger-full-access"]);
+  assert.equal(stored.status, 0, stored.stderr);
+  assert.match(stored.stdout, /Delegations now use model fake-model-low in every workspace without its own setting\./);
+  assert.deepEqual(state.getUserConfig(), { version: 1, models: { agy: { model: "fake-model-low", effort: null } }, writeSandbox: "danger-full-access" });
+  for (const ctx of [first, second]) {
+    const before = configBytes(ctx.repo);
+    const result = companion(AGY, ctx, ["setup"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^- delegation model: fake-model-low \(user setting\)$/m);
+    assert.match(result.stdout, /^- write sandbox: danger-full-access \(user setting\)$/m);
+    assert.deepEqual(configBytes(ctx.repo), before);
+    assert.equal(Object.hasOwn(state.getConfig(ctx.repo), "models"), false);
+    const report = JSON.parse(companion(AGY, ctx, ["setup", "--json"]).stdout);
+    assert.deepEqual(report.sources, { model: "user", effort: "provider-default", writeSandbox: "user" });
+  }
+});
+
+test("a user write sandbox never reaches a read-only agy task", (t) => {
+  usePluginData(t);
+  const ctx = makeWorkspace(t);
+  assert.equal(companion(AGY, ctx, ["setup", "--scope", "user", "--write-sandbox", "danger-full-access"]).status, 0);
+  const readOnly = companion(AGY, ctx, ["task", "look"]);
+  assert.equal(readOnly.status, 0, readOnly.stderr);
+  const write = companion(AGY, ctx, ["task", "--write", "edit"]);
+  assert.equal(write.status, 0, write.stderr);
+  const [readRun, writeRun] = readFakeAgyState(ctx.binDir).runs;
+  assert.match(readRun.args.join(" "), /--sandbox --settings \S+read-only-settings\.json/);
+  assert.equal(writeRun.args.includes("--sandbox"), false, writeRun.args.join(" "));
+});
+
+test("setup --scope user --model default clears the user model, and workspace-write is stored explicitly", (t) => {
+  usePluginData(t);
+  const ctx = makeWorkspace(t);
+  assert.equal(companion(AGY, ctx, ["setup", "--scope", "user", "--model", "fake-model-low"]).status, 0);
+  const cleared = companion(AGY, ctx, ["setup", "--scope", "user", "--model", "default", "--write-sandbox", "workspace-write"]);
+  assert.equal(cleared.status, 0, cleared.stderr);
+  assert.deepEqual(state.getUserConfig(), { version: 1, models: { agy: null }, writeSandbox: "workspace-write" });
+  assert.match(cleared.stdout, /^- write sandbox: workspace-write \(user setting\)$/m);
+  assert.match(cleared.stdout, /^- delegation model: .* \(provider-default\)$/m);
+  assert.equal(configBytes(ctx.repo), null);
+});
+
+test("codex setup --scope user stores the delegation model for every workspace", (t) => {
+  usePluginData(t);
+  const ctx = makeWorkspace(t);
+  const stored = companion(CODEX, ctx, ["setup", "--scope", "user", "--model", "luna", "--effort", "high", "--write-sandbox", "danger-full-access"]);
+  assert.equal(stored.status, 0, stored.stderr);
+  const other = makeWorkspace(t, ctx.binDir);
+  const report = JSON.parse(companion(CODEX, other, ["setup", "--json"]).stdout);
+  assert.equal(report.writeSandbox, "danger-full-access");
+  assert.deepEqual(report.sources, { model: "user", effort: "user", writeSandbox: "user" });
+  const text = companion(CODEX, other, ["setup"]);
+  assert.match(text.stdout, /^- delegation model: gpt-5\.6-luna \(user setting\)$/m);
+  assert.match(text.stdout, /^- delegation effort: high \(user setting\)$/m);
+  assert.equal(configBytes(other.repo), null);
+});
+
+test("without a plugin data folder the user config sits in the fallback state root", (t) => {
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  delete process.env.CLAUDE_PLUGIN_DATA;
+  t.after(() => {
+    process.env.CLAUDE_PLUGIN_DATA = previous;
+  });
+  const workspace = makeTempDir(t);
+  assert.equal(path.dirname(state.userConfigFile()), path.dirname(state.resolveStateDir(workspace)));
+  assert.equal(path.basename(state.userConfigFile()), "user-config.json");
 });

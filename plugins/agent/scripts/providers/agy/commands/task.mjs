@@ -6,7 +6,8 @@ import { renderTaskResult } from "../../../lib/render.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { createJob, decideNext, generateJobId, getConfig, InvalidLabelError, listJobViews, PROMPT_LIMIT_BYTES, PromptTooLargeError } from "../../../lib/state.mjs";
+import { writeSandboxFor } from "../../../lib/settings.mjs";
+import { createJob, decideNext, generateJobId, InvalidLabelError, listJobViews, PROMPT_LIMIT_BYTES, PromptTooLargeError } from "../../../lib/state.mjs";
 import { attachWorktree, buildSessionReviewHandoff, discardLaunchWorktree, readTaskInputFiles } from "../../../lib/task-launch.mjs";
 import { agyProvider } from "../index.mjs";
 import { ensureAgyAvailable, readAgySavedModel } from "../runtime.mjs";
@@ -20,7 +21,7 @@ const LABEL_PATTERN = /^[a-z0-9-]{1,40}$/;
 const PLUGIN_ROOT = path.resolve(fileURLToPath(new URL("../../../..", import.meta.url)));
 
 export function writeSandboxMode(workspaceRoot, write) {
-  return write ? getConfig(workspaceRoot).writeSandbox ?? "workspace-write" : "read-only";
+  return writeSandboxFor(workspaceRoot, write);
 }
 
 // The lines of a job's output that name the model agy used when the plugin named none.

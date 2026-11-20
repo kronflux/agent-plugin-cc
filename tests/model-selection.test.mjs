@@ -429,8 +429,8 @@ test("setup --model stores the delegation default and reports the model a delega
 
   const text = companion(ctx, ["setup"]);
   assert.equal(text.status, 0, text.stderr);
-  assert.match(text.stdout, /^- delegation model: gpt-5\.6-luna \(setting\)$/m);
-  assert.match(text.stdout, /^- delegation effort: high \(setting\)$/m);
+  assert.match(text.stdout, /^- delegation model: gpt-5\.6-luna \(project setting\)$/m);
+  assert.match(text.stdout, /^- delegation effort: high \(project setting\)$/m);
 
   // --effort alone keeps the stored model.
   setupJson(ctx, ["--effort", "medium"]);

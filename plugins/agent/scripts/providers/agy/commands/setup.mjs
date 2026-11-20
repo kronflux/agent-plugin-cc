@@ -1,41 +1,62 @@
 import { outputCommandResult, parseCommandInput, resolveCommandCwd, resolveCommandWorkspace } from "../../../lib/companion-cli.mjs";
-import { delegationLines, describeDelegation, storeDelegationSetting } from "../../../lib/model-selection.mjs";
+import { delegationLines, describeDelegation, planDelegationSetting } from "../../../lib/model-selection.mjs";
 import { binaryAvailable } from "../../../lib/process.mjs";
-import { delegationSetting } from "../../../lib/settings.mjs";
-import { getConfig, setConfig } from "../../../lib/state.mjs";
+import {
+  checkWriteSandbox,
+  delegationSetting,
+  parseSetupArguments,
+  resolveSetting,
+  settingSources,
+  sourceLabel,
+  WRITE_SANDBOXES
+} from "../../../lib/settings.mjs";
+import { getConfig, setConfig, updateUserConfig } from "../../../lib/state.mjs";
 import { agyProvider } from "../index.mjs";
 import { getAgyAvailability, readAgyEfforts, readAgyModels, readAgySavedModel, resolveAgyDelegationModel } from "../runtime.mjs";
 
-const WRITE_SANDBOXES = ["workspace-write", "danger-full-access"];
-
-export const usage = `setup [--model <id|family|default|configured>] [--effort <level>] [--write-sandbox <${WRITE_SANDBOXES.join("|")}>] [--json]`;
+export const usage = `setup [--scope project|user] [--model <id|family|default|configured>] [--effort <level>] [--write-sandbox <${WRITE_SANDBOXES.join("|")}>] [--json]`;
 
 export async function handleSetup(argv) {
-  const { options } = parseCommandInput(argv, { valueOptions: ["cwd", "model", "effort", "write-sandbox"], booleanOptions: ["json"] });
+  const options = parseSetupArguments(argv, {
+    parse: parseCommandInput,
+    usage,
+    valueOptions: ["cwd", "model", "effort", "write-sandbox"],
+    booleanOptions: ["json"]
+  });
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const actionsTaken = [];
 
-  let sandbox = null;
-  if (options["write-sandbox"] !== undefined) {
-    sandbox = String(options["write-sandbox"]).trim();
-    if (!WRITE_SANDBOXES.includes(sandbox)) {
-      throw new Error(`Unsupported write sandbox "${sandbox}". Use one of: ${WRITE_SANDBOXES.join(", ")}.`);
+  const sandbox = options["write-sandbox"] !== undefined ? checkWriteSandbox(options["write-sandbox"]) : null;
+  const planned = await planDelegationSetting(agyProvider, workspaceRoot, cwd, options, { scope: options.scope });
+  for (const warning of planned?.warnings ?? []) {
+    process.stderr.write(`${warning}\n`);
+  }
+  // The write sandbox setting is shared with the Codex provider. At user scope every change of
+  // this call is written in one update of the user config.
+  const where = options.scope === "user" ? "in every workspace without its own setting" : `in ${workspaceRoot}`;
+  if (options.scope === "user" && (planned || sandbox)) {
+    updateUserConfig((config) => ({
+      ...config,
+      ...(planned ? { models: { ...config.models, [agyProvider.id]: planned.value } } : {}),
+      ...(sandbox ? { writeSandbox: sandbox } : {})
+    }));
+  } else if (options.scope !== "user") {
+    if (planned) {
+      setConfig(workspaceRoot, "models", { ...(getConfig(workspaceRoot).models ?? {}), [agyProvider.id]: planned.value });
+    }
+    if (sandbox) {
+      setConfig(workspaceRoot, "writeSandbox", sandbox);
     }
   }
-  const delegationSetting = await storeDelegationSetting(agyProvider, workspaceRoot, cwd, options);
-  if (delegationSetting) {
-    for (const warning of delegationSetting.warnings) {
-      process.stderr.write(`${warning}\n`);
-    }
-    actionsTaken.push(delegationSetting.action);
+  if (planned) {
+    actionsTaken.push(planned.action);
   }
-  // The write sandbox setting is shared with the Codex provider.
   if (sandbox) {
-    setConfig(workspaceRoot, "writeSandbox", sandbox);
-    actionsTaken.push(`Write-capable tasks now run with the ${sandbox} sandbox in ${workspaceRoot}.`);
+    actionsTaken.push(`Write-capable tasks now run with the ${sandbox} sandbox ${where}.`);
   }
 
+  const writeSandbox = resolveSetting("writeSandbox", { workspaceRoot });
   const node = binaryAvailable("node", ["--version"], { cwd });
   const agy = getAgyAvailability(cwd);
   const login = agy.available ? readAgyModels(cwd) : { ok: false, models: [], detail: "skipped: agy is not installed" };
@@ -54,7 +75,8 @@ export async function handleSetup(argv) {
     agy,
     login: { ok: login.ok, detail: login.detail },
     models: login.models,
-    writeSandbox: getConfig(workspaceRoot).writeSandbox ?? "workspace-write",
+    writeSandbox: writeSandbox.value,
+    sources: settingSources(delegation, writeSandbox.source),
     delegation,
     contracts: agyProvider.contractSummary(agy.available ? installedVersion(agy.detail) : null),
     version: agy.available ? installedVersion(agy.detail) : null,
@@ -74,7 +96,7 @@ export async function handleSetup(argv) {
     `- node: ${node.detail}`,
     `- agy: ${agy.detail}`,
     `- sign-in: ${login.ok ? `signed in (${login.detail})` : login.detail}`,
-    `- write sandbox: ${report.writeSandbox}`,
+    `- write sandbox: ${report.writeSandbox} (${sourceLabel(writeSandbox.source)})`,
     ...delegationLines(delegation, {
       chosenBy: agyProvider.label,
       modelName: delegation.providerModel ? `${delegation.providerModel} from the Antigravity settings` : null
