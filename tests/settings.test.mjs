@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 
 import { makeTempDir } from "./helpers.mjs";
 import * as state from "../plugins/agent/scripts/lib/state.mjs";
+import { delegationSetting, resolveSetting, writeSandboxFor } from "../plugins/agent/scripts/lib/settings.mjs";
 
 // Gives the test its own plugin data folder, so the user config of one test never reaches another.
 function usePluginData(t) {
@@ -101,4 +102,35 @@ test("an unreadable or future-version user config is never overwritten", (t) => 
     });
     assert.equal(fs.readFileSync(file, "utf8"), content);
   }
+});
+
+test("each setting resolves from the flag, the project, the user, then the default", (t) => {
+  usePluginData(t);
+  const workspaceRoot = makeTempDir(t);
+  const provider = { id: "agy" };
+  const resolve = (key, flag) => resolveSetting(key, { provider, workspaceRoot, flag });
+  assert.deepEqual(resolve("writeSandbox"), { value: "workspace-write", source: "provider-default" });
+  assert.deepEqual(resolve("model"), { value: null, source: "provider-default" });
+  state.setUserConfig("writeSandbox", "danger-full-access");
+  state.setUserConfig("models", { agy: { model: "a", effort: "low" } });
+  assert.deepEqual(resolve("writeSandbox"), { value: "danger-full-access", source: "user" });
+  assert.deepEqual(resolve("model"), { value: "a", source: "user" });
+  assert.deepEqual(resolve("effort"), { value: "low", source: "user" });
+  state.setConfig(workspaceRoot, "writeSandbox", "workspace-write");
+  state.setConfig(workspaceRoot, "models", { agy: { model: "b", effort: null } });
+  assert.deepEqual(resolve("writeSandbox"), { value: "workspace-write", source: "project" });
+  assert.deepEqual(resolve("model"), { value: "b", source: "project" });
+  assert.deepEqual(resolve("model", "c"), { value: "c", source: "flag" });
+  // A project entry cleared by --model default stops at the provider default.
+  state.setConfig(workspaceRoot, "models", { agy: null });
+  assert.deepEqual(delegationSetting(provider, workspaceRoot), { setting: null, source: "provider-default" });
+  assert.deepEqual(resolve("model"), { value: null, source: "provider-default" });
+});
+
+test("a read-only job never takes the write sandbox setting", (t) => {
+  usePluginData(t);
+  const workspaceRoot = makeTempDir(t);
+  state.setUserConfig("writeSandbox", "danger-full-access");
+  assert.equal(writeSandboxFor(workspaceRoot, false), "read-only");
+  assert.equal(writeSandboxFor(workspaceRoot, true), "danger-full-access");
 });

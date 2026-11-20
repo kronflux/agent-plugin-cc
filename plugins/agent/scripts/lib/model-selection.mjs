@@ -1,7 +1,9 @@
 // Chooses the model and reasoning effort a job runs with. Each provider's model catalog
 // resolves and checks the values; this module only decides which choice applies, in this order:
-// the command line, the job a follow-up continues, the workspace setting, the provider default.
+// the command line, the job a follow-up continues, the workspace setting, the user setting, the
+// provider default.
 
+import { delegationSetting } from "./settings.mjs";
 import { getConfig, setConfig } from "./state.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -12,13 +14,25 @@ function isGiven(value) {
   return value != null && String(value).trim() !== "";
 }
 
-/** The delegation setting stored for `provider` in the workspace of `cwd`, or null. */
+// The job source of a model or effort that a stored setting chose, by where the setting is kept.
+const SETTING_SOURCES = { project: "setting", user: "user-setting" };
+
+/**
+ * The delegation setting of `provider` for the workspace of `cwd`: `{ setting, source }`, the
+ * workspace setting first, then the user setting (see `delegationSetting`).
+ */
 export function readModelSetting(provider, cwd) {
   try {
-    return getConfig(resolveWorkspaceRoot(cwd)).models?.[provider.id] ?? null;
+    return delegationSetting(provider, resolveWorkspaceRoot(cwd));
   } catch {
-    return null;
+    return { setting: null, source: "provider-default" };
   }
+}
+
+/** The `setting` and `settingSource` options of `resolveModelSelection` for `workspaceRoot`. */
+export function delegationOptions(provider, workspaceRoot) {
+  const { setting, source } = delegationSetting(provider, workspaceRoot);
+  return { setting, settingSource: source };
 }
 
 /**
@@ -64,15 +78,16 @@ async function keptModelEfforts(catalog, model, context) {
 /**
  * Resolves `options.model` and `options.effort` through `catalog`.
  *
- * `options.setting` is the stored delegation setting `{ model, effort }`; when it is undefined it
- * is read from the workspace. `options.stored` is what `storedSelection` returned for the job a
+ * `options.setting` is the stored delegation setting `{ model, effort }` and `options.settingSource`
+ * where it is kept (`project` or `user`); when the setting is undefined both are read from the
+ * workspace and user settings. `options.stored` is what `storedSelection` returned for the job a
  * follow-up continues: its values are used as they are, with their sources, unless the command
  * gives its own; a stored effort is dropped, with a warning, when the command gives a new model
  * that does not accept it. A given effort goes through `catalog.checkEffort`, which throws when
  * the model does not support it; with a stored model it is checked against that model's efforts.
  *
  * Returns `{ model, effort, modelSource, effortSource, warnings }`; a source is one of
- * `explicit`, `setting`, `catalog-default`, `family-fallback`, `provider-default`, or the stored
+ * `explicit`, `setting` (workspace), `user-setting`, `catalog-default`, `family-fallback`, `provider-default`, or the stored
  * source of a continued job.
  */
 export async function resolveModelSelection(provider, options = {}, catalog = provider.modelCatalog) {
@@ -83,8 +98,11 @@ export async function resolveModelSelection(provider, options = {}, catalog = pr
   const requestedModel = isGiven(options?.model) ? String(options.model).trim() : null;
   const usesStoredModel = !requestedModel && Boolean(stored?.model);
   let setting = null;
+  let settingSource = "setting";
   if (!usesStoredModel || !(isGiven(options?.effort) || stored?.effort)) {
-    setting = options?.setting === undefined ? readModelSetting(provider, cwd) : options.setting;
+    const read = options?.setting === undefined ? readModelSetting(provider, cwd) : { setting: options.setting, source: options.settingSource ?? "project" };
+    setting = read.setting;
+    settingSource = SETTING_SOURCES[read.source] ?? "setting";
   }
   // --model default chooses the provider default and leaves the stored setting aside entirely.
   const forcedDefault = requestedModel?.toLowerCase() === "default";
@@ -99,7 +117,7 @@ export async function resolveModelSelection(provider, options = {}, catalog = pr
       resolved.efforts = await keptModelEfforts(catalog, resolved.model, context);
     }
   } else if (isGiven(setting?.model)) {
-    resolved = await resolveChoice(catalog, setting.model, "setting", context);
+    resolved = await resolveChoice(catalog, setting.model, settingSource, context);
   } else {
     resolved = await catalog.resolveDefault(context);
   }
@@ -133,7 +151,7 @@ export async function resolveModelSelection(provider, options = {}, catalog = pr
     effortSource = inherited.source;
   } else if (!stored?.effort && !forcedDefault && isGiven(setting?.effort)) {
     effort = await catalog.checkEffort(setting.effort, resolved.efforts ?? null, effortContext);
-    effortSource = "setting";
+    effortSource = settingSource;
   } else if (resolved.defaultEffort) {
     effort = resolved.defaultEffort;
     effortSource = CATALOG_SOURCES.has(resolved.source) ? resolved.source : "catalog-default";
@@ -201,8 +219,10 @@ export async function storeDelegationSetting(provider, workspaceRoot, cwd, optio
  */
 export async function describeDelegation(provider, workspaceRoot, cwd) {
   try {
+    const delegation = delegationSetting(provider, workspaceRoot);
     const selection = await resolveModelSelection(provider, {
-      setting: getConfig(workspaceRoot).models?.[provider.id] ?? null,
+      setting: delegation.setting,
+      settingSource: delegation.source,
       cwd
     });
     return {

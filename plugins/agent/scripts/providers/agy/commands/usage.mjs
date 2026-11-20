@@ -1,5 +1,5 @@
 import { parseCommandInput, resolveCommandCwd, resolveCommandWorkspace } from "../../../lib/companion-cli.mjs";
-import { getConfig } from "../../../lib/state.mjs";
+import { delegationSetting } from "../../../lib/settings.mjs";
 import { readAgyEfforts, resolveAgyDelegationModel } from "../runtime.mjs";
 import {
   markDefaultGroup,
@@ -30,7 +30,7 @@ export async function handleUsage(argv) {
     return;
   }
   const workspaceRoot = resolveCommandWorkspace(options);
-  const delegation = resolveAgyDelegationModel(cwd, { setting: getConfig(workspaceRoot).models?.agy?.model ?? null });
+  const delegation = resolveAgyDelegationModel(cwd, { setting: delegationSetting("agy", workspaceRoot).setting?.model ?? null });
   const name = delegation.displayName ? stripEffortSuffix(delegation.displayName, readAgyEfforts(cwd)) : null;
   const normalized = normalizeAgyUsage({ groups: markDefaultGroup(parsed.groups, name) });
   const notes = name ? [] : [UNKNOWN_DELEGATION_MODEL_LINE];

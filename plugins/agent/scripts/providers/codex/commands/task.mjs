@@ -12,7 +12,7 @@ import {
 import { readStdinIfPiped } from "../../../lib/fs.mjs";
 import { readRequesterIdentity } from "../../../lib/host.mjs";
 import { reconcileStore } from "../../../lib/job-control.mjs";
-import { resolveModelSelection, storedSelection } from "../../../lib/model-selection.mjs";
+import { delegationOptions, resolveModelSelection, storedSelection } from "../../../lib/model-selection.mjs";
 import { providerForJob } from "../../../lib/providers.mjs";
 import { renderTaskResult } from "../../../lib/render.mjs";
 import {
@@ -87,7 +87,7 @@ export async function resolveTaskSelection(workspaceRoot, cwd, { model, effort, 
   return resolveModelSelection(codexProvider, {
     model,
     effort,
-    setting: getConfig(workspaceRoot).models?.[codexProvider.id] ?? null,
+    ...delegationOptions(codexProvider, workspaceRoot),
     stored: storedSelectionOf(job),
     cwd
   });

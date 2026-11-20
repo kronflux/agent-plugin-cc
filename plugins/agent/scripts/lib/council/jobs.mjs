@@ -2,8 +2,7 @@
 // background task with an output schema, a label and a run id; and the seat's usage reading.
 import process from "node:process";
 
-import { getConfig } from "../state.mjs";
-import { resolveModelSelection } from "../model-selection.mjs";
+import { delegationOptions, resolveModelSelection } from "../model-selection.mjs";
 import { getProvider } from "../providers.mjs";
 import { runCompanion } from "../runs.mjs";
 import { readTaskInputFiles } from "../task-launch.mjs";
@@ -61,7 +60,7 @@ export async function buildSeatJob({ family, model = null, prompt, schemaPath, l
     const selection = await resolveModelSelection(agyProvider, {
       model: model ?? undefined,
       effort: undefined,
-      setting: getConfig(workspaceRoot).models?.[agyProvider.id] ?? null,
+      ...delegationOptions(agyProvider, workspaceRoot),
       stored: null,
       cwd
     });

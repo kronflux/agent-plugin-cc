@@ -1,7 +1,7 @@
 import { parseCommandInput, resolveCommandCwd, resolveCommandWorkspace } from "../../../lib/companion-cli.mjs";
 import { readStdinIfPiped } from "../../../lib/fs.mjs";
 import { getSessionId, readRequesterIdentity } from "../../../lib/host.mjs";
-import { resolveModelSelection, storedSelection } from "../../../lib/model-selection.mjs";
+import { delegationOptions, resolveModelSelection, storedSelection } from "../../../lib/model-selection.mjs";
 import { renderTaskResult } from "../../../lib/render.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -205,7 +205,7 @@ export async function handleTask(argv) {
     const selection = await resolveModelSelection(agyProvider, {
       model: options.model,
       effort: options.effort,
-      setting: getConfig(workspaceRoot).models?.[agyProvider.id] ?? null,
+      ...delegationOptions(agyProvider, workspaceRoot),
       stored: selectionOf(continued),
       cwd
     });

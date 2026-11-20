@@ -1,6 +1,7 @@
 import { outputCommandResult, parseCommandInput, resolveCommandCwd, resolveCommandWorkspace } from "../../../lib/companion-cli.mjs";
 import { delegationLines, describeDelegation, storeDelegationSetting } from "../../../lib/model-selection.mjs";
 import { binaryAvailable } from "../../../lib/process.mjs";
+import { delegationSetting } from "../../../lib/settings.mjs";
 import { getConfig, setConfig } from "../../../lib/state.mjs";
 import { agyProvider } from "../index.mjs";
 import { getAgyAvailability, readAgyEfforts, readAgyModels, readAgySavedModel, resolveAgyDelegationModel } from "../runtime.mjs";
@@ -59,7 +60,7 @@ export async function handleSetup(argv) {
     version: agy.available ? installedVersion(agy.detail) : null,
     modelCount: login.models.length,
     // The model a delegation uses, by agy's display name (the saved default is one already).
-    delegationModel: resolveAgyDelegationModel(cwd, { setting: getConfig(workspaceRoot).models?.[agyProvider.id]?.model ?? null }),
+    delegationModel: resolveAgyDelegationModel(cwd, { setting: delegationSetting(agyProvider, workspaceRoot).setting?.model ?? null }),
     efforts: agy.available ? readAgyEfforts(cwd) : [],
     actionsTaken,
     nextSteps
