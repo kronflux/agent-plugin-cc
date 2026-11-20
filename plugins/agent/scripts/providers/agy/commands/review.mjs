@@ -17,7 +17,7 @@ import { getConfig } from "../../../lib/state.mjs";
 import { createProviderJob } from "../../../lib/task-launch.mjs";
 import { resolveWorkspaceRoot } from "../../../lib/workspace.mjs";
 import { agyProvider } from "../index.mjs";
-import { ensureAgyAvailable, readAgySavedModel, runAgyTurn } from "../runtime.mjs";
+import { ensureAgyAvailable, outsideFolders, readAgySavedModel, runAgyTurn } from "../runtime.mjs";
 import { modelNoteLines, notesText, readRunModel } from "./task.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("../../../..", import.meta.url)));
@@ -71,12 +71,15 @@ export async function executeAgyReview(request) {
     instructions: request.instructions ?? "",
     context
   });
-  const result = await runAgyTurn(context?.repoRoot ?? target.root, {
+  const workingFolder = context?.repoRoot ?? target.root;
+  const result = await runAgyTurn(workingFolder, {
     prompt,
     model: request.model,
     effort: request.effort,
     sandboxMode: "read-only",
     jsonSchema: REVIEW_SCHEMA,
+    // A reviewed path outside the folder agy runs in is readable through its folder.
+    addDirs: outsideFolders(workingFolder, (target.paths ?? []).map((entry) => path.resolve(target.root, entry))),
     onProgress: request.onProgress
   });
   const parsed = parseReviewOutput(result);

@@ -1,0 +1,82 @@
+{
+  "two-turn-1": {
+    "source": "agy 1.5.10, --sandbox, first turn of a two-turn conversation",
+    "exitCode": 0,
+    "resultStatus": "SUCCESS",
+    "conversationId": "00000000-0000-4000-8000-000000000001",
+    "turns": 1,
+    "status": "answer"
+  },
+  "two-turn-2": {
+    "source": "agy 1.5.10, --sandbox --conversation, second turn in a new process",
+    "continued": true,
+    "exitCode": 0,
+    "resultStatus": "SUCCESS",
+    "conversationId": "00000000-0000-4000-8000-000000000001",
+    "turns": 2,
+    "status": "answer"
+  },
+  "stop-resume-1": {
+    "source": "agy 1.5.10, --sandbox --conversation, stopped by its process id mid-turn",
+    "continued": true,
+    "exitCode": 1,
+    "resultStatus": null,
+    "conversationId": "00000000-0000-4000-8000-000000000001",
+    "turns": null,
+    "status": "failed",
+    "error": "agy exited with code 1 before the turn finished."
+  },
+  "stop-resume-2": {
+    "source": "agy 1.5.10, --sandbox --conversation, the turn after the stop",
+    "continued": true,
+    "exitCode": 0,
+    "resultStatus": "SUCCESS",
+    "conversationId": "00000000-0000-4000-8000-000000000001",
+    "turns": 4,
+    "status": "answer"
+  },
+  "schema-1": {
+    "source": "agy 1.5.10, --sandbox --json-schema with a required string answer",
+    "exitCode": 0,
+    "resultStatus": "SUCCESS",
+    "conversationId": "00000000-0000-4000-8000-000000000002",
+    "turns": 1,
+    "status": "answer",
+    "json": { "answer": "Paris" }
+  },
+  "schema-2": {
+    "source": "agy 1.5.10, --sandbox --conversation with a different --json-schema (required integer count)",
+    "continued": true,
+    "exitCode": 0,
+    "resultStatus": "SUCCESS",
+    "conversationId": "00000000-0000-4000-8000-000000000002",
+    "turns": 2,
+    "status": "answer",
+    "json": { "count": 5 }
+  },
+  "read-only-summary": {
+    "source": "agy 1.5.10, --sandbox --settings denying write_file and command, three-file summary",
+    "exitCode": 0,
+    "resultStatus": "SUCCESS",
+    "conversationId": "00000000-0000-4000-8000-000000000003",
+    "turns": 1,
+    "status": "answer"
+  },
+  "read-only-outside-add-dir": {
+    "source": "agy 1.5.10, read-only settings with --add-dir; three reads fail with a TOOL_ERROR that is not a permission refusal",
+    "exitCode": 0,
+    "resultStatus": "SUCCESS",
+    "conversationId": "00000000-0000-4000-8000-000000000004",
+    "turns": 1,
+    "status": "answer"
+  },
+  "read-only-denied-edit": {
+    "source": "agy 1.5.10, read-only settings asked for an edit; the edit is refused by the deny rule",
+    "exitCode": 0,
+    "resultStatus": "SUCCESS",
+    "conversationId": "00000000-0000-4000-8000-000000000005",
+    "turns": 1,
+    "status": "failed",
+    "error": "Antigravity was denied permission for write_file (edit_file) on C:\\trace\\agy\\ws\\one.txt."
+  }
+}

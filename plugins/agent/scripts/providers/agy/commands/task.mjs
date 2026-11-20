@@ -84,6 +84,25 @@ export function readRunModel(workspaceRoot, request) {
   return { providerModel, savedModelChange };
 }
 
+// An agy process runs one turn and takes no message while it runs. A message queued for the job
+// during the turn is reported unconfirmed when the turn ends, so its sender starts a new turn on
+// the conversation instead.
+function reportUntakenMessages(workspaceRoot, jobId) {
+  let queued = [];
+  try {
+    queued = takeJobMessages(workspaceRoot, jobId);
+  } catch {
+    return;
+  }
+  for (const message of queued) {
+    try {
+      writeJobMessageOutcome(workspaceRoot, jobId, message.id, { status: "unconfirmed" });
+    } catch {
+      // The sender reads a missing outcome after the job ended as a message to start a turn with.
+    }
+  }
+}
+
 export async function executeAgyTask(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
   ensureAgyAvailable(request.cwd);
@@ -95,14 +114,11 @@ export async function executeAgyTask(request) {
     model: request.model,
     effort: request.effort,
     sandboxMode: writeSandboxMode(workspaceRoot, request.write),
-    onProgress: request.onProgress,
-    messageInbox: request.jobId
-      ? {
-          take: () => takeJobMessages(workspaceRoot, request.jobId),
-          report: (messageId, outcome) => writeJobMessageOutcome(workspaceRoot, request.jobId, messageId, outcome)
-        }
-      : null
+    onProgress: request.onProgress
   });
+  if (request.jobId) {
+    reportUntakenMessages(workspaceRoot, request.jobId);
+  }
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
   const failureMessage = result.error?.message ?? result.stderr ?? "";
   // The payload keeps the model lines, so result prints them after the stored output.

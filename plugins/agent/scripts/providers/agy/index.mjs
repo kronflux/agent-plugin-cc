@@ -3,9 +3,9 @@ import { fileURLToPath } from "node:url";
 import { startTurnWithProviderCompanion } from "../../lib/task-launch.mjs";
 import { agyModelCatalog } from "./runtime.mjs";
 
-// Antigravity (agy) runs one CLI process per job. It has no protocol to interrupt a turn, so
-// cancel stops the job's processes; a message sent during a turn is written to the same process
-// and runs as a turn of its own.
+// Antigravity (agy) runs one CLI process per turn. It has no protocol to interrupt a turn, so
+// cancel stops the job's processes. A message sent during a turn is not written to the running
+// process; when the turn ends, the message starts a new turn on the same conversation.
 export const agyProvider = Object.freeze({
   id: "agy",
   label: "Antigravity",
