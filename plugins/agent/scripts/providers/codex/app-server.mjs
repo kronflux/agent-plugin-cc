@@ -65,6 +65,8 @@ export class AppServerClientBase {
     this.stderr = "";
     this.closed = false;
     this.exitError = null;
+    // The last error a notification handler threw; line processing continues after it.
+    this.lastHandlerError = null;
     /** @type {AppServerNotificationHandler | null} */
     this.notificationHandler = null;
     this.lineBuffer = "";
@@ -89,7 +91,7 @@ export class AppServerClientBase {
    */
   request(method, params) {
     if (this.closed) {
-      throw new Error("codex app-server client is closed.");
+      return Promise.reject(this.createClosedError());
     }
 
     const id = this.nextId;
@@ -97,8 +99,26 @@ export class AppServerClientBase {
 
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject, method });
-      this.sendMessage({ id, method, params });
+      try {
+        this.sendMessage({ id, method, params });
+      } catch (error) {
+        this.pending.delete(id);
+        reject(error);
+      }
     });
+  }
+
+  createClosedError() {
+    const cause = this.exitError;
+    return new Error(
+      cause ? `codex app-server client is closed: ${cause.message}` : "codex app-server client is closed.",
+      cause ? { cause } : undefined
+    );
+  }
+
+  // Overridden by transports that own a process or socket; the base only marks the client closed.
+  async close() {
+    this.closed = true;
   }
 
   notify(method, params = {}) {
@@ -129,6 +149,8 @@ export class AppServerClientBase {
       message = JSON.parse(line);
     } catch (error) {
       this.handleExit(createProtocolError(`Failed to parse codex app-server JSONL: ${error.message}`, { line }));
+      // A stream that is not JSONL cannot be resynchronised, so the transport is ended too.
+      this.close().catch(() => {});
       return;
     }
 
@@ -153,15 +175,21 @@ export class AppServerClientBase {
     }
 
     if (message.method && this.notificationHandler) {
-      this.notificationHandler(/** @type {AppServerNotification} */ (message));
+      // A throwing handler must not stop the lines after it, which may answer pending requests.
+      try {
+        this.notificationHandler(/** @type {AppServerNotification} */ (message));
+      } catch (error) {
+        this.lastHandlerError = error;
+      }
     }
   }
 
-  // `--write` runs use `approvalPolicy: "on-request"`, so app-server sends
-  // server->client approval requests. Rejecting them with -32601 makes the turn
-  // error out or hang. This client runs Codex non-interactively — there is no
-  // operator to ask — so every approval is answered with that request type's own
-  // refusal variant. The generated types disagree on shape: the v1 approvals take
+  // Every thread and turn this plugin starts sends `approvalPolicy: "never"`, read-only and
+  // `--write` runs alike, so app-server is not expected to ask for approval. An approval request
+  // that still arrives is answered fail-closed rather than rejected with -32601, which would
+  // make the turn error out or hang. This client runs Codex non-interactively, with no operator
+  // to ask, so every approval is answered with that request type's own refusal variant. The
+  // generated types disagree on shape: the v1 approvals take
   // a `ReviewDecision` (refusal `{ denied: { rejection } }`), the v2 item
   // approvals take a plain `"decline"` enum with no room for a reason, and
   // `PermissionsRequestApprovalResponse` has no refusal variant at all, so
@@ -185,10 +213,13 @@ export class AppServerClientBase {
         this.sendMessage({ id: message.id, result: { permissions: {}, scope: "turn" } });
         return;
 
-      // MCP servers (e.g. ChatGPT connectors surfaced as `codex_apps`) request
-      // the operator's consent via an elicitation. Form-mode elicitations expect
-      // structured content back, so a blanket accept with `content: null`
-      // violates the contract; decline those and accept the rest.
+      // MCP servers (e.g. ChatGPT connectors surfaced as `codex_apps`) ask for the
+      // operator's consent through an elicitation. A request whose `mode` is `form` or
+      // `openai/form` expects structured content back, which this runner cannot supply,
+      // so it is declined. Every other request is accepted with `content: null`: that
+      // includes `url` mode, the `openaiForm` spelling, and a request with no `mode`.
+      // They are accepted because declining them blocks the MCP tool call that raised
+      // them, and a delegated run has no operator who could answer instead.
       case "mcpServer/elicitation/request": {
         const mode = message.params?.mode;
         if (mode === "form" || mode === "openai/form") {
@@ -216,6 +247,7 @@ export class AppServerClientBase {
     }
 
     this.exitResolved = true;
+    this.closed = true;
     this.exitError = error ?? null;
 
     for (const pending of this.pending.values()) {
@@ -230,7 +262,7 @@ export class AppServerClientBase {
   }
 }
 
-class SpawnedCodexAppServerClient extends AppServerClientBase {
+export class SpawnedCodexAppServerClient extends AppServerClientBase {
   constructor(cwd, options = {}) {
     super(cwd, options);
     this.transport = "direct";
@@ -258,15 +290,15 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.handleExit(error);
     });
 
+    // A write to an app server that stopped reading fails with EPIPE on this stream; without a
+    // listener that error would crash the host process instead of failing the pending requests.
+    // After close() the same error only reflects the shutdown close() asked for.
+    this.proc.stdin.on("error", (error) => {
+      this.handleExit(this.closeStarted ? null : createProtocolError(`codex app-server stdin failed: ${error.message}`));
+    });
+
     this.proc.on("exit", (code, signal) => {
-      const stderr = this.stderr.trim();
-      const detail =
-        code === 0
-          ? null
-          : createProtocolError(
-              `codex app-server exited unexpectedly (${signal ? `signal ${signal}` : `exit ${code}`}).${stderr ? `\n${stderr}` : ""}`
-            );
-      this.handleExit(detail);
+      this.handleProcessExit(code, signal);
     });
 
     this.readline = readline.createInterface({ input: this.proc.stdout });
@@ -281,35 +313,63 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.notify("initialized", {});
   }
 
+  // An exit that follows close() is the one close() asked for, so it carries no error.
+  handleProcessExit(code, signal) {
+    const stderr = this.stderr.trim();
+    const detail =
+      code === 0 || this.closeStarted
+        ? null
+        : createProtocolError(
+            `codex app-server exited unexpectedly (${signal ? `signal ${signal}` : `exit ${code}`}).${stderr ? `\n${stderr}` : ""}`
+          );
+    this.handleExit(detail);
+  }
+
   async close() {
-    if (this.closed) {
+    if (this.closeStarted) {
       await this.exitPromise;
       return;
     }
 
+    this.closeStarted = true;
     this.closed = true;
 
     if (this.readline) {
       this.readline.close();
     }
 
-    if (this.proc && !this.proc.killed) {
-      this.proc.stdin.end();
+    const proc = this.proc;
+    if (!proc) {
+      // No process was started, so no exit event will ever settle the client.
+      this.handleExit(null);
+      return;
+    }
+
+    const isRunning = () => proc.pid !== undefined && proc.exitCode === null && proc.signalCode === null;
+    if (isRunning()) {
+      proc.stdin.end();
       setTimeout(() => {
-        if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
+        if (!isRunning()) {
+          return;
+        }
+        if (process.platform === "win32") {
           // When codex is a batch file the direct child is cmd.exe, so stop the
           // whole tree to reach the process it started.
-          if (process.platform === "win32") {
-            try {
-              terminateProcessTree(this.proc.pid);
-            } catch {
-              // Best-effort cleanup inside an unref'd timer — swallow errors
-              // to avoid crashing the host process during shutdown.
-            }
-          } else {
-            this.proc.kill("SIGTERM");
+          try {
+            terminateProcessTree(proc.pid);
+          } catch {
+            // Best-effort cleanup inside an unref'd timer: errors are swallowed
+            // so they cannot crash the host process during shutdown.
           }
+          return;
         }
+        proc.kill("SIGTERM");
+        // A process that ignores SIGTERM is killed 2 s later.
+        setTimeout(() => {
+          if (isRunning()) {
+            proc.kill("SIGKILL");
+          }
+        }, 2000).unref?.();
       }, 50).unref?.();
     }
 
@@ -361,15 +421,19 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
   }
 
   async close() {
-    if (this.closed) {
+    if (this.closeStarted) {
       await this.exitPromise;
       return;
     }
 
+    this.closeStarted = true;
     this.closed = true;
-    if (this.socket) {
-      this.socket.end();
+    if (!this.socket) {
+      // No socket was opened, so no close event will ever settle the client.
+      this.handleExit(null);
+      return;
     }
+    this.socket.end();
     await this.exitPromise;
   }
 
@@ -399,7 +463,14 @@ export class CodexAppServerClient {
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
-    await client.initialize();
+    try {
+      await client.initialize();
+    } catch (error) {
+      // A client whose handshake failed is never returned, so it is closed here to end the
+      // app-server process or socket it opened.
+      await client.close().catch(() => {});
+      throw error;
+    }
     return client;
   }
 }

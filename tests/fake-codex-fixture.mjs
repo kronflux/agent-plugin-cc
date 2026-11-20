@@ -10,6 +10,7 @@ export function installFakeCodex(binDir, behavior = "review-ok") {
   const source = `#!/usr/bin/env node
 const fs = require("node:fs");
 const crypto = require("node:crypto");
+const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
 
@@ -36,7 +37,74 @@ const readline = require("node:readline");
 	  }
 	}
 
+const LOCK_PATH = STATE_PATH + ".lock";
+let lockDepth = 0;
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+// Serialises state access between fake app servers that share one state file. The lock is
+// re-entrant within a process, and a lock left by a process that no longer runs is taken over.
+function withStateLock(fn) {
+  if (lockDepth > 0) {
+    lockDepth += 1;
+    try {
+      return fn();
+    } finally {
+      lockDepth -= 1;
+    }
+  }
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.writeFileSync(LOCK_PATH, String(process.pid), { flag: "wx" });
+      break;
+    } catch (error) {
+      if (error.code !== "EEXIST") {
+        throw error;
+      }
+      let holder = NaN;
+      try {
+        holder = Number.parseInt(fs.readFileSync(LOCK_PATH, "utf8"), 10);
+      } catch (readError) {
+        if (readError.code === "ENOENT") {
+          continue;
+        }
+        throw readError;
+      }
+      if (Number.isInteger(holder) && holder > 0 && !processAlive(holder)) {
+        fs.rmSync(LOCK_PATH, { force: true });
+        continue;
+      }
+      if (attempt >= 50) {
+        throw new Error("fake codex state lock is held by process " + holder);
+      }
+      sleepSync(20);
+    }
+  }
+  lockDepth = 1;
+  try {
+    return fn();
+  } finally {
+    lockDepth = 0;
+    fs.rmSync(LOCK_PATH, { force: true });
+  }
+}
+
 function saveState(state) {
+  withStateLock(() => writeState(state));
+}
+
+function writeState(state) {
   const tempFile = STATE_PATH + "." + process.pid + ".tmp";
   fs.writeFileSync(tempFile, JSON.stringify(state, null, 2));
   for (let attempt = 0; ; attempt += 1) {
@@ -177,7 +245,8 @@ function ledgerSourcePath(sourcePath) {
 }
 
 function importLedgerPath() {
-  return path.join(process.env.CODEX_HOME || path.join(process.env.HOME, ".codex"), "external_agent_session_imports.json");
+  const codexHome = process.env.CODEX_HOME || path.join(process.env.HOME || process.env.USERPROFILE || os.tmpdir(), ".codex");
+  return path.join(codexHome, "external_agent_session_imports.json");
 }
 
 function loadImportLedger() {
@@ -304,9 +373,12 @@ if (args[0] === "login") {
 if (args[0] !== "app-server") {
   process.exit(1);
 }
-const bootState = loadState();
-bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
-saveState(bootState);
+withStateLock(() => {
+  const bootState = loadState();
+  bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
+  bootState.appServerPids = [...(bootState.appServerPids || []), process.pid];
+  saveState(bootState);
+});
 
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
@@ -314,12 +386,29 @@ rl.on("line", (line) => {
     return;
   }
 
-  const message = JSON.parse(line);
-  const state = loadState();
+  let message = null;
+  try {
+    message = JSON.parse(line);
+  } catch (error) {
+    send({ id: null, error: { code: -32700, message: "Parse error: " + error.message } });
+    return;
+  }
 
   try {
+    withStateLock(() => handleMessage(message));
+  } catch (error) {
+    send({ id: message.id, error: { code: -32000, message: error.message } });
+  }
+});
+
+function handleMessage(message) {
+  const state = loadState();
     switch (message.method) {
       case "initialize":
+        if (BEHAVIOR === "initialize-fails") {
+          send({ id: message.id, error: { code: -32000, message: "initialize failed" } });
+          break;
+        }
         state.capabilities = message.params.capabilities || null;
         saveState(state);
         send({ id: message.id, result: { userAgent: "fake-codex-app-server" } });
@@ -592,14 +681,31 @@ rl.on("line", (line) => {
 	          turnId,
 	          model: message.params.model ?? null,
 	          effort: message.params.effort ?? null,
-	          prompt
+	          prompt,
+	          outputSchema: message.params.outputSchema ?? null
 	        };
 	        saveState(state);
+	        if (BEHAVIOR === "close-stdin-on-turn") {
+	          // Leaves turn/start unanswered and stops reading, so the client's next write finds no reader.
+	          // process.stdin.destroy() leaves descriptor 0 open, so it is closed explicitly as well.
+	          rl.close();
+	          process.stdin.destroy();
+	          try {
+	            fs.closeSync(0);
+	          } catch {}
+	          send({ method: "fake/stdinClosed", params: { threadId: thread.id, turnId } });
+	          setTimeout(() => process.exit(1), 3000);
+	          break;
+	        }
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+	        if (BEHAVIOR === "exit-mid-turn") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          // Exits once stdout has flushed, so the client sees the response and the notification first.
+	          process.stdout.write("", () => process.exit(1));
+	          break;
+	        }
 
         const isGateReview = prompt.includes("Only review the work from the previous Claude turn.");
-        state.lastTurnStart.outputSchema = message.params.outputSchema ?? null;
-        saveState(state);
         const payload = !isGateReview && message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
           : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
@@ -826,10 +932,7 @@ rl.on("line", (line) => {
 	        send({ id: message.id, error: { code: -32601, message: "Unsupported method: " + message.method } });
         break;
     }
-  } catch (error) {
-    send({ id: message.id, error: { code: -32000, message: error.message } });
-  }
-});
+}
 `;
   writeExecutable(scriptPath, source);
 
