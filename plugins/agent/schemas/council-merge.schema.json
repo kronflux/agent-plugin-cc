@@ -81,6 +81,32 @@
         }
       }
     },
+    "answers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["label", "seat", "text"],
+        "properties": {
+          "label": { "type": "string", "pattern": "^[A-Z]$" },
+          "seat": { "type": "string", "pattern": "^s[1-9]$" },
+          "text": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "options": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "labels", "text"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[A-Z]$" },
+          "labels": { "type": "array", "items": { "type": "string", "pattern": "^[A-Z]$" } },
+          "text": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
     "clusters": {
       "type": "array",
       "items": {

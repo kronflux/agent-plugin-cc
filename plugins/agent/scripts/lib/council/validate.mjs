@@ -2,16 +2,37 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { selfLabel } from "./anonymise.mjs";
 import { readObject as readStoredObject } from "./objects.mjs";
 
 // Checks council answers against the round schemas and the rules a schema cannot express.
 // The schema checker covers the keywords the council schemas use: type (with nullable type
 // lists), enum, const, required, properties, additionalProperties (false or a schema), items,
-// minLength, minimum and pattern.
+// minLength, maxLength, minimum and pattern.
 
 const SCHEMA_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "schemas");
 const ROUND_SCHEMAS = { 1: "council-round1", 2: "council-round2" };
+// The round schemas of the kinds whose seats answer the question in their own words: Round 1 adds
+// the answer, Round 2 adds the answer labels a seat links (`question`) or agrees with (`open`).
+const KIND_SCHEMAS = {
+  question: { 1: "council-round1-question", 2: "council-round2-question" },
+  open: { 1: "council-round1-question", 2: "council-round2-open" }
+};
 const schemaCache = new Map();
+
+/** The schema name of a council round's answer for a run of `kind`. */
+export function roundSchemaName(round, kind = "review") {
+  const name = (Object.hasOwn(KIND_SCHEMAS, kind ?? "") ? KIND_SCHEMAS[kind] : ROUND_SCHEMAS)[round];
+  if (!name) {
+    throw new TypeError(`Unknown council round "${round}".`);
+  }
+  return name;
+}
+
+/** Whether seats of a run of `kind` answer in their own words (a `question` or `open` run). */
+export function answersInOwnWords(kind) {
+  return Object.hasOwn(KIND_SCHEMAS, kind ?? "");
+}
 
 export function loadCouncilSchema(name) {
   if (!schemaCache.has(name)) {
@@ -84,6 +105,9 @@ function checkSchema(schema, value, where, errors) {
     if (schema.minLength !== undefined && [...value].length < schema.minLength) {
       errors.push(`${label(where)}: must have at least ${schema.minLength} character(s)`);
     }
+    if (schema.maxLength !== undefined && [...value].length > schema.maxLength) {
+      errors.push(`${label(where)}: must have at most ${schema.maxLength} characters, got ${[...value].length}`);
+    }
     if (schema.pattern !== undefined && !new RegExp(schema.pattern, "u").test(value)) {
       errors.push(`${label(where)}: ${describe(value)} does not match ${schema.pattern}`);
     }
@@ -145,9 +169,63 @@ function checkUniqueIds(findings, where, errors, taken = new Set()) {
   });
 }
 
+// A question or open seat answers in `answer`; its stance belongs to Round 2.
+function checkNullStance(answer, context, errors) {
+  if (answersInOwnWords(context?.kind) && answer.stance !== null) {
+    errors.push(`stance: must be null in the first round of a ${context.kind} council, got ${describe(answer.stance)}`);
+  }
+}
+
 function checkRound1(answer, context, errors) {
   checkUniqueIds(answer.findings, "findings", errors);
   checkDecisionStance(answer, context, errors);
+  checkNullStance(answer, context, errors);
+}
+
+function labelsText(labels) {
+  return labels.length > 0 ? labels.join(", ") : "(none)";
+}
+
+// The answer labels of a question or open seat's Round 2: `sameAs` pairs of two different known
+// labels and a `stance` naming one (question), or `agreesWith` known labels, each once, and a null
+// stance (open). Every message names the labels the seat was given.
+function checkAnswerLabels(answer, context, errors) {
+  const labels = context?.answerLabels ?? [];
+  const known = new Set(labels);
+  const named = labelsText(labels);
+  if (context.kind === "question") {
+    answer.sameAs.forEach((pair, index) => {
+      const where = `sameAs[${index}]`;
+      if (pair.length !== 2) {
+        errors.push(`${where}: must hold exactly two answer labels, got ${pair.length}`);
+        return;
+      }
+      for (const item of pair) {
+        if (!known.has(item)) {
+          errors.push(`${where}: ${describe(item)} is not an answer label; the labels are ${named}`);
+        }
+      }
+      if (pair[0] === pair[1]) {
+        errors.push(`${where}: must name two different answers, got ${describe(pair[0])} twice`);
+      }
+    });
+    if (!known.has(answer.stance)) {
+      errors.push(`stance: ${describe(answer.stance)} is not an answer label; the labels are ${named}`);
+    }
+    return;
+  }
+  const seen = new Set();
+  answer.agreesWith.forEach((item, index) => {
+    if (!known.has(item)) {
+      errors.push(`agreesWith[${index}]: ${describe(item)} is not an answer label; the labels are ${named}`);
+    } else if (seen.has(item)) {
+      errors.push(`agreesWith[${index}]: ${item} is listed twice`);
+    }
+    seen.add(item);
+  });
+  if (answer.stance !== null) {
+    errors.push(`stance: must be null in an open council, got ${describe(answer.stance)}`);
+  }
 }
 
 const DISPUTES = ["claim", "severity", "fix"];
@@ -194,6 +272,9 @@ function checkRound2(answer, context, errors) {
   }
   checkUniqueIds(answer.added, "added", errors, ownIds);
   checkDecisionStance(answer, context, errors);
+  if (answersInOwnWords(context?.kind)) {
+    checkAnswerLabels(answer, context, errors);
+  }
 }
 
 /**
@@ -341,7 +422,9 @@ function readJsonObject(readObject, runDir, sha256) {
 /**
  * The context validateAnswer needs for `seat`'s answer in `round`, from the committed rows of the
  * snapshot `view` (readCouncil) and their verified objects only: `{ schema, kind, options,
- * bundleRefs, ownFindingIds }`. Round 2 reads the seat's accepted Round 1 answer, the committed
+ * bundleRefs, ownFindingIds, answerLabels }`. `answerLabels` (Round 2 of a question or open run)
+ * are the letters of the actor's letter map, then its own answer's label (selfLabel) unless the
+ * actor is a fresh Round 2 stand-in, which has no answer of its own. Round 2 reads the seat's accepted Round 1 answer, the committed
  * map and the other lettered seats' Round 1 answers, each through the digest-checked reader.
  * `actor` names the answering actor when it is not the seat's original: a carried Round 1
  * stand-in (`<seat>~r1`) owns its Round 1 findings and its primary map entry; a fresh Round 2
@@ -352,7 +435,7 @@ export function validationContext(runDir, view, seat, round, { readObject = read
   const kind = view.run.kind;
   const options = JSON.parse(view.run.options_json ?? "[]");
   if (round === 1) {
-    return { schema: ROUND_SCHEMAS[1], kind, options, bundleRefs: [], ownFindingIds: [] };
+    return { schema: roundSchemaName(1, kind), kind, options, bundleRefs: [], ownFindingIds: [], answerLabels: [] };
   }
   const round1 = new Map(view.seatRounds.filter((row) => row.round === 1).map((row) => [row.seat, row]));
   const answerOf = (name) => {
@@ -377,16 +460,15 @@ export function validationContext(runDir, view, seat, round, { readObject = read
       bundleRefs.push(`${letter}-${finding.id}`);
     }
   }
-  return { schema: ROUND_SCHEMAS[2], kind, options, bundleRefs, ownFindingIds };
+  const answerLabels = answersInOwnWords(kind) ? [...letters, ...(own ? [selfLabel(letterMap)] : [])] : [];
+  return { schema: roundSchemaName(2, kind), kind, options, bundleRefs, ownFindingIds, answerLabels };
 }
 
-// round: 1 or 2. context: { kind, options, bundleRefs, ownFindingIds }; bundleRefs and
-// ownFindingIds are used in round 2. The round rules run only on a schema-valid answer.
+// round: 1 or 2. context: { kind, options, bundleRefs, ownFindingIds, answerLabels }; bundleRefs,
+// ownFindingIds and answerLabels are used in round 2. The kind picks the round's schema. The
+// round rules run only on a schema-valid answer.
 export function validateAnswer(round, answer, context = {}) {
-  const schemaName = ROUND_SCHEMAS[round];
-  if (!schemaName) {
-    throw new TypeError(`Unknown council round "${round}".`);
-  }
+  const schemaName = roundSchemaName(round, context?.kind);
   const schemaCheck = validateSchemaFile(schemaName, answer);
   if (!schemaCheck.ok) {
     return schemaCheck;
