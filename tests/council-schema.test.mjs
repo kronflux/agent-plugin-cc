@@ -38,6 +38,7 @@ import {
 const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
 
 const COUNCIL_TABLES = [
+  "council_agreements",
   "council_attempts",
   "council_ext_decisions",
   "council_ext_events",
@@ -45,6 +46,7 @@ const COUNCIL_TABLES = [
   "council_ext_turns",
   "council_observations",
   "council_rounds",
+  "council_run_modes",
   "council_runs",
   "council_seat_rounds",
   "council_seats",
@@ -144,6 +146,17 @@ const EXTENSION_TRIGGERS = [
 ];
 const EXTENSION_TABLES = ["council_ext_decisions", "council_ext_events", "council_ext_turns", "council_ext_requests"];
 
+// The tables and triggers the modes migration (version 6) adds.
+const MODE_TABLES = ["council_agreements", "council_run_modes"];
+const MODE_TRIGGERS = [
+  "council_agreement_delete",
+  "council_agreement_insert",
+  "council_agreement_update",
+  "council_run_mode_delete",
+  "council_run_mode_insert",
+  "council_run_mode_update"
+];
+
 // A Round 1 seed in insertion order (run, round, seats, then each seat round before its attempt),
 // three seats: a Claude prompt seat (s1, running), a Codex seat (s2, issuing) and an Antigravity
 // seat (s3, issuing). T=1000.
@@ -225,17 +238,17 @@ async function libChildWithin(op, args, env, timeoutMs = 60000) {
 }
 
 test("migration 2 creates the council tables once", { timeout: 120000 }, async (t) => {
-  assert.equal(store.SCHEMA_VERSION, 5);
-  assert.equal(store.MIGRATIONS.at(-1).version, 5);
+  assert.equal(store.SCHEMA_VERSION, 6);
+  assert.equal(store.MIGRATIONS.at(-1).version, 6);
   const stateDir = makeStoreDir(t);
   const countFile = path.join(stateDir, "migrations.txt");
   const env = { AGENT_PLUGIN_TEST_MIGRATION_COUNT_FILE: countFile, FIXTURE_START_AT: String(Date.now() + 1500) };
   const results = await Promise.all([0, 1].map(() => libChildWithin("fixture.coldOpen", [stateDir], env)));
   for (const result of results) {
     assert.equal(result.ok, true, JSON.stringify(result.error));
-    assert.equal(result.value.userVersion, 5);
+    assert.equal(result.value.userVersion, 6);
   }
-  assert.equal(rawAll(stateDir, "PRAGMA user_version")[0].user_version, 5);
+  assert.equal(rawAll(stateDir, "PRAGMA user_version")[0].user_version, 6);
   assert.deepEqual(
     rawAll(stateDir, "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'council\\_%' ESCAPE '\\' ORDER BY name").map((r) => r.name),
     COUNCIL_TABLES
@@ -245,7 +258,7 @@ test("migration 2 creates the council tables once", { timeout: 120000 }, async (
     rawAll(stateDir, "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'council\\_%' ESCAPE '\\' ORDER BY name").map((r) => r.name),
     ["council_ext_turn_challenge_seat", "council_ext_turn_ordinal", "council_ext_turn_round_seat", "council_pending_stops", "council_seat_label"]
   );
-  assert.equal(countObjects(stateDir, "trigger"), 24 + EXTENSION_TRIGGERS.length);
+  assert.equal(countObjects(stateDir, "trigger"), 24 + EXTENSION_TRIGGERS.length + MODE_TRIGGERS.length);
   assert.equal(fs.readFileSync(countFile, "utf8").trim().split(/\r?\n/).length, 1);
   const later = await libChildWithin("fixture.coldOpen", [stateDir], { AGENT_PLUGIN_TEST_MIGRATION_COUNT_FILE: countFile });
   assert.equal(later.ok, true, JSON.stringify(later.error));
@@ -1121,9 +1134,22 @@ test("objects install without clobbering and exports re-check the row", (t) => {
   assert.throws(() => publishExport(runDir, "report.md", absent, () => absent), ObjectDamagedError);
 });
 
+// Turns a store written by this version back into a version-5 store: every table of migration 5
+// with its rows, without the mode tables and their triggers.
+function asVersion5Store(stateDir) {
+  for (const trigger of MODE_TRIGGERS) {
+    rawExec(stateDir, `DROP TRIGGER IF EXISTS ${trigger}`);
+  }
+  for (const table of MODE_TABLES) {
+    rawExec(stateDir, `DROP TABLE IF EXISTS ${table}`);
+  }
+  rawExec(stateDir, "PRAGMA user_version = 5");
+}
+
 // Turns a store written by this version back into a version-4 store: the council tables of
 // migration 4 with their rows, without the extension tables, indexes and triggers.
 function asVersion4Store(stateDir) {
+  asVersion5Store(stateDir);
   for (const trigger of EXTENSION_TRIGGERS) {
     rawExec(stateDir, `DROP TRIGGER IF EXISTS ${trigger}`);
   }
@@ -1135,7 +1161,7 @@ function asVersion4Store(stateDir) {
 
 function migration4Rows(stateDir) {
   const dump = dumpTables(stateDir);
-  return Object.fromEntries(Object.entries(dump).filter(([name]) => name.startsWith("council_") && !name.startsWith("council_ext_")));
+  return Object.fromEntries(Object.entries(dump).filter(([name]) => name.startsWith("council_") && !name.startsWith("council_ext_") && !MODE_TABLES.includes(name)));
 }
 
 test("migration 5 adds the extension tables to a version-4 store once and keeps its council runs", (t) => {
@@ -1154,7 +1180,7 @@ test("migration 5 adds the extension tables to a version-4 store once and keeps 
     delete process.env.AGENT_PLUGIN_TEST_MIGRATION_COUNT_FILE;
   }
   assert.equal(fs.readFileSync(countFile, "utf8").trim().split(/\r?\n/).length, 1);
-  assert.equal(rawAll(stateDir, "PRAGMA user_version")[0].user_version, 5);
+  assert.equal(rawAll(stateDir, "PRAGMA user_version")[0].user_version, 6);
   assert.deepEqual(migration4Rows(stateDir), before);
   assert.deepEqual(rawAll(stateDir, "PRAGMA foreign_key_check"), []);
   const names = (type) =>
@@ -1214,4 +1240,110 @@ test("migration 5 accepts one substitute per seat and round and refuses impossib
   refuses(db, [request, `UPDATE council_ext_requests SET result = '{"decision":"accept"}'`, `UPDATE council_ext_requests SET result = '{"decision":"decline"}'`], /immutable council extension request/, {
     label: "a request finalized twice"
   });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Migration 6: the question and open modes, added beside the existing council tables.
+
+test("migration 6 adds the mode tables to a populated version-5 store once and keeps every row", (t) => {
+  const { db, stateDir } = seededDb(t);
+  accepts(
+    db,
+    [
+      ...BIND_S2,
+      OBSERVE_S2,
+      ...FINISH_S2,
+      SUBSTITUTE(TURN, { seat: "s3" }),
+      ISSUE(TURN),
+      DEPOSIT(TURN),
+      FINISH(TURN, "valid"),
+      `INSERT INTO council_ext_requests (id, run_id, kind, at, payload) VALUES ('${id("a")}', 'run-1', 'collect', 40, '{"round":1}')`,
+      `INSERT INTO council_verdicts (run_id, target_kind, target, brief_sha256, verdict, recorded_at) VALUES ('run-1', 'claim', 'a1', '${hex("b")}', 'verified', 41)`
+    ],
+    { commit: true, label: "a run with a final seat, an extension turn, a request and a verdict" }
+  );
+  asVersion5Store(stateDir);
+  const rowsOf = () => Object.fromEntries(Object.entries(dumpTables(stateDir)).filter(([name]) => name !== "user_version" && !MODE_TABLES.includes(name)));
+  const before = rowsOf();
+  assert.equal(before.council_runs.length, 1);
+  assert.equal(before.council_ext_turns.length, 1);
+  assert.equal(before.council_verdicts.length, 1);
+  const countFile = path.join(stateDir, "migrations.txt");
+  process.env.AGENT_PLUGIN_TEST_MIGRATION_COUNT_FILE = countFile;
+  try {
+    store.openStore(stateDir).close();
+    store.openStore(stateDir).close();
+  } finally {
+    delete process.env.AGENT_PLUGIN_TEST_MIGRATION_COUNT_FILE;
+  }
+  assert.equal(fs.readFileSync(countFile, "utf8").trim().split(/\r?\n/).length, 1);
+  assert.equal(rawAll(stateDir, "PRAGMA user_version")[0].user_version, 6);
+  assert.deepEqual(rowsOf(), before);
+  assert.deepEqual(rawAll(stateDir, "PRAGMA foreign_key_check"), []);
+  const names = (type) =>
+    rawAll(
+      stateDir,
+      "SELECT name FROM sqlite_master WHERE type = ? AND (name LIKE 'council\\_run\\_mode%' ESCAPE '\\' OR name LIKE 'council\\_agreement%' ESCAPE '\\') ORDER BY name",
+      [type]
+    ).map((row) => row.name);
+  assert.deepEqual(names("table"), MODE_TABLES);
+  assert.deepEqual(names("trigger"), MODE_TRIGGERS);
+  // The old run reads through the library as before: a review run with no mode.
+  const opened = store.openStore(stateDir);
+  try {
+    const snapshot = readCouncil(opened, "run-1");
+    assert.equal(snapshot.run.kind, "review");
+    assert.equal(snapshot.seatRounds.find((row) => row.seat === "s2").state, "valid");
+  } finally {
+    opened.close();
+  }
+});
+
+// A run seeded with only its run row, of stored kind `kind`.
+const RUN_ROW = (runId, kind) =>
+  `INSERT INTO council_runs (id, kind, session_id, cwd, brief_sha256, options_json, timeout_ms, seat_count, turn_cap, created_at, clock)
+   VALUES ('${runId}', '${kind}', NULL, '/w', '${hex("b")}', '[]', 1000, 3, 12, 0, 0)`;
+const MODE = (runId, mode) => `INSERT INTO council_run_modes (run_id, mode) VALUES ('${runId}', '${mode}')`;
+const MERGED = (runId, digest = hex("9"), rev = 0) => `UPDATE council_runs SET merge_sha256 = '${digest}', merge_rev = ${rev} WHERE id = '${runId}'`;
+const AGREEMENT = (runId, { value = "agreed", reason = "every answer says the same", digest = hex("9"), rev = 0, at = 5 } = {}) =>
+  `INSERT INTO council_agreements (run_id, value, reason, merge_sha256, input_rev, recorded_at) VALUES ('${runId}', '${value}', '${reason}', '${digest}', ${rev}, ${at})`;
+
+test("migration 6 sets a run's mode once at creation and fences the agreement to the current merge of an open run", (t) => {
+  const { db } = freshDb(t);
+  // The stored kind keeps its two values: an unknown kind, also a mode name, is still refused.
+  refuses(db, [RUN_ROW("q", "question")], CHECK, { label: "a mode name as the stored kind" });
+  refuses(db, [RUN_ROW("q", "verdict")], CHECK, { label: "an unknown kind" });
+  accepts(db, [RUN_ROW("q", "decision"), MODE("q", "question"), "INSERT INTO council_rounds (run_id, round, started_at) VALUES ('q', 1, 0)"], { commit: true, label: "a question run" });
+  accepts(db, [RUN_ROW("o", "review"), MODE("o", "open")], { commit: true, label: "an open run" });
+  refuses(db, [RUN_ROW("x", "decision"), MODE("x", "open")], /council run mode is set once/, { label: "open over a decision" });
+  refuses(db, [RUN_ROW("x", "review"), MODE("x", "question")], /council run mode is set once/, { label: "question over a review" });
+  refuses(db, [RUN_ROW("x", "review"), MODE("x", "bogus")], CHECK, { label: "an unknown mode" });
+  refuses(db, [MODE("o", "open")], /council run mode is set once/, { label: "a second mode" });
+  refuses(db, [RUN_ROW("x", "decision"), "INSERT INTO council_rounds (run_id, round, started_at) VALUES ('x', 1, 0)", MODE("x", "question")], /council run mode is set once/, {
+    label: "a mode after the run started"
+  });
+  refuses(db, ["UPDATE council_run_modes SET mode = 'question' WHERE run_id = 'o'"], /council run mode is immutable/, { label: "a mode update" });
+  refuses(db, ["DELETE FROM council_run_modes WHERE run_id = 'o'"], /council run mode cannot be deleted/, { label: "a mode delete" });
+  // The agreement: an open run with its current merge only.
+  refuses(db, [AGREEMENT("o")], /council agreement needs an open run/, { label: "an agreement before the merge" });
+  refuses(db, [MERGED("q"), AGREEMENT("q")], /council agreement needs an open run/, { label: "an agreement on a question run" });
+  refuses(db, [RUN_ROW("r", "review"), MERGED("r"), AGREEMENT("r")], /council agreement needs an open run/, { label: "an agreement on a review run" });
+  refuses(db, [MERGED("o"), AGREEMENT("o", { digest: hex("8") })], /council agreement needs an open run/, { label: "an agreement on another merge" });
+  refuses(db, [MERGED("o"), AGREEMENT("o", { value: "maybe" })], CHECK, { label: "an unknown value" });
+  refuses(db, [MERGED("o"), AGREEMENT("o", { reason: "" })], CHECK, { label: "an empty reason" });
+  accepts(db, [MERGED("o"), AGREEMENT("o")], { commit: true, label: "an agreement on the current merge" });
+  refuses(db, [AGREEMENT("o", { value: "partly", at: 6 })], /council agreement needs an open run/, { label: "a second agreement row" });
+  // A later merge at a later input revision: the agreement is replaced by an update, never rewound.
+  accepts(
+    db,
+    [
+      "UPDATE council_runs SET input_rev = 1 WHERE id = 'o'",
+      MERGED("o", hex("7"), 1),
+      `UPDATE council_agreements SET value = 'partly', reason = 'one answer differs', merge_sha256 = '${hex("7")}', input_rev = 1, recorded_at = 6 WHERE run_id = 'o'`
+    ],
+    { commit: true, label: "a replaced agreement" }
+  );
+  refuses(db, [`UPDATE council_agreements SET merge_sha256 = '${hex("9")}', input_rev = 0 WHERE run_id = 'o'`], /council agreement run is fixed/, { label: "a rewound agreement" });
+  refuses(db, ["UPDATE council_agreements SET run_id = 'q' WHERE run_id = 'o'"], /council agreement run is fixed/, { label: "a moved agreement" });
+  refuses(db, ["DELETE FROM council_agreements WHERE run_id = 'o'"], /council agreement cannot be deleted/, { label: "an agreement delete" });
 });
