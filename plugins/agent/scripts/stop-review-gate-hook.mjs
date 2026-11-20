@@ -2,6 +2,7 @@
 
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import process from "node:process";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -43,10 +44,16 @@ function filterJobsForCurrentSession(jobs, input = {}) {
 }
 
 // The previous Claude response is quoted between markers carrying a random id, so text in
-// the response cannot close the quote early. Marker text inside the response is removed.
+// the response cannot close the quote early. Marker text inside the response is removed
+// repeatedly, so a marker built from the pieces of another one does not survive.
 function fenceUntrusted(text) {
   const id = randomBytes(6).toString("hex");
-  const cleaned = text.replace(new RegExp(`</?${UNTRUSTED_TAG}[^>]*>`, "gi"), "");
+  const marker = new RegExp(`</?${UNTRUSTED_TAG}[^>]*>`, "gi");
+  let cleaned = text;
+  for (let previous = null; previous !== cleaned; ) {
+    previous = cleaned;
+    cleaned = cleaned.replace(marker, "");
+  }
   return [`<${UNTRUSTED_TAG} id="${id}">`, cleaned, `</${UNTRUSTED_TAG} id="${id}">`].join("\n");
 }
 
@@ -120,12 +127,25 @@ function runStopReview(cwd, input = {}) {
     ...process.env,
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", "--output-schema", VERDICT_SCHEMA, prompt], {
-    cwd,
-    env: childEnv,
-    encoding: "utf8",
-    timeout: STOP_REVIEW_TIMEOUT_MS
-  });
+  // The prompt goes through a file because a long message does not fit in a command line.
+  const promptFile = path.join(os.tmpdir(), `agent-stop-review-${randomBytes(8).toString("hex")}.md`);
+  let result;
+  try {
+    fs.writeFileSync(promptFile, prompt, { encoding: "utf8", mode: 0o600 });
+    result = spawnSync(
+      process.execPath,
+      [scriptPath, "task", "--json", "--output-schema", VERDICT_SCHEMA, "--prompt-file", promptFile],
+      {
+        cwd,
+        env: childEnv,
+        encoding: "utf8",
+        timeout: STOP_REVIEW_TIMEOUT_MS,
+        windowsHide: true
+      }
+    );
+  } finally {
+    fs.rmSync(promptFile, { force: true });
+  }
 
   if (result.error?.code === "ETIMEDOUT") {
     return infrastructureFailure("The stop-time Codex review timed out after 15 minutes.");
