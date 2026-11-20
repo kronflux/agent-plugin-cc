@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import { parseCommandInput, resolveCommandCwd } from "../lib/companion-cli.mjs";
 import { readRequesterIdentity } from "../lib/host.mjs";
 import { reconcileStore } from "../lib/job-control.mjs";
+import { readMessageOutcome, sendToChain, withdrawMessage } from "../lib/mailbox.mjs";
+import { providerForJob } from "../lib/providers.mjs";
 import {
   createJob,
   decideNext,
@@ -33,6 +35,7 @@ import { installObject, ObjectDamagedError, publishExport, readObject } from "..
 import { buildBundles } from "../lib/council/anonymise.mjs";
 import { mergeCouncil, serializeMerge, sortedTally } from "../lib/council/merge.mjs";
 import {
+  CUTOFF_NOTICE,
   FAMILIES,
   familyProvider,
   planSeats,
@@ -511,6 +514,9 @@ function startUsageRead(job, family, run, deps) {
  * job through E11, classifies it, installs the answer and errors objects from its stored result,
  * and deposits the observation. A failed or interrupted job first needs its usage read, started
  * once per command and never awaited here; a finished read is used by this or a later pass.
+ * When the replacement prompt of an invalid or transient verdict cannot be prepared (a missing or
+ * damaged object, an unreadable file), the job is deposited as the permanent failure
+ * `replacement prompt unavailable` and `deps.diagnostics` gets `{ seat, jobId, problem, message }`.
  * Resolves to the number of observations deposited.
  */
 export async function observeJobs(store, runDir, snapshot, deps) {
@@ -563,7 +569,17 @@ export async function observeJobs(store, runDir, snapshot, deps) {
         }
       }
     }
-    verdict = withReplacement(runDir, snapshot, attempt, verdict, deps.layer);
+    try {
+      verdict = withReplacement(runDir, snapshot, attempt, verdict, deps.layer);
+    } catch (error) {
+      if (!(error instanceof ObjectDamagedError) && typeof error?.code !== "string") {
+        throw error;
+      }
+      // Without its replacement prompt the verdict cannot take a repair or retry: it is deposited
+      // as a permanent failure, which the deposit rules accept without a prepared digest.
+      deps.diagnostics?.push({ seat: attempt.seat, jobId: attempt.job_id, problem: "replacement-unavailable", message: error.message });
+      verdict = { outcome: "failure", eventAt: verdict.eventAt, reason: "replacement prompt unavailable", transient: false };
+    }
     const result = await depositObservation(store, { attemptId: attempt.id, jobId: attempt.job_id, verdict, layer: deps.layer, deadline: deps.deadline });
     if (result.ok) {
       deposited += 1;
@@ -579,10 +595,13 @@ function defaultSleep(ms) {
   });
 }
 
-/** The prompts a seat's agent should answer now: current, unretired, unanswered and open. */
+/**
+ * The prompts a seat's agent should answer now: current, unretired, unanswered and open (before
+ * its own deadline and before a sealed round's cutoff).
+ */
 export function openDeliveries(snapshot, runDir, t) {
   const observed = new Set(snapshot.observations.map((row) => row.attempt_id));
-  const closed = new Set(snapshot.rounds.filter((row) => row.closed_at !== null).map((row) => row.round));
+  const closed = new Set(snapshot.rounds.filter((row) => row.closed_at !== null || (row.cutoff_at !== null && t >= row.cutoff_at)).map((row) => row.round));
   const attempts = new Map(snapshot.attempts.map((row) => [row.id, row]));
   const deliveries = [];
   for (const seatRound of snapshot.seatRounds) {
@@ -606,6 +625,154 @@ export function openDeliveries(snapshot, runDir, t) {
     .map(({ round: _round, ...delivery }) => delivery);
 }
 
+// ---------------------------------------------------------------------------------------------
+// The cutoff notice: once a round is sealed, each seat still working is told once that the other
+// seats have answered. A run-folder marker, created exclusively, records that a seat's notice of a
+// round was handled, so no second command hands or sends it again.
+
+function noticeMarker(runDir, round, seat) {
+  return path.join(runDir, "notices", `${round}-${seat}.json`);
+}
+
+// Creates the marker of a seat's notice; false when another command already created it.
+function claimNotice(runDir, round, seat, record) {
+  const file = noticeMarker(runDir, round, seat);
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  let fd;
+  try {
+    fd = fs.openSync(file, "wx", 0o600);
+  } catch (error) {
+    if (error.code === "EEXIST") {
+      return false;
+    }
+    throw error;
+  }
+  try {
+    fs.writeSync(fd, `${JSON.stringify(record)}\n`);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return true;
+}
+
+// The seats of sealed, open rounds that are still working before the cutoff at `t`, each with its
+// current attempt.
+function noticeCandidates(snapshot, t) {
+  const sealed = new Set(snapshot.rounds.filter((row) => row.closed_at === null && row.cutoff_at !== null && t < row.cutoff_at).map((row) => row.round));
+  const attempts = new Map(snapshot.attempts.map((row) => [row.id, row]));
+  return snapshot.seatRounds
+    .filter((row) => sealed.has(row.round) && (row.state === "running" || row.state === "issuing") && row.current_id)
+    .map((row) => ({ round: row.round, seat: row.seat, attempt: attempts.get(row.current_id) }))
+    .filter((entry) => entry.attempt && entry.attempt.retired_at === null);
+}
+
+/**
+ * The cutoff notices the leader delivers to Claude seats: for each Claude seat of a sealed, open
+ * round whose prompt is open at `t`, the first call claims the seat's marker and returns
+ * `{ kind: "notice", seat, text }`; later calls, from any command, return nothing for it.
+ */
+export function claudeNotices(snapshot, runDir, t) {
+  const open = new Set(openDeliveries(snapshot, runDir, t).map((delivery) => delivery.intentId));
+  const notices = [];
+  for (const entry of noticeCandidates(snapshot, t)) {
+    if (entry.attempt.kind !== "prompt" || !open.has(entry.attempt.id)) {
+      continue;
+    }
+    if (claimNotice(runDir, entry.round, entry.seat, { kind: "leader", attemptId: entry.attempt.id })) {
+      notices.push({ kind: "notice", seat: entry.seat, text: CUTOFF_NOTICE });
+    }
+  }
+  return notices;
+}
+
+/**
+ * Sends the cutoff notice into the running turn of each provider seat of a sealed, open round,
+ * once per seat and round. The first look at a seat after the seal decides: only a running job
+ * at its chain's tip, on a provider whose driver takes a message into a running turn
+ * (`capabilities.steer`), gets the message through the plugin's message path; any other seat gets
+ * none, now or later. A failed send is a diagnostic `{ seat, jobId, notice, message }` and changes
+ * nothing in the round. Resolves to the diagnostics.
+ */
+export async function sendProviderNotices(store, runDir, snapshot, t, deps) {
+  const diagnostics = [];
+  for (const entry of noticeCandidates(snapshot, t)) {
+    if (entry.attempt.kind === "prompt" || fs.existsSync(noticeMarker(runDir, entry.round, entry.seat))) {
+      continue;
+    }
+    const jobId = entry.attempt.job_id;
+    const view = jobId ? readJobView(store, jobId) : null;
+    const takesMessage =
+      view !== null && view.isTip && view.state === "running" && view.row.cancel_requested_at === null && Boolean(providerForJob(view.row).capabilities?.steer);
+    if (!claimNotice(runDir, entry.round, entry.seat, { kind: takesMessage ? "message" : "none", jobId })) {
+      continue;
+    }
+    if (!takesMessage) {
+      continue;
+    }
+    const failed = (message) => diagnostics.push({ seat: entry.seat, jobId, notice: "not-sent", message });
+    try {
+      const requester = await requesterOf(deps);
+      const outcome = await retried(
+        (opts) => (deps.sendMessage ?? sendToChain)(store, { ref: jobId, observedTipId: jobId }, { text: CUTOFF_NOTICE, requester }, opts),
+        deps.deadline
+      );
+      fs.writeFileSync(noticeMarker(runDir, entry.round, entry.seat), `${JSON.stringify({ kind: "message", jobId, messageId: outcome.messageId })}\n`);
+      if (outcome.outcome === "continued") {
+        // The job ended between the look and the send, and the message started a new job: the
+        // council started that job, so it stops it by its exact id.
+        failed(`The job had ended; the notice started job ${outcome.jobId}, which is stopped.`);
+        await retried(
+          (opts) => (deps.requestStop ?? requestStop)(store, { jobIds: [outcome.jobId] }, { reason: "cancel", sessionId: requester.sessionId ?? null, cancel: true }, opts),
+          deps.deadline
+        );
+      } else if (outcome.outcome !== "running") {
+        failed("The job was no longer running; the notice stays pending and is withdrawn later.");
+      }
+    } catch (error) {
+      if (error instanceof TypeError || error instanceof ReferenceError) {
+        throw error;
+      }
+      failed(error?.message ?? String(error));
+    }
+  }
+  return diagnostics;
+}
+
+/**
+ * Withdraws each cutoff notice message of the run that no worker took while its job's turn was
+ * running, so a job that ended first is not continued by it. Best effort: a store error leaves the
+ * message for a later command.
+ */
+export async function withdrawStaleNotices(store, runDir, deadline) {
+  let names;
+  try {
+    names = fs.readdirSync(path.join(runDir, "notices"));
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    let record;
+    try {
+      record = JSON.parse(fs.readFileSync(path.join(runDir, "notices", name), "utf8"));
+    } catch {
+      continue;
+    }
+    if (!Number.isInteger(record?.messageId)) {
+      continue;
+    }
+    try {
+      const outcome = readMessageOutcome(store, record.messageId);
+      if (outcome?.state === "pending" && outcome.tipState !== "running" && outcome.tipState !== "queued") {
+        await retried((opts) => withdrawMessage(store, record.messageId, opts), deadline);
+      }
+    } catch (error) {
+      if (!(error instanceof StoreError)) {
+        throw error;
+      }
+    }
+  }
+}
+
 function issuable(snapshot, round) {
   const attempts = new Map(snapshot.attempts.map((row) => [row.id, row]));
   return snapshot.seatRounds
@@ -620,8 +787,10 @@ function issuable(snapshot, round) {
  * attempts, observes ended jobs, and reduces again; E43 runs every 10 seconds. A pass with nothing
  * to write makes no write transaction. Between passes it waits on the first of the usage reads in
  * flight, POLL_MS and the wake delay (the reducer's `nextDue` or the stop retry delay), through
- * the injected `sleep(ms)`. With `once` it returns after the first pass. Resolves to `{ wake,
- * nextDue, deliveries, diagnostics, errors, notes }`, `wake` being `closed`, `prompt`, `budget`,
+ * the injected `sleep(ms)`. With `once` it returns after the first pass. Once the round is sealed,
+ * each pass sends the cutoff notice to provider seats (`sendProviderNotices`) and hands it for
+ * Claude seats (`claudeNotices`) after the prompt deliveries. Resolves to `{ wake, nextDue,
+ * deliveries, diagnostics, errors, notes }`, `wake` being `closed`, `prompt`, `notice`, `budget`,
  * or null after a single pass or for a refusal (`errors[0].error` is `unknown-run` or
  * `round-not-started`); `notes` are launch lines for standard error.
  */
@@ -643,15 +812,19 @@ export async function advance(runDir, options) {
     buildJob: options.buildJob,
     launch: options.launch,
     requestStop: options.requestStop,
+    sendMessage: options.sendMessage,
     stamps: options.stamps ?? new Map(),
     usage: new Map(),
-    diagnosticLines: []
+    diagnosticLines: [],
+    diagnostics: []
   };
-  const diagnostics = [];
+  const diagnostics = deps.diagnostics;
   const errors = [];
   let lastReconcile = null;
   let initialDeliveries = null;
-  const result = (wake, nextDue, deliveries) => ({ wake, nextDue, deliveries, diagnostics, errors, notes: deps.diagnosticLines });
+  // Cutoff notices handed to the leader in this call; they follow the prompt deliveries.
+  const notices = [];
+  const result = (wake, nextDue, deliveries) => ({ wake, nextDue, deliveries: [...deliveries, ...notices], diagnostics, errors, notes: deps.diagnosticLines });
   try {
     for (;;) {
       let snapshot = readCouncil(store, runId);
@@ -665,6 +838,8 @@ export async function advance(runDir, options) {
       }
       const t0 = Math.max(snapshot.run.clock, wallNow());
       initialDeliveries ??= new Set(openDeliveries(snapshot, runDir, t0).map((delivery) => delivery.intentId));
+      // A notice no running turn took is withdrawn before E43 could continue its ended job.
+      await withdrawStaleNotices(store, runDir, deadline);
       if (lastReconcile === null || now() - lastReconcile >= RECONCILE_EVERY_MS) {
         lastReconcile = now();
         try {
@@ -674,6 +849,11 @@ export async function advance(runDir, options) {
             throw error;
           }
         }
+      }
+      // Before a due cutoff is adjudicated, deposit what already ended (no usage read is awaited).
+      const cutoffAt = snapshot.rounds.find((row) => row.round === round).cutoff_at;
+      if (cutoffAt !== null && t0 >= cutoffAt) {
+        await observeJobs(store, runDir, snapshot, deps);
       }
       await reduceIfNeeded(store, { runId, round, layer, deadline });
       const stopped = await dispatchStops(store, snapshot.run, deps);
@@ -697,8 +877,13 @@ export async function advance(runDir, options) {
         return result("closed", null, deliveries);
       }
       const nextDue = peek?.nextDue ?? null;
+      diagnostics.push(...(await sendProviderNotices(store, runDir, snapshot, t, deps)));
+      notices.push(...claudeNotices(snapshot, runDir, t));
       if (deliveries.some((delivery) => !initialDeliveries.has(delivery.intentId))) {
         return result("prompt", nextDue, deliveries);
+      }
+      if (notices.length > 0) {
+        return result("notice", nextDue, deliveries);
       }
       if (options.once) {
         return result(null, nextDue, deliveries);
@@ -915,6 +1100,14 @@ function commandStore(stateDir, deadline) {
 
 function writeDiagnostics(io, diagnostics, notes = []) {
   for (const entry of diagnostics) {
+    if (entry.notice) {
+      io.stderr(`Seat ${entry.seat}: the cutoff notice was not delivered to job ${entry.jobId} (${entry.message}).\n`);
+      continue;
+    }
+    if (entry.problem === "replacement-unavailable") {
+      io.stderr(`Seat ${entry.seat}: job ${entry.jobId} ended without a repair or retry, because its replacement prompt could not be prepared (${entry.message}).\n`);
+      continue;
+    }
     io.stderr(`Seat ${entry.seat}: label ${entry.label} was not carried to job ${entry.jobId}.\n`);
   }
   for (const line of notes) {
@@ -947,9 +1140,10 @@ function isoOrNull(value) {
 /**
  * The status object of one round: `{ runId, round, closedAt, quorum, validSeats, validFamilies,
  * cleanupPending, memberTurns, repairs, retries, seats }`, each seat `{ seat, family, state,
- * reason, jobId, answerSha256, forcedReasons }`; `closedAt` and `quorum` are null while open.
+ * reason, jobId, answerSha256, forcedReasons }`; `closedAt` and `quorum` are null while open. At
+ * `layer` 2 or more it also has `quorumAt` and `cutoffAt`, null until the round is sealed.
  */
-export function roundObject(snapshot, round) {
+export function roundObject(snapshot, round, { layer = 0 } = {}) {
   const roundRow = snapshot.rounds.find((row) => row.round === round);
   const seats = new Map(snapshot.seats.map((row) => [row.seat, row]));
   const attempts = new Map(snapshot.attempts.map((row) => [row.id, row]));
@@ -962,6 +1156,7 @@ export function roundObject(snapshot, round) {
     round,
     closedAt: isoOrNull(roundRow.closed_at),
     quorum: roundRow.closed_at === null ? null : roundRow.quorum === 1,
+    ...(layer >= 2 ? { quorumAt: isoOrNull(roundRow.quorum_at), cutoffAt: isoOrNull(roundRow.cutoff_at) } : {}),
     validSeats: valid.length,
     validFamilies: familyCount(valid.map((row) => seats.get(row.seat).family)),
     cleanupPending: snapshot.stops.some((stop) => stop.acknowledged_at === null && roundJobs.has(stop.job_id)),
@@ -1130,12 +1325,13 @@ async function cleanupStops(store, runId, { deadline, cleanupDeadline, ctx }) {
   }
 }
 
-async function closedResult(store, runId, round, { deadline, ctx, json, diagnostics = [] }) {
+async function closedResult(store, runId, round, { runDir, deadline, ctx, json, diagnostics = [] }) {
   const now = ctx.advance?.now ?? (() => performance.now());
   const cleanupDeadline = Math.min(deadline, now() + CLEANUP_BUDGET_MS);
+  await withdrawStaleNotices(store, runDir, deadline);
   const pendingLeft = await cleanupStops(store, runId, { deadline, cleanupDeadline, ctx });
   const snapshot = readCouncil(store, runId);
-  const object = { ...roundObject(snapshot, round), wake: "closed" };
+  const object = { ...roundObject(snapshot, round, { layer: ctx.layer }), wake: "closed" };
   object.cleanupPending = pendingLeft || object.cleanupPending;
   if (diagnostics.length > 0) {
     object.diagnostics = diagnostics;
@@ -1166,17 +1362,22 @@ async function collectCouncil(options, positionals, ctx) {
       throw new CouncilRefusal("round-not-started", `Round ${round} has not started.`);
     }
     if (roundRow.closed_at !== null) {
-      return await closedResult(store, runId, round, { deadline, ctx, json: options.json });
+      return await closedResult(store, runId, round, { runDir: runDirOf(stateDir, runId), deadline, ctx, json: options.json });
     }
     const outcome = await advance(runDirOf(stateDir, runId), { runId, round, layer: ctx.layer, deadline, stateDir, openStore: () => store, ...ctx.advance });
     writeDiagnostics(ctx.io, outcome.diagnostics, outcome.notes);
     if (outcome.wake === "closed") {
-      return await closedResult(store, runId, round, { deadline, ctx, json: options.json, diagnostics: outcome.diagnostics });
+      return await closedResult(store, runId, round, { runDir: runDirOf(stateDir, runId), deadline, ctx, json: options.json, diagnostics: outcome.diagnostics });
     }
-    const wake = outcome.wake === "prompt" ? "prompt" : "budget";
+    const wake = outcome.wake === "prompt" || outcome.wake === "notice" ? outcome.wake : "budget";
     const payload = { runId, round, wake, deliveries: outcome.deliveries, ...(outcome.diagnostics.length > 0 ? { diagnostics: outcome.diagnostics } : {}) };
-    const fresh = outcome.deliveries[outcome.deliveries.length - 1];
-    const text = wake === "prompt" ? `Wake: a prompt for ${fresh.seat} is ready. Run council status.` : "Wake: budget. Run council collect again.";
+    const prompts = outcome.deliveries.filter((delivery) => delivery.kind !== "notice");
+    const fresh = prompts[prompts.length - 1];
+    const lines = [wake === "prompt" ? `Wake: a prompt for ${fresh.seat} is ready. Run council status.` : wake === "notice" ? "Wake: notice." : "Wake: budget. Run council collect again."];
+    for (const notice of outcome.deliveries.filter((delivery) => delivery.kind === "notice")) {
+      lines.push(`Notice for ${notice.seat}: ${notice.text}`);
+    }
+    const text = lines.join("\n");
     emit(ctx.io, options.json, payload, text);
     return 0;
   } finally {
@@ -1260,7 +1461,15 @@ async function submitCouncil(options, positionals, ctx) {
     const after = readCouncil(store, runId);
     const state = after.seatRounds.find((row) => row.round === round && row.seat === seat)?.state ?? null;
     const payload = { runId, round, seat, intentId, state, deliveries: passed.deliveries };
-    emit(ctx.io, options.json, payload, `Recorded the reply of ${seat} for round ${round}: ${state}.`);
+    const lines = [`Recorded the reply of ${seat} for round ${round}: ${state}.`];
+    for (const delivery of passed.deliveries) {
+      if (delivery.kind === "notice") {
+        lines.push(`Notice for ${delivery.seat}: ${delivery.text}`);
+      } else if (delivery.seat === seat && delivery.intentId !== intentId) {
+        lines.push(`New prompt for ${seat}: ${delivery.promptFile} (intent ${delivery.intentId}, reply by ${delivery.deadline}).`);
+      }
+    }
+    emit(ctx.io, options.json, payload, lines.join("\n"));
     return 0;
   } finally {
     store.close();
@@ -1700,7 +1909,8 @@ const ACTION_TEXT = {
   done: () => "Done."
 };
 
-// `council status <run-id>`: one read snapshot, the object checks, and the next action; no write.
+// `council status <run-id>`: one read snapshot, the object checks, and the next action; no store
+// write (a cutoff notice handed to the leader creates its run-folder marker).
 async function statusCouncil(options, positionals, ctx) {
   const deadline = performance.now() + BUDGET_MS.submit;
   const runId = oneRunId(positionals, "status <run-id> [--json]");
@@ -1711,12 +1921,14 @@ async function statusCouncil(options, positionals, ctx) {
     const snapshot = requireRun(store, runId);
     const t = Math.max(snapshot.run.clock, wallNow());
     const next = nextAction(snapshot, { t, objects: checkObjects(runDir, snapshot), runId, runDir });
+    // A cutoff notice for a Claude seat is handed once, by whichever command sees it first.
+    const notices = next.action === "damaged" ? [] : claudeNotices(snapshot, runDir, t);
     const payload = {
       runId,
       action: next.action,
       round: next.round,
-      rounds: snapshot.rounds.map((row) => roundObject(snapshot, row.round)),
-      deliveries: next.deliveries,
+      rounds: snapshot.rounds.map((row) => roundObject(snapshot, row.round, { layer: ctx.layer })),
+      deliveries: [...next.deliveries, ...notices],
       clusters: next.clusters,
       cleanupPending: snapshot.stops.some((stop) => stop.acknowledged_at === null),
       ...(next.damaged ? { damaged: next.damaged } : {})
@@ -1724,6 +1936,9 @@ async function statusCouncil(options, positionals, ctx) {
     const lines = [`Council ${runId}: ${next.action}${next.round ? ` (round ${next.round})` : ""}.`];
     for (const delivery of next.deliveries) {
       lines.push(`Prompt for ${delivery.seat}: ${delivery.promptFile} (intent ${delivery.intentId}, reply by ${delivery.deadline}).`);
+    }
+    for (const notice of notices) {
+      lines.push(`Notice for ${notice.seat}: ${notice.text}`);
     }
     lines.push(ACTION_TEXT[next.action](next, runId));
     emit(ctx.io, options.json, payload, lines.join("\n"));

@@ -13,6 +13,13 @@ const MAX_SEATS = 5;
 
 export const FAMILIES = ["claude", "codex", "agy"];
 
+/**
+ * The notice a seat that is still working gets once when its round reaches quorum. It is not a
+ * prompt: it needs no reply of its own and does not extend any deadline.
+ */
+export const CUTOFF_NOTICE =
+  "The other seats of the panel have answered. You have five minutes from now to give your answer in the required JSON form; after that the round closes without it.";
+
 const FAMILY_PROVIDERS = { claude: null, codex: "codex", agy: "agy" };
 
 export const DEFAULT_LENSES = {

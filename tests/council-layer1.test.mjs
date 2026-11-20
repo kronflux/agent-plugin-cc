@@ -165,8 +165,8 @@ async function oneSeatOpen(t, clock, options) {
   return fx;
 }
 
-test("the shipped layer is 1", () => {
-  assert.equal(COUNCIL_LAYER, 1);
+test("the shipped layer includes layer 1", () => {
+  assert.ok(COUNCIL_LAYER >= 1);
 });
 
 test("an invalid provider answer gets one repair with the prepared prompt, and the repaired answer is accepted", async (t) => {
@@ -544,4 +544,36 @@ test("the council's own stop records first-cancellation evidence, and only that 
       assert.deepEqual([row.state, retry.charge, retry.kind], ["issuing", "retry", "create"]);
     }
   }
+});
+
+test("an ended job whose replacement prompt cannot be prepared ends as an error without a replacement, and the round closes", async (t) => {
+  const clock = useTestClock(t, 0);
+  const fx = await oneSeatOpen(t, clock);
+  const turn = currentOf(fx, "s2");
+  fs.rmSync(path.join(fx.dir, "objects", `${turn.prompt_sha256}.md`));
+  completeJob(fx, turn.job_id, 10, INVALID);
+  const closed = await collect(fx);
+  assert.deepEqual([closed.code, closed.json.wake, closed.json.quorum, closed.json.repairs], [0, "closed", true, 0], closed.stdout);
+  assert.deepEqual([seatRow(fx, "s2").state, seatRow(fx, "s2").reason], ["error", "replacement prompt unavailable"]);
+  assert.deepEqual(attemptsOf(fx, "s2").map((row) => row.charge), ["turn"]);
+  assert.deepEqual(observationOf(fx, turn.id).outcome, "failure");
+  assert.equal(closed.json.diagnostics.length, 1);
+  assert.deepEqual([closed.json.diagnostics[0].seat, closed.json.diagnostics[0].jobId, closed.json.diagnostics[0].problem], ["s2", turn.job_id, "replacement-unavailable"]);
+  assert.match(closed.stderr, /Seat s2: /);
+});
+
+test("a plain-text submit of an invalid Claude reply names the repair prompt", async (t) => {
+  const clock = useTestClock(t, 0);
+  const fx = await started(t, clock);
+  const turn = currentOf(fx, "s1");
+  clock.set(10);
+  const file = path.join(fx.cwd, "reply.json");
+  fs.writeFileSync(file, INVALID);
+  const result = await council(["submit", fx.runId, "s1", "--intent", turn.id, "--file", file], { cwd: fx.cwd });
+  assert.equal(result.code, 0, result.stderr);
+  const repair = currentOf(fx, "s1");
+  assert.equal(repair.charge, "repair");
+  const line = result.stdout.split("\n").find((entry) => entry.includes(repair.id)) ?? "";
+  assert.ok(line.includes(path.join(fx.dir, "objects", `${repair.prompt_sha256}.md`)), result.stdout);
+  assert.ok(line.includes(new Date(repair.issue_by).toISOString()), result.stdout);
 });

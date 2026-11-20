@@ -319,9 +319,9 @@ test("migration 2 accepts the seed order and refuses the malformed rows", (t) =>
   });
 
   const r1 = "WHERE run_id = 'run-1' AND round = 1";
-  refuses(db, [`UPDATE council_rounds SET quorum_at = 100, cutoff_at = 180000 ${r1}`], CHECK, { label: "cutoff not quorum_at+180000" });
+  refuses(db, [`UPDATE council_rounds SET quorum_at = 100, cutoff_at = 180100 ${r1}`], CHECK, { label: "cutoff not quorum_at+300000" });
   refuses(db, [`UPDATE council_rounds SET quorum_at = 100 ${r1}`], CHECK, { label: "a single seal column" });
-  refuses(db, [`UPDATE council_rounds SET quorum_at = 100, cutoff_at = 180100, closed_at = 50, quorum = 1 ${r1}`], CHECK, { label: "closed_at before quorum_at" });
+  refuses(db, [`UPDATE council_rounds SET quorum_at = 100, cutoff_at = 300100, closed_at = 50, quorum = 1 ${r1}`], CHECK, { label: "closed_at before quorum_at" });
   refuses(db, [`UPDATE council_rounds SET closed_at = 50 ${r1}`], CHECK, { label: "closed_at without quorum" });
 });
 
@@ -400,7 +400,7 @@ test("migration 2 refuses updates and deletes of protected rows", (t) => {
   const roundFixed = /council round start, map, seal or close is fixed/;
   refuses(db, [`UPDATE council_rounds SET closed_at = 50, quorum = 1 ${r1}`, `UPDATE council_rounds SET closed_at = 60 ${r1}`], roundFixed, { label: "closed round" });
   refuses(db, [`UPDATE council_rounds SET started_at = 1 ${r1}`], roundFixed, { label: "round start" });
-  refuses(db, [`UPDATE council_rounds SET quorum_at = 100, cutoff_at = 180100 ${r1}`, `UPDATE council_rounds SET quorum_at = 101, cutoff_at = 180101 ${r1}`], roundFixed, {
+  refuses(db, [`UPDATE council_rounds SET quorum_at = 100, cutoff_at = 300100 ${r1}`, `UPDATE council_rounds SET quorum_at = 101, cutoff_at = 300101 ${r1}`], roundFixed, {
     label: "sealed round's seal fields"
   });
   refuses(db, [`DELETE FROM council_rounds ${r1}`], /council round cannot be deleted/, { label: "round delete" });
@@ -542,17 +542,17 @@ test("migration 2 accepts the Layer 1 and Layer 2 shapes", (t) => {
   );
 
   const r1 = "WHERE run_id = 'run-1' AND round = 1";
-  accepts(layer1, [`UPDATE council_rounds SET quorum_at = 100, cutoff_at = 180100 ${r1}`], { label: "seal at 100 and 180100" });
-  accepts(layer1, [`UPDATE council_rounds SET quorum_at = 100, cutoff_at = 180100, closed_at = 100, quorum = 1 ${r1}`], { label: "seal and close in one update" });
-  accepts(layer1, [`UPDATE council_rounds SET quorum_at = 100, cutoff_at = 180100 ${r1}`, `UPDATE council_rounds SET closed_at = 180100, quorum = 1 ${r1}`], {
+  accepts(layer1, [`UPDATE council_rounds SET quorum_at = 100, cutoff_at = 300100 ${r1}`], { label: "seal at 100 and 300100" });
+  accepts(layer1, [`UPDATE council_rounds SET quorum_at = 100, cutoff_at = 300100, closed_at = 100, quorum = 1 ${r1}`], { label: "seal and close in one update" });
+  accepts(layer1, [`UPDATE council_rounds SET quorum_at = 100, cutoff_at = 300100 ${r1}`, `UPDATE council_rounds SET closed_at = 300100, quorum = 1 ${r1}`], {
     label: "a later close"
   });
-  accepts(layer1, ["INSERT INTO council_stops (job_id, requested_at, cause) VALUES ('job-2', 180100, 'quorum-cutoff')"], { label: "a quorum-cutoff stop" });
+  accepts(layer1, ["INSERT INTO council_stops (job_id, requested_at, cause) VALUES ('job-2', 300100, 'quorum-cutoff')"], { label: "a quorum-cutoff stop" });
   const roundFixed = /council round start, map, seal or close is fixed/;
-  refuses(layer1, [`UPDATE council_rounds SET quorum_at = 100, cutoff_at = 180100 ${r1}`, `UPDATE council_rounds SET quorum_at = 200, cutoff_at = 180200 ${r1}`], roundFixed, {
+  refuses(layer1, [`UPDATE council_rounds SET quorum_at = 100, cutoff_at = 300100 ${r1}`, `UPDATE council_rounds SET quorum_at = 200, cutoff_at = 300200 ${r1}`], roundFixed, {
     label: "a sealed round's quorum_at"
   });
-  refuses(layer1, [`UPDATE council_rounds SET quorum_at = 100, cutoff_at = 180100 ${r1}`, `UPDATE council_rounds SET quorum_at = NULL, cutoff_at = NULL ${r1}`], roundFixed, {
+  refuses(layer1, [`UPDATE council_rounds SET quorum_at = 100, cutoff_at = 300100 ${r1}`, `UPDATE council_rounds SET quorum_at = NULL, cutoff_at = NULL ${r1}`], roundFixed, {
     label: "a sealed round's cutoff_at"
   });
 });

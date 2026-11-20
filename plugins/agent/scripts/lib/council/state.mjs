@@ -10,12 +10,12 @@ import { reduceRound } from "./reduce.mjs";
  * exact cancellation attribution, 2 adds the quorum cutoff. Commands read it once and pass it to
  * every state function as `layer`; no state function reads it.
  */
-export const COUNCIL_LAYER = 1;
+export const COUNCIL_LAYER = 2;
 
 /** How long a selected stop dispatch, or a foreign cancellation, may stay unsettled. */
 export const STOP_BOUND_MS = 120000;
-/** The time after quorum that the rest of the seats get (read only at layer 2). */
-export const GRACE_MS = 180000;
+/** The time after quorum that the rest of the seats get: five minutes (sealed only at layer 2). */
+export const GRACE_MS = 300000;
 /** The spacing between two stop requests for one job inside one command. */
 export const STOP_RETRY_MS = 5000;
 /** The longest run-wide stop cleanup pass of a closed collect. */
@@ -100,7 +100,7 @@ function attemptContext(db, attemptId) {
     db
       .prepare(
         `SELECT a.*, sr.current_id AS current_id, sr.state AS seat_state, r.closed_at AS round_closed_at,
-           ru.clock AS run_clock
+           r.cutoff_at AS round_cutoff_at, ru.clock AS run_clock
          FROM council_attempts AS a
          JOIN council_seat_rounds AS sr ON sr.run_id = a.run_id AND sr.round = a.round AND sr.seat = a.seat
          JOIN council_rounds AS r ON r.run_id = a.run_id AND r.round = a.round
@@ -111,11 +111,17 @@ function attemptContext(db, attemptId) {
   );
 }
 
+// Whether a sealed round's quorum cutoff has come: after it nothing is issued or received.
+function cutoffPassed(context, t) {
+  return context.round_cutoff_at !== null && t >= context.round_cutoff_at;
+}
+
 // The issuance fence: the current, unretired, unbound, unrefused provider attempt of an open
-// round, before its issue_by.
+// round, before its issue_by and before the round's quorum cutoff.
 function issuanceOpen(context, t) {
   return (
     context.round_closed_at === null &&
+    !cutoffPassed(context, t) &&
     context.current_id === context.id &&
     context.retired_at === null &&
     context.job_id === null &&
@@ -399,10 +405,10 @@ function insertObservation(db, attemptId, verdict, { observedAt, afterClose }) {
 /**
  * Records the validated reply to a Claude prompt as that attempt's receipt. Checks, in order, the
  * run and the attempt's identity, an earlier receipt, the open prompt (current, unretired,
- * running, open round, receipt time before `issue_by`), and at layer 1 or more an invalid
- * verdict's prepared replacement digest. `verdict` is `{ outcome: "valid" | "invalid",
- * answerSha256, errorsSha256, reason, replacementSha256 }`. Resolves to `{ ok: true, round }` or
- * `{ ok: false, reason, round? }`.
+ * running, open round, receipt time before `issue_by` and before a sealed round's cutoff), and
+ * at layer 1 or more an invalid verdict's prepared replacement digest. `verdict` is `{ outcome:
+ * "valid" | "invalid", answerSha256, errorsSha256, reason, replacementSha256 }`. Resolves to
+ * `{ ok: true, round }` or `{ ok: false, reason, round? }`.
  */
 export async function depositReceipt(store, { runId, seat, attemptId, verdict, layer = 0, deadline } = {}) {
   checkVerdict(verdict, RECEIPT_OUTCOMES);
@@ -424,6 +430,7 @@ export async function depositReceipt(store, { runId, seat, attemptId, verdict, l
     const { t } = sampleTimes(context.run_clock);
     const open =
       context.round_closed_at === null &&
+      !cutoffPassed(context, t) &&
       context.current_id === context.id &&
       context.retired_at === null &&
       context.seat_state === "running" &&
@@ -877,6 +884,15 @@ function applyWrite(db, view, write, t) {
       );
       return;
     }
+    case "seal":
+      // Set once: the round's trigger refuses any later change of a set cutoff.
+      db.prepare("UPDATE council_rounds SET quorum_at = ?, cutoff_at = ? WHERE run_id = ? AND round = ? AND cutoff_at IS NULL").run(
+        write.quorumAt,
+        write.cutoffAt,
+        runId,
+        round
+      );
+      return;
     case "close":
       db.prepare("UPDATE council_rounds SET closed_at = ?, quorum = ? WHERE run_id = ? AND round = ?").run(t, write.quorum, runId, round);
       db.prepare("UPDATE council_runs SET input_rev = input_rev + 1 WHERE id = ?").run(runId);

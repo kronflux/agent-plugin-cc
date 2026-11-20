@@ -529,7 +529,8 @@ CREATE TABLE council_rounds (
   PRIMARY KEY (run_id,round),
   CHECK ((quorum_at IS NULL)=(cutoff_at IS NULL)),
   CHECK (quorum_at IS NULL OR quorum_at>=started_at),
-  CHECK (cutoff_at IS NULL OR cutoff_at=quorum_at+180000),
+  -- The cutoff is five minutes (GRACE_MS) after quorum.
+  CHECK (cutoff_at IS NULL OR cutoff_at=quorum_at+300000),
   CHECK ((closed_at IS NULL)=(quorum IS NULL)),
   CHECK (closed_at IS NULL OR closed_at>=started_at),
   CHECK (closed_at IS NULL OR quorum_at IS NULL OR closed_at>=quorum_at),

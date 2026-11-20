@@ -1,6 +1,6 @@
 // The pure reducer of one council round: the collection rows applied to a view of the round's
 // rows and exact jobs, at a raw wall sample `w` and a council time `t`.
-import { STOP_BOUND_MS } from "./state.mjs";
+import { GRACE_MS, STOP_BOUND_MS } from "./state.mjs";
 
 /** The persisted seat reason of each exact council stop cause. */
 export const STOP_CAUSE_REASONS = Object.freeze({
@@ -112,6 +112,36 @@ function retryDigest(attempts, row, current) {
   return attempts.find((attempt) => attempt.seat === row.seat && attempt.charge === "turn")?.prompt_sha256 ?? null;
 }
 
+// Whether the valid seats reach quorum: at least two valid seats from at least two families.
+function hasQuorum(view, ordered, states) {
+  const familyOf = new Map(view.seats.map((seat) => [seat.seat, seat.family]));
+  const validSeats = ordered.filter((row) => states.get(row.seat) === "valid").map((row) => row.seat);
+  return validSeats.length >= 2 && new Set(validSeats.map((seat) => familyOf.get(seat))).size >= 2;
+}
+
+const CUTOFF_OUTCOME = Object.freeze({ state: "timed-out", reason: STOP_CAUSE_REASONS["quorum-cutoff"] });
+
+// L2a: the outcome of a seat at a due cutoff from what is in hand. Quota, a permanent failure and
+// a missing job keep their ordinary outcomes (B5 priority), and a late output its lateness. Any
+// other answer counts by its ordinary outcome only when it ended before the cutoff. A seat with
+// nothing in hand, or whose answer ended at or after the cutoff, is cut off. Nothing is replaced.
+function cutoffOutcome(observation, stop, proven, layer, cutoffAt) {
+  if (!observation) {
+    return CUTOFF_OUTCOME;
+  }
+  const kept = observation.outcome === "quota" || observation.outcome === "missing" || observation.outcome === "late";
+  if (kept || (observation.outcome === "failure" && observation.transient !== 1)) {
+    return observationOutcome(observation, stop);
+  }
+  if (observation.event_at === null || observation.event_at === undefined || observation.event_at >= cutoffAt) {
+    return CUTOFF_OUTCOME;
+  }
+  if (observation.outcome === "cancelled" && layer >= 1 && !(stop && proven)) {
+    return { state: "error", reason: "external cancellation" };
+  }
+  return observationOutcome(observation, stop);
+}
+
 function finishWrite(seat, outcome) {
   return {
     op: "finish",
@@ -137,6 +167,12 @@ function finishWrite(seat, outcome) {
  * timeout), writing `{ op: "replace", seat, charge, attemptId, kind, predecessorId, replacesId,
  * promptSha256, retryPromptSha256 }` with `attemptId` from `view.freshIds` (two per seat); B8
  * also covers a council stop without first-cancellation evidence.
+ * At `layer` 2 the first sweep that leaves an open round with quorum writes `{ op: "seal",
+ * quorumAt: t, cutoffAt: t + GRACE_MS }`. Once a round's `cutoff_at` is due (at any layer), L2a
+ * replaces B4 to B8: every open seat is settled from what is in hand, without a replacement,
+ * a seat with nothing timely in hand ends `timed-out`, `quorum cutoff`, each newly settled
+ * seat's exact live tip gets a `quorum-cutoff` stop unless it already has a stop or a
+ * cancellation request, and the round closes.
  */
 export function reduceRound(view, { w, t, layer = 0 }) {
   if (!view.round || view.round.closed_at !== null) {
@@ -154,6 +190,9 @@ export function reduceRound(view, { w, t, layer = 0 }) {
     states.set(seat, outcome.state);
   };
   const ordered = [...view.seatRounds].sort((a, b) => (a.seat < b.seat ? -1 : a.seat > b.seat ? 1 : 0));
+  // The Layer 2 cutoff, set once by the seal; a due cutoff replaces the ordinary sweep by L2a.
+  const cutoffAt = view.round.cutoff_at ?? null;
+  const cutoffDue = cutoffAt !== null && t >= cutoffAt;
 
   for (const row of ordered) {
     if (states.get(row.seat) !== "issuing") {
@@ -165,7 +204,7 @@ export function reduceRound(view, { w, t, layer = 0 }) {
       states.set(row.seat, "running");
     } else if (current.refusal !== null) {
       finish(row.seat, { state: "error", reason: current.refusal });
-    } else if (t >= current.issue_by) {
+    } else if (t >= current.issue_by && (!cutoffDue || current.issue_by <= cutoffAt)) {
       finish(row.seat, { state: "error", reason: "issuance deadline expired" });
     }
   }
@@ -173,6 +212,26 @@ export function reduceRound(view, { w, t, layer = 0 }) {
   const roundAttempts = view.attempts ?? [];
   // Exact council-first cancellation evidence, recorded by the stop's own E18 transaction.
   const councilFirst = new Set((view.cancels ?? []).map((row) => row.job_id));
+  const closeWrite = () => ({ op: "close", quorum: hasQuorum(view, ordered, states) ? 1 : 0 });
+
+  if (cutoffDue) {
+    // L2a: settle every open seat from what is in hand, stop each newly settled seat's exact
+    // live tip unless it already has a council stop or a cancellation request, then close (B9).
+    for (const row of ordered) {
+      if (FINAL_STATES.has(states.get(row.seat))) {
+        continue;
+      }
+      const current = attempts.get(row.current_id);
+      const stop = current.job_id !== null ? (stops.get(current.job_id) ?? null) : null;
+      finish(row.seat, cutoffOutcome(observations.get(current.id), stop, councilFirst.has(current.job_id), layer, cutoffAt));
+      const job = current.job_id !== null ? jobs[current.job_id] : null;
+      if (job && job.end_state === null && !stop && job.isTip && job.cancel_requested_at === null) {
+        writes.push({ op: "stop", jobId: current.job_id, cause: "quorum-cutoff" });
+      }
+    }
+    writes.push(closeWrite());
+    return { writes, nextDue: null };
+  }
   const replaced = [];
   // Before an ordinary B4, B5 or B7 candidate finishes, Layer 1 tries its repair (L1b) or retry
   // (L1c) slot; the fallback finishes the candidate.
@@ -255,17 +314,22 @@ export function reduceRound(view, { w, t, layer = 0 }) {
     }
   }
 
+  // Seal (Layer 2): the first sweep that leaves an open, unsealed round with quorum sets the cutoff.
+  let seal = null;
+  if (layer >= 2 && cutoffAt === null && hasQuorum(view, ordered, states)) {
+    seal = { op: "seal", quorumAt: t, cutoffAt: t + GRACE_MS };
+    writes.push(seal);
+  }
+
   if (ordered.every((row) => FINAL_STATES.has(states.get(row.seat)))) {
-    const familyOf = new Map(view.seats.map((seat) => [seat.seat, seat.family]));
-    const validSeats = ordered.filter((row) => states.get(row.seat) === "valid").map((row) => row.seat);
-    const families = new Set(validSeats.map((seat) => familyOf.get(seat)));
-    writes.push({ op: "close", quorum: validSeats.length >= 2 && families.size >= 2 ? 1 : 0 });
+    writes.push(closeWrite());
     return { writes, nextDue: null };
   }
 
   const replacementOf = new Map(replaced.map((write) => [write.seat, write]));
   const after = {
     ...view,
+    round: seal ? { ...view.round, quorum_at: seal.quorumAt, cutoff_at: seal.cutoffAt } : view.round,
     seatRounds: view.seatRounds.map((row) => ({ ...row, state: states.get(row.seat), current_id: replacementOf.get(row.seat)?.attemptId ?? row.current_id })),
     attempts: [
       ...roundAttempts,
@@ -289,9 +353,9 @@ export function reduceRound(view, { w, t, layer = 0 }) {
 /**
  * The nearest remaining delay of an open round, or null: each deadline converted on its own
  * clock, a W3 column (queue and execution limits, external cancellation bound) against `w` with
- * `axis: "wall"`, a council column (`issue_by`, selected-dispatch bound) against `t` with
- * `axis: "council"`. Returns `{ delayMs, axis, source }` with `source` naming the seat and the
- * deadline; a delay already due is 0.
+ * `axis: "wall"`, a council column (`issue_by`, selected-dispatch bound, the round's `cutoff_at`)
+ * against `t` with `axis: "council"`. Returns `{ delayMs, axis, source }` with `source` naming the
+ * seat (or `round` for the cutoff) and the deadline; a delay already due is 0.
  */
 export function nextDue(view, { w, t, layer = 0 }) {
   if (!view.round || view.round.closed_at !== null) {
@@ -338,6 +402,9 @@ export function nextDue(view, { w, t, layer = 0 }) {
     if (foreign && job.cancel_requested_at !== null) {
       add(row.seat, "external-cancel", "wall", job.cancel_requested_at + STOP_BOUND_MS, w);
     }
+  }
+  if (view.round.cutoff_at !== null && view.round.cutoff_at !== undefined) {
+    add("round", "cutoff", "council", view.round.cutoff_at, t);
   }
   if (candidates.length === 0) {
     return null;

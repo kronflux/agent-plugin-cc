@@ -669,24 +669,36 @@ the retry are separate, and a seat can use both in either order; after that its 
 final. A provider seat's replacement continues its ended job when that job recorded a thread, and
 otherwise starts a fresh job whose prompt holds the whole round context. The Claude seat's
 replacement is a new prompt among the deliveries. A cancellation that the council did not request
-ends the seat as `error` with no retry. There is no grace period after a quorum. Each seat ends a
-round as `valid`, `invalid`, `timed-out`, `error`, `missing-cli` or `quota-exhausted`; a failed
-provider turn is checked against the provider's usage to tell exhausted quota from other failures.
-The member-turn cap counts ordinary turns only; `repairs` and `retries` count the replacements
-issued and appear in `collect`, `status` and the report. The time limit (`--timeout-ms`, 15 minutes
-by default) applies to each attempt three ways: to start it, to wait in the queue, and to run it,
-counted from the moment a worker claims the job (`claimed_at`). A seat past its limit gets one exact
-stop request for its job.
+ends the seat as `error` with no retry. Each seat ends a round as `valid`, `invalid`, `timed-out`,
+`error`, `missing-cli` or `quota-exhausted`; a failed provider turn is checked against the
+provider's usage to tell exhausted quota from other failures. The member-turn cap counts ordinary
+turns only; `repairs` and `retries` count the replacements issued and appear in `collect`, `status`
+and the report. The time limit (`--timeout-ms`, 15 minutes by default) applies to each attempt
+three ways: to start it, to wait in the queue, and to run it, counted from the moment a worker
+claims the job (`claimed_at`). A seat past its limit gets one exact stop request for its job.
+
+**Five minutes after quorum.** As soon as two seats from two families have valid answers, the
+round is sealed: `quorumAt` is that moment and `cutoffAt` is five minutes later, and neither moves
+afterwards. Each seat still working is told once that the other seats have answered and that it has
+five minutes to give its answer in the required JSON form. The leader passes this notice to the
+Claude seat's agent; a Codex seat with a running turn gets it as a message in that turn. A seat whose
+job has not started, and an Antigravity seat (which takes a message only by starting a new job), get
+no notice. The notice is not a prompt and needs no reply of its own, and a notice that cannot be
+sent is reported as a diagnostic. An answer that arrives before the cutoff counts as usual. At the
+cutoff, a seat with no answer ends `timed-out` with the reason `quorum cutoff`, its running job gets
+an exact stop request, no further repair or retry is issued, and the round closes with its quorum.
+Without a quorum there is no cutoff, and each seat keeps its own time limit.
 
 **The status loop.** The skill repeats `council status <run-id>`, which names one next action:
 `collect`, `crossexam`, `merge`, `verify`, `report`, `report-failure`, `damaged` or `done`, with
-the prompts to deliver (`deliveries`, each with its prompt file and intent id). Claude's replies go
-back with `council submit <run-id> <seat> --intent <intent-id> --file <reply.json>`; a reply that
-arrives after its deadline is refused. `council collect <run-id> --round N` runs in the background
-and returns when the round closes, a new prompt is ready, or its 9-minute budget ends. A closed
-round returns its stored result at once (`Round N closed with quorum.`, or the no-quorum text),
-after a short separate cleanup of pending stop requests; `cleanupPending` says whether some are
-still outstanding.
+the prompts to deliver (`deliveries`, each with its prompt file and intent id) and any cutoff notice
+for the Claude seat (a delivery with `kind` `notice`, the seat and the text), which is handed once.
+Claude's replies go back with `council submit <run-id> <seat> --intent <intent-id> --file
+<reply.json>`; a reply that arrives after its deadline or after the cutoff is refused. `council
+collect <run-id> --round N` runs in the background and returns when the round closes, a new prompt
+or a cutoff notice is ready, or its 9-minute budget ends. A closed round returns its stored result
+at once (`Round N closed with quorum.`, or the no-quorum text), after a short separate cleanup of
+pending stop requests; `cleanupPending` says whether some are still outstanding.
 
 **Merge, verdicts and report.** `council merge` groups the findings into clusters labelled
 `consensus`, `cross-validated`, `disputed` or `solo` by explicit links only. `council verdict

@@ -577,3 +577,122 @@ test("layer 1 attribution: L1a, the B7 retry of a threadless live job, and the B
   assert.deepEqual(nextDue(layer1View({ stops: [pending], job: foreign }), { w: 25, t: 25, layer: 1 }), { delayMs: 120000, axis: "wall", source: "s2:external-cancel" });
   assert.deepEqual(reduceRound(layer1View({ stops: [pending], job: foreign }), { w: 120025, t: 120025, layer: 0 }).writes, []);
 });
+
+// Layer 2: a hand-built round with T = 1,000,000, where `seats` gives each seat's row, attempt,
+// observation and job. The round is sealed when `cutoffAt` is given.
+const GRACE = 300000;
+function layer2View({ seats, cutoffAt = null, stops = [], cancels = [] }) {
+  const view = handView({
+    seatRounds: seats.map((entry) => ({ seat: entry.seat, state: entry.state, current_id: entry.attempt.id })),
+    attempts: seats.map((entry) => entry.attempt),
+    observations: seats
+      .filter((entry) => entry.observation)
+      .map((entry) => ({ attempt_id: entry.attempt.id, transient: 0, replacement_sha256: null, ...entry.observation })),
+    stops,
+    cancels,
+    jobs: Object.fromEntries(seats.filter((entry) => entry.job).map((entry) => [entry.attempt.job_id, entry.job])),
+    freshIds: FRESH
+  });
+  return {
+    ...view,
+    run: { ...view.run, timeout_ms: 1000000 },
+    round: { ...view.round, quorum_at: cutoffAt === null ? null : cutoffAt - GRACE, cutoff_at: cutoffAt }
+  };
+}
+const liveJob = (columns = {}) => ({ created_at: 0, claimed_at: 10, end_state: null, isTip: 1, cancel_requested_at: null, thread_id: null, ...columns });
+const validSeat = (seat) => ({ seat, state: "valid", attempt: turn(`a${seat.slice(1)}`, seat, seat === "s1" ? "prompt" : "create", { issue_by: 1000000 }) });
+const liveSeat = (columns = {}) => ({ seat: "s2", state: "running", attempt: turn("a2", "s2", "create", { job_id: "j2", issue_by: 1000000 }), job: liveJob(columns) });
+const answered = (observation, job = endedJob({ end_at: observation.event_at })) => ({ ...liveSeat(), job, observation });
+const cutoffFinish = (seat) => finishOf(seat, "timed-out", "quorum cutoff");
+
+test("layer 2 seal: the first sweep with two valid families seals once at t, five minutes before the cutoff", () => {
+  const s3Valid = {
+    seat: "s3",
+    state: "running",
+    attempt: turn("a3", "s3", "create", { job_id: "j3", issue_by: 1000000 }),
+    job: endedJob(),
+    observation: { outcome: "valid", event_at: 50, answer_sha256: hex("3"), reason: null }
+  };
+  const view = layer2View({ seats: [validSeat("s1"), liveSeat(), s3Valid] });
+  const sealed = reduceRound(view, { w: 100, t: 100, layer: 2 });
+  assert.deepEqual(sealed.writes, [
+    { op: "finish", seat: "s3", state: "valid", reason: null, answerSha256: hex("3"), errorsSha256: null },
+    { op: "seal", quorumAt: 100, cutoffAt: 300100 }
+  ]);
+  // The cutoff is the next wake when it is the nearest deadline.
+  assert.deepEqual(sealed.nextDue, { delayMs: 300000, axis: "council", source: "round:cutoff" });
+  // Layer 1 does not seal; one valid family does not seal; a sealed round is not sealed again.
+  assert.deepEqual(reduceRound(view, { w: 100, t: 100, layer: 1 }).writes, [sealed.writes[0]]);
+  const oneFamily = layer2View({ seats: [validSeat("s1"), liveSeat(), { ...s3Valid, observation: { outcome: "failure", event_at: 50, reason: "provider failure" } }] });
+  assert.deepEqual(reduceRound(oneFamily, { w: 100, t: 100, layer: 2 }).writes, [finishOf("s3", "error", "provider failure")]);
+  const again = layer2View({ seats: [validSeat("s1"), liveSeat(), validSeat("s3")], cutoffAt: 300100 });
+  assert.deepEqual(reduceRound(again, { w: 200, t: 200, layer: 2 }).writes, []);
+  assert.deepEqual(reduceRound(again, { w: 200, t: 200, layer: 2 }).nextDue, { delayMs: 299900, axis: "council", source: "round:cutoff" });
+  // The last seat validating in the sealing sweep: seal, then close.
+  const last = layer2View({ seats: [validSeat("s1"), answered({ outcome: "valid", event_at: 90, answer_sha256: hex("2"), reason: null }), s3Valid] });
+  assert.deepEqual(
+    reduceRound(last, { w: 100, t: 100, layer: 2 }).writes.map((write) => write.op),
+    ["finish", "finish", "seal", "close"]
+  );
+});
+
+test("layer 2 cutoff: a due cutoff settles every open seat, stops its exact live job, never replaces, and closes", () => {
+  const sealed = (s2, extra = {}) => layer2View({ seats: [validSeat("s1"), s2, validSeat("s3")], cutoffAt: 300100, ...extra });
+  const at = { w: 300100, t: 300100, layer: 2 };
+  const closeWrite = { op: "close", quorum: 1 };
+  // Before the cutoff nothing happens; at the cutoff a silent live seat ends with an exact stop.
+  assert.deepEqual(reduceRound(sealed(liveSeat()), { w: 300099, t: 300099, layer: 2 }).writes, []);
+  assert.deepEqual(reduceRound(sealed(liveSeat()), at), {
+    writes: [cutoffFinish("s2"), { op: "stop", jobId: "j2", cause: "quorum-cutoff" }, closeWrite],
+    nextDue: null
+  });
+  // An existing exact stop is reused, and a job whose cancellation was requested elsewhere gets none.
+  const stop = { job_id: "j2", requested_at: 20, cause: "deadline", dispatched_at: null, acknowledged_at: null };
+  assert.deepEqual(reduceRound(sealed(liveSeat(), { stops: [stop] }), at).writes, [cutoffFinish("s2"), closeWrite]);
+  assert.deepEqual(reduceRound(sealed(liveSeat({ cancel_requested_at: 50 })), at).writes, [cutoffFinish("s2"), closeWrite]);
+  // An unbound attempt and a silent Claude prompt end with nothing to stop.
+  const unbound = { seat: "s2", state: "issuing", attempt: turn("a2", "s2", "create", { issue_by: 1000000 }) };
+  assert.deepEqual(reduceRound(sealed(unbound), at).writes, [cutoffFinish("s2"), closeWrite]);
+  const silentClaude = { seat: "s1", state: "running", attempt: turn("a1", "s1", "prompt", { issue_by: 1000000, issued_at: 0 }) };
+  const silent = layer2View({ seats: [silentClaude, validSeat("s2"), validSeat("s3")], cutoffAt: 300100 });
+  assert.deepEqual(reduceRound(silent, at).writes, [cutoffFinish("s1"), closeWrite]);
+  // An unbound attempt whose issuance deadline came before the cutoff keeps its own expiry.
+  const expired = { seat: "s2", state: "issuing", attempt: turn("a2", "s2", "create", { issue_by: 200000 }) };
+  assert.deepEqual(reduceRound(sealed(expired), at).writes, [finishOf("s2", "error", "issuance deadline expired"), closeWrite]);
+
+  // Answers in hand: an answer that ended before the cutoff counts by its ordinary outcome without
+  // a repair or retry; one that ended at or after the cutoff is cut off.
+  const invalid = { outcome: "invalid", event_at: 300050, reason: "schema validation failed", errors_sha256: hex("e"), replacement_sha256: hex("p") };
+  assert.deepEqual(reduceRound(sealed(answered(invalid)), at).writes, [{ ...finishOf("s2", "invalid", "schema validation failed"), errorsSha256: hex("e") }, closeWrite]);
+  assert.deepEqual(reduceRound(sealed(answered({ ...invalid, event_at: 300100 })), at).writes, [cutoffFinish("s2"), closeWrite]);
+  const valid = { outcome: "valid", event_at: 300099, answer_sha256: hex("2"), reason: null };
+  assert.deepEqual(reduceRound(sealed(answered(valid)), at).writes, [
+    { op: "finish", seat: "s2", state: "valid", reason: null, answerSha256: hex("2"), errorsSha256: null },
+    closeWrite
+  ]);
+  const transient = { outcome: "failure", event_at: 300050, reason: "transient provider failure", transient: 1, replacement_sha256: hex("t") };
+  assert.deepEqual(reduceRound(sealed(answered(transient)), at).writes, [finishOf("s2", "error", "transient provider failure"), closeWrite]);
+  const late = { outcome: "late", event_at: 300050, reason: "execution deadline expired" };
+  assert.deepEqual(reduceRound(sealed(answered(late)), at).writes, [finishOf("s2", "timed-out", "execution deadline expired"), closeWrite]);
+  // Quota, a permanent failure and a missing job keep their outcomes whenever they ended.
+  for (const [observation, state, reason] of [
+    [{ outcome: "quota", event_at: 300200, reason: "quota exhausted" }, "quota-exhausted", "quota exhausted"],
+    [{ outcome: "failure", event_at: 300200, reason: "provider failure" }, "error", "provider failure"],
+    [{ outcome: "missing", event_at: null, reason: "job pruned or missing" }, "error", "job pruned or missing"]
+  ]) {
+    const seat = answered(observation, observation.outcome === "missing" ? null : endedJob());
+    assert.deepEqual(reduceRound(sealed(seat), at).writes, [finishOf("s2", state, reason), closeWrite], observation.outcome);
+  }
+  // A repair in flight (a new unbound attempt) still has only until the cutoff.
+  const repair = {
+    seat: "s2",
+    state: "issuing",
+    attempt: turn("a2r", "s2", "create", { charge: "repair", replaces_id: "a2", created_at: 300000, issue_by: 1300000 })
+  };
+  assert.deepEqual(reduceRound(sealed(repair), at).writes, [cutoffFinish("s2"), closeWrite]);
+  // The same answer before the cutoff goes through Layer 1: the invalid answer gets its repair.
+  assert.deepEqual(
+    reduceRound(sealed(answered(invalid)), { w: 300060, t: 300060, layer: 2 }).writes.map((write) => write.op),
+    ["replace"]
+  );
+});
