@@ -262,6 +262,45 @@
           "issuedAt": { "type": ["string", "null"] }
         }
       }
+    },
+    "followups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ordinal",
+          "intentId",
+          "seat",
+          "findingId",
+          "question",
+          "mergeSha256",
+          "state",
+          "issuedAt",
+          "jobId",
+          "answer",
+          "stance",
+          "at",
+          "reason",
+          "forceReason"
+        ],
+        "properties": {
+          "ordinal": { "type": "integer", "minimum": 1 },
+          "intentId": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+          "seat": { "type": "string", "pattern": "^s[1-9]$" },
+          "findingId": { "type": "string", "minLength": 1 },
+          "question": { "type": "string", "minLength": 1 },
+          "mergeSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "state": { "type": "string", "enum": ["valid", "invalid", "timed-out", "quota-exhausted", "error"] },
+          "issuedAt": { "type": ["integer", "null"] },
+          "jobId": { "type": ["string", "null"] },
+          "answer": { "type": ["string", "null"] },
+          "stance": { "type": ["string", "null"] },
+          "at": { "type": ["integer", "null"] },
+          "reason": { "type": ["string", "null"] },
+          "forceReason": { "type": ["object", "null"] }
+        }
+      }
     }
   }
 }

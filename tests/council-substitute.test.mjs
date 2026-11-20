@@ -15,7 +15,7 @@ import { resolveStateDir } from "../plugins/agent/scripts/lib/state.mjs";
 import { openStore } from "../plugins/agent/scripts/lib/store.mjs";
 import { handleCouncil, renderCouncilReport, renderFailedReport } from "../plugins/agent/scripts/commands/council.mjs";
 import { makeTempDir } from "./helpers.mjs";
-import { EPOCH, bindAttempt, observe, openCouncilStore, receive, seatJobFields, seedRun, setJob, useTestClock } from "./council-helpers.mjs";
+import { EPOCH, bindAttempt, observe, openCouncilStore, receive, seatJobFields, seedRun, setJob, sql, useTestClock } from "./council-helpers.mjs";
 
 const hex = (character) => character.repeat(64);
 const ON = { substitution: true };
@@ -50,8 +50,8 @@ async function settledWithFailedCodex(t, clock, { runId = "run-1" } = {}) {
   return { store, runDir: runDir(runId), ids };
 }
 
-test("the shipped extensions turn substitution on and leave follow-ups and the challenge off", () => {
-  assert.deepEqual({ ...COUNCIL_EXTENSIONS }, { followups: false, substitution: true, challenge: false });
+test("the shipped extensions turn substitution and follow-ups on and leave the challenge off", () => {
+  assert.deepEqual({ ...COUNCIL_EXTENSIONS }, { followups: true, substitution: true, challenge: false });
 });
 
 test("an extension turn settles once by X1 to X4, and a carry at a due cutoff by S3", () => {
@@ -614,4 +614,56 @@ test("start takes no --disallow-substitute and collect has no --allow-substitute
   assert.deepEqual([start.code, start.json], [1, { error: "invalid-arguments", message: "--disallow-substitute is only valid on council collect." }]);
   const allow = await council(["collect", "run-x", "--round", "1", "--allow-substitute", "--json"], { cwd });
   assert.deepEqual([allow.code, allow.json], [1, { error: "invalid-arguments", message: "Unknown option --allow-substitute." }]);
+});
+
+test("a fresh Round 2 stand-in's bundle hides the model name a seat's job recorded, as the primary bundles do", async (t) => {
+  const clock = useTestClock(t, 0);
+  const fx = await started(t, clock);
+  // s2 runs with no model override; its job records the model it ran on, and its finding names it.
+  clock.set(100);
+  const job2 = currentOf(fx, "s2").job_id;
+  completeJob(fx, job2, 100, r1Answer("bravo breaks on gpt-secret-9"));
+  setJob(fx.store, job2, { model: "gpt-secret-9" });
+  completeJob(fx, currentOf(fx, "s3").job_id, 100, r1Answer("charlie"));
+  assert.equal((await submit(fx, "s1", currentOf(fx, "s1").id, r1Answer("alpha"))).code, 0);
+  assert.equal((await collect(fx)).json.quorum, true);
+  clock.set(1000);
+  const sent = await council(["crossexam", fx.runId, "--json"], { cwd: fx.cwd });
+  const s1 = sent.json.deliveries.find((delivery) => delivery.seat === "s1");
+  assert.doesNotMatch(promptText(s1), /gpt-secret-9/);
+  assert.match(promptText(s1), /bravo breaks on \[member\]/);
+  // s3 fails Round 2: its fresh stand-in answers the alternate bundle, which holds s2's finding.
+  const map = mapOf(fx);
+  clock.set(1100);
+  assert.equal((await submit(fx, "s1", s1.intentId, r2Answer(map.s1))).json.state, "valid");
+  completeJob(fx, currentOf(fx, "s2", 2).job_id, 1100, r2Answer(map.s2));
+  failJob(fx, currentOf(fx, "s3", 2).job_id, 1100);
+  const woke = await collect(fx, { round: 2 });
+  const fresh = woke.json.deliveries.find((delivery) => delivery.actor === "s3~r2");
+  assert.ok(fresh, woke.stdout);
+  assert.match(promptText(fresh), /bravo breaks on \[member\]/);
+  assert.doesNotMatch(promptText(fresh), /gpt-secret-9/);
+});
+
+test("crossexam counts a carried stand-in among the seats it sent Round 2 to", async (t) => {
+  const clock = useTestClock(t, 0);
+  const { fx, sent } = await round2WithCarry(t, clock);
+  // s1, s3 and s4 continue as ordinary seats; s2's Round 1 stand-in is carried.
+  assert.equal(sent.json.deliveries.filter((delivery) => delivery.actor === "s2~r1").length, 1);
+  assert.equal(sent.json.seats, 4);
+  assert.equal(snap(fx).seatRounds.filter((row) => row.round === 2).length, 3);
+});
+
+test("a closed collect after the capacity decision names the cap and the decision", async (t) => {
+  const clock = useTestClock(t, 0);
+  const fx = await codexFailedAt100(t, clock);
+  // The capacity decision cannot arise with five seats or fewer; the test records it directly.
+  sql(fx.store, ["INSERT INTO council_ext_decisions (run_id, kind, scope, at, decision) VALUES (?, 'substitution', 1, ?, 'capacity')", fx.runId, EPOCH + 100]);
+  const closed = await collect(fx);
+  assert.deepEqual(
+    [closed.code, closed.json.wake, closed.json.quorum, closed.json.substitutionDecision, closed.json.message, closed.json.substitutions],
+    [0, "closed", true, "capacity", "The run has reached its cap of 12 member turns.", []]
+  );
+  const text = await council(["collect", fx.runId, "--round", "1"], { cwd: fx.cwd });
+  assert.equal(text.stdout, "Round 1 closed with quorum.\nStand-in decision: capacity. The run has reached its cap of 12 member turns.\n");
 });

@@ -126,6 +126,40 @@ export function renderSubstitutePrompt({ basePrompt }) {
   return render("council-substitute", { BASE_PROMPT: trimEnd(basePrompt) });
 }
 
+/**
+ * The prompt of a follow-up question to one seat's actor after Round 2: the brief, the actor's
+ * lens, its accepted Round 1 and Round 2 answers (null when it gave none), the target (a merged
+ * cluster with no seat or family names, or `stance` on a decision), the question and the schema.
+ * It is complete, so a new agent can answer it after a restart.
+ */
+export function renderFollowupPrompt({ brief, lens, round1, round2, target, cluster = null, question, kind, options = [], schemaText }) {
+  const subject =
+    target === "stance"
+      ? `Your stance on the decision. The options are: ${options.join(", ")}.`
+      : `Merged finding ${target}:\n\n${jsonBlock({
+          severity: cluster?.severity ?? null,
+          label: cluster?.label ?? null,
+          path: cluster?.path ?? null,
+          line: cluster?.line ?? null,
+          claim: cluster?.claim ?? null,
+          challenges: (cluster?.challenges ?? []).map((challenge) => ({ disputes: challenge.disputes, reason: challenge.reason }))
+        })}`;
+  const stanceRule =
+    kind === "decision"
+      ? `Set \`stance\` to your choice among the options (${options.join(", ")}) when the question changes it or you restate it; otherwise set it to null.`
+      : "Set `stance` to null.";
+  return render("council-followup", {
+    BRIEF: trimEnd(brief),
+    LENS: lens,
+    FIRST_ANSWER: round1 ? jsonBlock(round1) : "(none: you did not answer the first round for this seat)",
+    SECOND_ANSWER: jsonBlock(round2 ?? null),
+    TARGET: subject,
+    QUESTION: trimEnd(question),
+    STANCE_RULE: stanceRule,
+    SCHEMA: trimEnd(schemaText)
+  });
+}
+
 // The round's prompt under a first line that names the reissue time and, when a reason is
 // given, a second line that names what happened to the previous attempt. `round` is accepted
 // for the caller's record and does not change the text.

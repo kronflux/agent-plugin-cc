@@ -34,7 +34,7 @@ import { buildSeatJob, readSeatUsage } from "../lib/council/jobs.mjs";
 import { installObject, ObjectDamagedError, publishExport, readObject } from "../lib/council/objects.mjs";
 import { buildBundles, bundleFromMap } from "../lib/council/anonymise.mjs";
 import { depositExtensionReceipt, depositSubstitutionOptIn } from "../lib/council/extensions.mjs";
-import { mergeCouncil, serializeMerge, sortedTally } from "../lib/council/merge.mjs";
+import { mergeCouncil, serializeMerge, sortedTally, unanimousPanel } from "../lib/council/merge.mjs";
 import {
   CUTOFF_NOTICE,
   FAMILIES,
@@ -43,12 +43,25 @@ import {
   renderRepairPrompt,
   renderRetryPrompt,
   renderRound1Prompt,
+  renderFollowupPrompt,
   renderRound2Prompt,
   renderSubstitutePrompt
 } from "../lib/council/prompts.mjs";
-import { actorKey, effectivePanel, eventsByTurn, quorumFamilies, substitutionCandidates, turnActor, turnState } from "../lib/council/reduce-ext.mjs";
+import {
+  actorKey,
+  effectivePanel,
+  eventsByTurn,
+  followupLimits,
+  followupOpen,
+  pendingExtensionStops,
+  quorumFamilies,
+  substitutionCandidates,
+  turnActor,
+  turnState
+} from "../lib/council/reduce-ext.mjs";
 import {
   acknowledgeStop,
+  admitFollowup,
   BUDGET_MS,
   CLEANUP_BUDGET_MS,
   continueBindingHook,
@@ -56,13 +69,19 @@ import {
   COUNCIL_LAYER,
   COUNCIL_TEST_POINTS as POINTS,
   CouncilFenceError,
+  CouncilStopSelectionError,
   createBindingHook,
   createCouncilRun,
+  depositExtensionObservation,
+  depositExtensionRefusal,
   depositObservation,
   depositReceipt,
+  extensionDecisionHook,
+  extensionStopHook,
   peekRound,
   POLL_MS,
   readCouncil,
+  readFollowupCounts,
   recordMerge,
   recordRefusal,
   recordReport,
@@ -73,7 +92,7 @@ import {
   stopHook,
   USAGE_READ_MS
 } from "../lib/council/state.mjs";
-import { classifyFailure, classifyJob, validateAnswer, validationContext } from "../lib/council/validate.mjs";
+import { classifyFailure, classifyJob, validateAnswer, validateFollowupAnswer, validationContext } from "../lib/council/validate.mjs";
 
 // `council`: a panel of read-only seats answers one brief in two rounds; this module runs the
 // executor (issuing attempts, exact stops, observing jobs) and the council subcommands.
@@ -81,6 +100,7 @@ import { classifyFailure, classifyJob, validateAnswer, validationContext } from 
 const SCHEMA_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "schemas");
 const RECONCILE_EVERY_MS = 10000;
 const ROUND_SCHEMA_FILES = { 1: "council-round1.schema.json", 2: "council-round2.schema.json" };
+const FOLLOWUP_SCHEMA_FILE = "council-followup.schema.json";
 
 /** The packaged schema file of a council round. */
 export function roundSchemaPath(round) {
@@ -90,6 +110,19 @@ export function roundSchemaPath(round) {
 function readRoundSchema(round) {
   try {
     return JSON.parse(fs.readFileSync(roundSchemaPath(round), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/** The packaged schema file of a follow-up answer (the provider wire form, with a nullable stance). */
+export function followupSchemaPath() {
+  return path.join(SCHEMA_DIR, FOLLOWUP_SCHEMA_FILE);
+}
+
+function readFollowupSchema() {
+  try {
+    return JSON.parse(fs.readFileSync(followupSchemaPath(), "utf8"));
   } catch {
     return null;
   }
@@ -242,29 +275,36 @@ function predecessorProblem(view) {
   return null;
 }
 
-async function dispatchContinue(store, stateDir, runDir, attempt, ctx) {
-  const predecessorId = attempt.predecessor_id;
+// Continues the exact predecessor `spec.predecessorId` through E17 with `spec.promptSha256` as the
+// message, at most one forced call per dispatch, and E38 once after a win. `spec` is
+// `{ predecessorId, promptSha256, readSchema, schemaRefusal, refuse(reason), hook(force, reasons),
+// seat, label, evidenceForceOnly }`: a deterministic failure goes to `refuse` with the contract's
+// reason, an availability or fence loss leaves the work pending. With `evidenceForceOnly` a failed
+// or cancelled tip is forced only on unobserved-exit or thread-barrier evidence, and otherwise
+// refused with its reason.
+async function continueJob(store, stateDir, runDir, spec, ctx) {
+  const { predecessorId, refuse: refuseWith } = spec;
   const before = predecessorProblem(readJobView(store, predecessorId));
   if (before === "wait") {
     return { dispatched: false, diagnostics: [] };
   }
   if (before) {
-    await refuse(store, attempt, before, ctx);
+    await refuseWith(before);
     return { dispatched: false, diagnostics: [] };
   }
   let message;
   try {
-    message = readObject(runDir, attempt.prompt_sha256, "md").toString("utf8");
+    message = readObject(runDir, spec.promptSha256, "md").toString("utf8");
   } catch (error) {
     if (error instanceof ObjectDamagedError) {
-      await refuse(store, attempt, "prompt object damaged", ctx);
+      await refuseWith("prompt object damaged");
       return { dispatched: false, diagnostics: [] };
     }
     throw error;
   }
-  const outputSchema = readRoundSchema(attempt.round);
+  const outputSchema = spec.readSchema();
   if (!outputSchema) {
-    await refuse(store, attempt, "invalid round schema", ctx);
+    await refuseWith(spec.schemaRefusal);
     return { dispatched: false, diagnostics: [] };
   }
   const requester = await requesterOf(ctx);
@@ -286,7 +326,7 @@ async function dispatchContinue(store, stateDir, runDir, attempt, ctx) {
               outputSchema,
               force,
               automatic: false,
-              withinDecision: continueBindingHook({ attemptId: attempt.id, predecessorId, force, reasons, layer: ctx.layer })
+              withinDecision: spec.hook(force, reasons)
             },
             opts
           ),
@@ -300,13 +340,17 @@ async function dispatchContinue(store, stateDir, runDir, attempt, ctx) {
         return { dispatched: false, diagnostics: [] };
       }
       const asked = forceAsked(error);
+      if (asked && !force && spec.evidenceForceOnly && !forceEvidenceSeen(store, predecessorId, asked)) {
+        await refuseWith(forcedRefusal(error) ?? "thread barrier");
+        return { dispatched: false, diagnostics: [] };
+      }
       if (asked && !force) {
         force = true;
         reasons = asked;
         continue;
       }
       if (asked && force) {
-        await refuse(store, attempt, forcedRefusal(error) ?? "thread barrier", ctx);
+        await refuseWith(forcedRefusal(error) ?? "thread barrier");
         return { dispatched: false, diagnostics: [] };
       }
       let reason;
@@ -324,20 +368,79 @@ async function dispatchContinue(store, stateDir, runDir, attempt, ctx) {
       } else {
         throw error;
       }
-      await refuse(store, attempt, reason, ctx);
+      await refuseWith(reason);
       return { dispatched: false, diagnostics: [] };
     }
     testPoint(POINTS.afterDecide);
     if (result.won) {
       await launchAfterWin(store, stateDir, result.successorId, ctx);
-      const diagnostics = result.labelDropped ? [{ seat: attempt.seat, jobId: result.successorId, label: ctx.seat.label }] : [];
+      const diagnostics = result.labelDropped ? [{ seat: spec.seat, jobId: result.successorId, label: spec.label }] : [];
       return { dispatched: true, jobId: result.successorId, diagnostics };
     }
     if (!result.successorId) {
-      await refuse(store, attempt, "continuation lost", ctx);
+      await refuseWith("continuation lost");
     }
     return { dispatched: false, diagnostics: [] };
   }
+}
+
+// Whether a continuation asked to force may use force on extension work: the reasons or the exact
+// predecessor show an unobserved provider exit or a thread barrier.
+function forceEvidenceSeen(store, predecessorId, asked) {
+  if (asked.includes("provider-exit-unobserved") || asked.includes("thread-barrier")) {
+    return true;
+  }
+  const row = readJobView(store, predecessorId)?.row;
+  return Boolean(row && (row.provider_exit_unobserved === 1 || row.release_kind === "unobserved"));
+}
+
+async function dispatchContinue(store, stateDir, runDir, attempt, ctx) {
+  const predecessorId = attempt.predecessor_id;
+  return continueJob(
+    store,
+    stateDir,
+    runDir,
+    {
+      predecessorId,
+      promptSha256: attempt.prompt_sha256,
+      readSchema: () => readRoundSchema(attempt.round),
+      schemaRefusal: "invalid round schema",
+      refuse: (reason) => refuse(store, attempt, reason, ctx),
+      hook: (force, reasons) => continueBindingHook({ attemptId: attempt.id, predecessorId, force, reasons, layer: ctx.layer }),
+      seat: attempt.seat,
+      label: ctx.seat?.label ?? null,
+      evidenceForceOnly: false
+    },
+    ctx
+  );
+}
+
+/**
+ * Issues one reserved provider follow-up `turn`: continues its exact predecessor through E17 with
+ * the extension decision hook and the follow-up answer schema; a deterministic failure records the
+ * turn's exact refusal, which the reducer settles. A failed or cancelled predecessor is forced only
+ * on unobserved-exit or thread-barrier evidence. `deps` is `{ run, seat, deadline }` plus the
+ * optional `launch`, `decideNext` and `readRequester`. Resolves to `{ dispatched, jobId?, diagnostics }`.
+ */
+export async function dispatchFollowup(store, stateDir, runDir, turn, deps) {
+  const predecessorId = turn.predecessor_id;
+  return continueJob(
+    store,
+    stateDir,
+    runDir,
+    {
+      predecessorId,
+      promptSha256: turn.prompt_sha256,
+      readSchema: readFollowupSchema,
+      schemaRefusal: "invalid follow-up schema",
+      refuse: (reason) => depositExtensionRefusal(store, { intentId: turn.id, reason, deadline: deps.deadline }),
+      hook: (force, reasons) => extensionDecisionHook({ intentId: turn.id, predecessorId, force, reasons }),
+      seat: turn.seat,
+      label: deps.seat?.label ?? null,
+      evidenceForceOnly: true
+    },
+    deps
+  );
 }
 
 /**
@@ -415,6 +518,46 @@ export async function dispatchStops(store, run, deps) {
       if (ack.reason === "stop-still-pending") {
         errors.push({ error: "store-error", jobId: stop.job_id, message: `The stop request for job ${stop.job_id} did not select it; it stays pending.` });
       }
+    }
+  }
+  // The stops of extension turns: the acknowledgement commits inside the stop request (P3).
+  for (const stop of pendingExtensionStops(snapshot?.ext)) {
+    const stamp = stamps.get(stop.jobId);
+    const waitFor = (ms) => {
+      pending += 1;
+      nextRetryMs = nextRetryMs === null ? ms : Math.min(nextRetryMs, ms);
+    };
+    if (stamp !== undefined && now() - stamp < STOP_RETRY_MS) {
+      waitFor(STOP_RETRY_MS - (now() - stamp));
+      continue;
+    }
+    const sessionId = run.session_id ?? (await requesterOf(deps)).sessionId ?? null;
+    testPoint(POINTS.beforeStop);
+    try {
+      await retried(
+        (opts) =>
+          (deps.requestStop ?? requestStop)(
+            store,
+            { jobIds: [stop.jobId] },
+            { reason: "cancel", sessionId, cancel: true, afterMs: 4000, withinStop: extensionStopHook({ intentId: stop.turnId, jobId: stop.jobId }) },
+            opts
+          ),
+        deps.deadline
+      );
+    } catch (error) {
+      stamps.set(stop.jobId, now());
+      if (error instanceof CouncilStopSelectionError) {
+        errors.push({ error: "store-error", jobId: stop.jobId, message: error.message });
+      } else if (!(error instanceof StoreError)) {
+        throw error;
+      }
+      waitFor(STOP_RETRY_MS);
+      continue;
+    }
+    stamps.set(stop.jobId, now());
+    testPoint(POINTS.afterStop);
+    if (pendingExtensionStops(readCouncil(store, run.id)?.ext).some((entry) => entry.turnId === stop.turnId)) {
+      waitFor(STOP_RETRY_MS);
     }
   }
   return { pending, nextRetryMs, errors };
@@ -593,24 +736,243 @@ export async function observeJobs(store, runDir, snapshot, deps) {
   return deposited;
 }
 
+// The decision context a follow-up answer is checked against.
+function followupContext(snapshot) {
+  return { kind: snapshot.run.kind, options: JSON.parse(snapshot.run.options_json ?? "[]") };
+}
+
+// The verdict of follow-up reply bytes or a completed job's structured output: a valid answer is
+// installed in its canonical form `{ answer, stance? }`, an invalid one with its errors.
+function followupAnswerVerdict(runDir, snapshot, text, eventAt) {
+  let answer;
+  try {
+    answer = JSON.parse(text);
+  } catch {
+    answer = undefined;
+  }
+  const checked = answer === undefined ? { ok: false, errors: ["answer: not valid JSON"] } : validateFollowupAnswer(answer, followupContext(snapshot));
+  if (checked.ok) {
+    return { outcome: "valid", eventAt, answerSha256: installObject(runDir, `${JSON.stringify(checked.answer)}\n`, "json") };
+  }
+  return { outcome: "invalid", eventAt, reason: "schema validation failed", errorsSha256: installObject(runDir, `${JSON.stringify(checked.errors)}\n`, "json") };
+}
+
+/**
+ * Observes the exact job of every issued provider follow-up that has no deposit: classifies it,
+ * checks a completed timely job's structured output as a follow-up answer, and deposits the
+ * observation (after the turn's finish it is historical). A failed or interrupted job first needs
+ * its usage read, started once per command and never awaited here. Resolves to the number of
+ * observations deposited.
+ */
+export async function observeFollowups(store, runDir, snapshot, deps) {
+  deps.usage ??= new Map();
+  const byTurn = eventsByTurn(snapshot.ext?.events ?? []);
+  let deposited = 0;
+  for (const turn of snapshot.ext?.turns ?? []) {
+    const events = byTurn.get(turn.id) ?? {};
+    const jobId = events.issue?.job_id ?? null;
+    if (turn.kind !== "followup" || !jobId || events.deposit) {
+      continue;
+    }
+    const row = readJobView(store, jobId)?.row ?? null;
+    const cls = classifyJob({ row, T: snapshot.run.timeout_ms });
+    if (!cls) {
+      continue;
+    }
+    let verdict;
+    switch (cls.kind) {
+      case "missing":
+        verdict = { outcome: "missing", reason: "job pruned or missing" };
+        break;
+      case "cancelled":
+        verdict = { outcome: "cancelled", eventAt: cls.eventAt, reason: "job cancelled" };
+        break;
+      case "waiting":
+        verdict = { outcome: "failure", eventAt: cls.eventAt, reason: "provider waiting" };
+        break;
+      case "late":
+        verdict = { outcome: "late", eventAt: cls.eventAt, reason: cls.lateReason };
+        break;
+      case "completed":
+        if (row.result_json_too_large) {
+          verdict = { outcome: "invalid", eventAt: cls.eventAt, reason: "structured output too large" };
+        } else if (row.result_json === null || row.result_json === undefined) {
+          verdict = { outcome: "invalid", eventAt: cls.eventAt, reason: "missing structured output" };
+        } else {
+          verdict = followupAnswerVerdict(runDir, snapshot, String(row.result_json), cls.eventAt);
+        }
+        break;
+      default: {
+        const seat = seatOf(snapshot, turn.seat);
+        const entry = deps.usage.get(jobId) ?? startUsageRead(jobId, seat.family, snapshot.run, deps);
+        if (!entry || !entry.done) {
+          continue;
+        }
+        const failure = classifyFailure({ family: seat.family, model: row.model ?? seat.model, usage: entry.result, row });
+        if (failure === "quota") {
+          verdict = { outcome: "quota", eventAt: cls.eventAt, reason: "quota exhausted" };
+        } else if (failure === "missing-output") {
+          verdict = cls.timely
+            ? { outcome: "invalid", eventAt: cls.eventAt, reason: "missing structured output" }
+            : { outcome: "late", eventAt: cls.eventAt, reason: cls.lateReason };
+        } else {
+          verdict = { outcome: "failure", eventAt: cls.eventAt, reason: failureReason(row, failure) };
+        }
+      }
+    }
+    const result = await depositExtensionObservation(store, { intentId: turn.id, jobId, verdict, deadline: deps.deadline });
+    if (result.ok) {
+      deposited += 1;
+      testPoint(POINTS.afterDeposit);
+    }
+  }
+  return deposited;
+}
+
+// Whether a follow-up of the run has no finish yet.
+function followupsOpen(snapshot) {
+  const byTurn = eventsByTurn(snapshot.ext?.events ?? []);
+  return (snapshot.ext?.turns ?? []).some((turn) => followupOpen(turn, byTurn));
+}
+
+// The reserved provider follow-ups that may still be issued at `t`.
+function issuableFollowups(snapshot, t) {
+  const byTurn = eventsByTurn(snapshot.ext?.events ?? []);
+  return (snapshot.ext?.turns ?? []).filter((turn) => {
+    const events = byTurn.get(turn.id) ?? {};
+    return turn.kind === "followup" && turn.predecessor_id && !events.issue && !events.refusal && !events.finish && t < turn.issue_by;
+  });
+}
+
+/**
+ * Drives the run's open follow-ups after Round 2 closed, until none is open, a new prompt is
+ * ready, or the command deadline comes: each pass reduces (X1 to X8 for the run), sends the
+ * pending exact stops, issues reserved provider follow-ups, observes their ended jobs and reduces
+ * again; E43 runs every 10 seconds. Between passes it waits on the first of the usage reads in
+ * flight, POLL_MS and the stop retry delay, through the injected `sleep(ms)`. With `once` it
+ * returns after the first pass. Resolves to `{ wake, deliveries, diagnostics, errors, notes }`,
+ * `wake` being `closed` (no follow-up open), `prompt`, `budget`, or null after a single pass.
+ */
+export async function advanceFollowups(runDir, options) {
+  const { runId, layer = 0, deadline, extensions = {} } = options;
+  const stateDir = options.stateDir ?? path.dirname(path.dirname(runDir));
+  const ownStore = !options.openStore;
+  const store = ownStore ? openStore(stateDir, { busyTimeoutMs: RETRY_BUDGETS.command.attemptMs }) : options.openStore();
+  const now = options.now ?? (() => performance.now());
+  const sleep = options.sleep ?? defaultSleep;
+  const reconcile = options.reconcile ?? ((dir, args) => reconcileStore(dir, args));
+  const deps = {
+    layer,
+    deadline,
+    now,
+    sleep: options.sleep,
+    readUsage: options.readUsage,
+    readRequester: options.readRequester,
+    launch: options.launch,
+    decideNext: options.decideNext,
+    requestStop: options.requestStop,
+    stamps: options.stamps ?? new Map(),
+    usage: new Map(),
+    diagnosticLines: [],
+    diagnostics: []
+  };
+  const errors = [];
+  let lastReconcile = null;
+  let initialDeliveries = null;
+  const result = (wake, deliveries) => ({ wake, deliveries, diagnostics: deps.diagnostics, errors, notes: deps.diagnosticLines });
+  const reduce = () => reduceRun(store, { runId, round: 2, layer, extensions, deadline });
+  try {
+    for (;;) {
+      let snapshot = readCouncil(store, runId);
+      initialDeliveries ??= new Set(openDeliveries(snapshot, runDir, Math.max(snapshot.run.clock, wallNow())).map((delivery) => delivery.intentId));
+      if (lastReconcile === null || now() - lastReconcile >= RECONCILE_EVERY_MS) {
+        lastReconcile = now();
+        try {
+          await reconcile(stateDir, { deadline, budget: "command" });
+        } catch (error) {
+          if (!(error instanceof StoreError)) {
+            throw error;
+          }
+        }
+      }
+      await reduce();
+      const stopped = await dispatchStops(store, snapshot.run, deps);
+      errors.push(...stopped.errors);
+      snapshot = readCouncil(store, runId);
+      for (const turn of issuableFollowups(snapshot, Math.max(snapshot.run.clock, wallNow()))) {
+        const outcome = await dispatchFollowup(store, stateDir, runDir, turn, { ...deps, run: snapshot.run, seat: seatOf(snapshot, turn.seat) });
+        deps.diagnostics.push(...outcome.diagnostics);
+      }
+      snapshot = readCouncil(store, runId);
+      await observeFollowups(store, runDir, snapshot, deps);
+      await reduce();
+      snapshot = readCouncil(store, runId);
+      const deliveries = openDeliveries(snapshot, runDir, Math.max(snapshot.run.clock, wallNow()));
+      if (!followupsOpen(snapshot)) {
+        return result("closed", deliveries);
+      }
+      if (deliveries.some((delivery) => !initialDeliveries.has(delivery.intentId))) {
+        return result("prompt", deliveries);
+      }
+      if (options.once) {
+        return result(null, deliveries);
+      }
+      let delay = POLL_MS;
+      const stopRetry = (await dispatchStopsDelay(store, snapshot.run, deps)) ?? null;
+      if (stopRetry !== null) {
+        delay = Math.min(delay, stopRetry);
+      }
+      if (now() + delay >= deadline) {
+        return result("budget", deliveries);
+      }
+      const reads = [...deps.usage.values()].filter((entry) => !entry.done).map((entry) => entry.promise);
+      await Promise.race([sleep(delay), ...reads]);
+    }
+  } finally {
+    if (ownStore) {
+      store.close();
+    }
+  }
+}
+
 function defaultSleep(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, Math.max(0, ms));
   });
 }
 
-// The prompts of issued Claude extension turns (stand-ins and carries) that are open at `t`: no
-// deposit or finish, an open round, before the turn's own deadline, and for a carry before a
-// sealed round's cutoff. A stand-in asked after the cutoff keeps its own full time.
+// The prompts of issued Claude extension turns (stand-ins, carries and follow-ups) that are open
+// at `t`: no deposit or finish, before the turn's own deadline, for a stand-in or carry an open
+// round, and for a carry before a sealed round's cutoff. A stand-in asked after the cutoff keeps
+// its own full time. A follow-up delivery has `round: 2`, its actor and `kind: "followup"`.
 function extensionDeliveries(snapshot, runDir, t) {
   const ext = snapshot.ext ?? { turns: [], events: [] };
   const byTurn = eventsByTurn(ext.events);
   const rounds = new Map(snapshot.rounds.map((row) => [row.round, row]));
   const deliveries = [];
+  let round2Panel = null;
   for (const turn of ext.turns) {
     const roundRow = rounds.get(turn.round);
     const { issue, deposit, finish } = turnState(turn, byTurn);
-    if (turn.kind === "followup" || !roundRow || roundRow.closed_at !== null || !issue || issue.job_id !== null || deposit || finish || t >= turn.issue_by) {
+    if (turn.kind === "followup") {
+      // A Claude follow-up goes to the actor that gave the seat's Round 2 answer.
+      if (!issue || issue.job_id !== null || deposit || finish || t >= turn.issue_by) {
+        continue;
+      }
+      round2Panel ??= effectivePanel(snapshot, 2);
+      deliveries.push({
+        seat: turn.seat,
+        intentId: turn.id,
+        promptFile: path.join(runDir, "objects", `${turn.prompt_sha256}.md`),
+        deadline: new Date(turn.issue_by).toISOString(),
+        round: 2,
+        actor: round2Panel.find((entry) => entry.seat === turn.seat)?.actor ?? turn.seat,
+        kind: "followup",
+        sort: [2, turn.seat, 1, turn.created_at, turn.id]
+      });
+      continue;
+    }
+    if (!roundRow || roundRow.closed_at !== null || !issue || issue.job_id !== null || deposit || finish || t >= turn.issue_by) {
       continue;
     }
     if (turn.kind === "carry" && roundRow.cutoff_at !== null && t >= roundRow.cutoff_at) {
@@ -709,10 +1071,16 @@ function noticeCandidates(snapshot, t) {
     .filter((entry) => entry.attempt && entry.attempt.retired_at === null);
 }
 
+// Whom a cutoff notice goes to in the text output: the seat, or the carried stand-in of the seat.
+function noticeTarget(notice) {
+  return notice.actor ? `${notice.seat} (stand-in ${notice.actor})` : notice.seat;
+}
+
 /**
  * The cutoff notices the leader delivers to Claude seats: for each Claude seat of a sealed, open
  * round whose prompt is open at `t`, the first call claims the seat's marker and returns
- * `{ kind: "notice", seat, text }`; later calls, from any command, return nothing for it.
+ * `{ kind: "notice", seat, text }`; later calls, from any command, return nothing for it. A
+ * carried stand-in whose Round 2 prompt is open gets the same notice once, with its `actor`.
  */
 export function claudeNotices(snapshot, runDir, t) {
   const open = new Set(openDeliveries(snapshot, runDir, t).map((delivery) => delivery.intentId));
@@ -723,6 +1091,16 @@ export function claudeNotices(snapshot, runDir, t) {
     }
     if (claimNotice(runDir, entry.round, entry.seat, { kind: "leader", attemptId: entry.attempt.id })) {
       notices.push({ kind: "notice", seat: entry.seat, text: CUTOFF_NOTICE });
+    }
+  }
+  // A carry is subject to the cutoff of its sealed round, like an original Claude seat.
+  const sealed = new Set(snapshot.rounds.filter((row) => row.closed_at === null && row.cutoff_at !== null && t < row.cutoff_at).map((row) => row.round));
+  for (const turn of snapshot.ext?.turns ?? []) {
+    if (turn.kind !== "carry" || !sealed.has(turn.round) || !open.has(turn.id)) {
+      continue;
+    }
+    if (claimNotice(runDir, turn.round, turn.seat, { kind: "leader", intentId: turn.id })) {
+      notices.push({ kind: "notice", seat: turn.seat, actor: turnActor(turn), text: CUTOFF_NOTICE });
     }
   }
   return notices;
@@ -956,11 +1334,12 @@ export async function advance(runDir, options) {
 async function dispatchStopsDelay(store, run, deps) {
   const snapshot = readCouncil(store, run.id);
   let delay = null;
-  for (const stop of snapshot.stops) {
-    if (stop.acknowledged_at !== null) {
-      continue;
-    }
-    const stamp = deps.stamps.get(stop.job_id);
+  const pendingJobs = [
+    ...snapshot.stops.filter((stop) => stop.acknowledged_at === null).map((stop) => stop.job_id),
+    ...pendingExtensionStops(snapshot.ext).map((stop) => stop.jobId)
+  ];
+  for (const jobId of pendingJobs) {
+    const stamp = deps.stamps.get(jobId);
     const wait = stamp === undefined ? 0 : Math.max(0, STOP_RETRY_MS - (deps.now() - stamp));
     delay = delay === null ? wait : Math.min(delay, wait);
   }
@@ -993,8 +1372,10 @@ function round1Actors(runDir, snapshot, jobModels = () => []) {
  * prompt cannot be prepared (a missing or damaged object). Round 1 is the seat's Round 1 prompt
  * for its lens; Round 2 answers the seat's `$alternates` bundle, which leaves out that seat's own
  * Round 1 findings, with no own findings of its own. Both sit under the stand-in preface.
+ * `jobModels(seat)` gives the model names a seat's Round 1 jobs recorded, which the alternate
+ * bundle scrubs as the primary bundles do.
  */
-export function prepareStandIns(runDir, snapshot, round) {
+export function prepareStandIns(runDir, snapshot, round, jobModels = () => []) {
   const roundRow = snapshot.rounds.find((row) => row.round === round);
   const decided = (snapshot.ext?.decisions ?? []).some((row) => row.kind === "substitution" && row.scope === round);
   if (!roundRow || roundRow.closed_at !== null || decided) {
@@ -1021,7 +1402,7 @@ export function prepareStandIns(runDir, snapshot, round) {
           prepared[seat] = null;
           continue;
         }
-        const { answers, rows } = round1Actors(runDir, snapshot);
+        const { answers, rows } = round1Actors(runDir, snapshot, jobModels);
         const bundle = bundleFromMap(rows, answers, letterMap, { runId: snapshot.run.id });
         basePrompt = renderRound2Prompt({ brief, lens, ownFindings: [], bundle, schemaText: fs.readFileSync(roundSchemaPath(2), "utf8") });
       }
@@ -1036,6 +1417,16 @@ export function prepareStandIns(runDir, snapshot, round) {
   return prepared;
 }
 
+// The model names each seat's Round 1 jobs recorded, by seat: a seat started without a model
+// override still ran on some model, and that name is scrubbed from the other seats' bundles too.
+function recordedModels(store, snapshot) {
+  return (seat) =>
+    snapshot.attempts
+      .filter((row) => row.seat === seat && row.round === 1 && row.job_id)
+      .map((row) => readJobView(store, row.job_id)?.row.model)
+      .filter(Boolean);
+}
+
 // Reduces the round only when the reducer has a row to write; resolves to the read-only peek
 // after any reduction (its `nextDue` is the next wake). With substitution on, each look first
 // prepares the stand-in prompts the current snapshot calls for, and a reduction that makes a new
@@ -1044,7 +1435,7 @@ async function reduceIfNeeded(store, { runId, round, layer, deadline, extensions
   let peek = null;
   for (let pass = 0; pass < 3; pass += 1) {
     const snapshot = extensions.substitution && runDir ? readCouncil(store, runId) : null;
-    const prepared = snapshot ? prepareStandIns(runDir, snapshot, round) : {};
+    const prepared = snapshot ? prepareStandIns(runDir, snapshot, round, recordedModels(store, snapshot)) : {};
     const options = { runId, round, layer, extensions, consent, prepared };
     peek = peekRound(store, options);
     if (!peek || peek.writes.length === 0) {
@@ -1061,10 +1452,11 @@ async function reduceIfNeeded(store, { runId, round, layer, deadline, extensions
 export const usage =
   "council start --brief <file> [--kind review|decision] [--seat <family>:<lens>]... [--model <family>=<value>]... [--timeout-ms <ms>] [--json]" +
   " | collect <run-id> --round 1|2 [--disallow-substitute] [--budget-ms <ms>] [--json]" +
-  " | submit <run-id> <seat> --intent <intent-id> --file <answer.json> [--json]" +
+  " | submit <run-id> <seat> --intent <intent-id> [--round 1|2] --file <answer.json> [--json]" +
   " | crossexam <run-id> [--json] | merge <run-id> [--json]" +
+  " | followup <run-id> <seat> --finding <cluster-id|stance> [--] <question> [--json]" +
   " | verdict <run-id> <cluster-id|claim-id> verified|rejected|not-checked [--strongest <n>] [--] [reason]" +
-  " | export <run-id> brief|map|merge|report [--json] | status <run-id> [--json] | report <run-id> [--json]";
+  " | export <run-id> brief|map|merge|report|followups [--json] | status <run-id> [--json] | report <run-id> [--json]";
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const BRIEF_KEYS = new Set(["question", "targets", "kind", "options", "claims"]);
@@ -1509,8 +1901,37 @@ async function closedResult(store, runId, round, { runDir, deadline, ctx, json, 
   if (diagnostics.length > 0) {
     object.diagnostics = diagnostics;
   }
-  emit(ctx.io, json, object, closedText(object));
+  // A stand-in batch that did not fit the member-turn cap is named, with the decision.
+  const decision = snapshot.ext.decisions.find((row) => row.kind === "substitution" && row.scope === round)?.decision ?? null;
+  let text = closedText(object);
+  if (decision === "capacity") {
+    object.substitutionDecision = decision;
+    object.message = `The run has reached its cap of ${snapshot.run.turn_cap} member turns.`;
+    text = `${text}\nStand-in decision: capacity. ${object.message}`;
+  }
+  emit(ctx.io, json, object, text);
   return object.quorum ? 0 : 1;
+}
+
+// The follow-up part of `council collect <run-id> --round 2` after Round 2 closed: drives the open
+// follow-ups, then returns the closed round's result, or wakes on a new prompt or the budget.
+async function collectFollowups(store, runId, { runDir, stateDir, deadline, ctx, json }) {
+  const outcome = await advanceFollowups(runDir, { runId, layer: ctx.layer, extensions: ctx.extensions, deadline, stateDir, openStore: () => store, readRequester: ctx.readRequester, ...ctx.advance });
+  writeDiagnostics(ctx.io, outcome.diagnostics, outcome.notes);
+  if (outcome.wake === "closed") {
+    return closedResult(store, runId, 2, { runDir, deadline, ctx, json, diagnostics: outcome.diagnostics });
+  }
+  const wake = outcome.wake === "prompt" ? "prompt" : "budget";
+  const payload = {
+    runId,
+    round: 2,
+    wake,
+    deliveries: outcome.deliveries,
+    ...(outcome.diagnostics.length > 0 ? { diagnostics: outcome.diagnostics } : {})
+  };
+  const fresh = outcome.deliveries[outcome.deliveries.length - 1];
+  emit(ctx.io, json, payload, wake === "prompt" ? `Wake: a follow-up prompt for ${fresh.seat} is ready. Run council status.` : "Wake: budget. Run council collect again.");
+  return 0;
 }
 
 // `council collect <run-id> --round N`: advances an open round, or returns a closed round's result.
@@ -1538,6 +1959,10 @@ async function collectCouncil(options, positionals, ctx) {
       throw new CouncilRefusal("round-not-started", `Round ${round} has not started.`);
     }
     if (roundRow.closed_at !== null) {
+      // After Round 2, collect drives the open follow-ups until none is open.
+      if (round === 2 && followupsOpen(snapshot)) {
+        return await collectFollowups(store, runId, { runDir: runDirOf(stateDir, runId), stateDir, deadline, ctx, json: options.json });
+      }
       return await closedResult(store, runId, round, { runDir: runDirOf(stateDir, runId), deadline, ctx, json: options.json });
     }
     if (substitution && consent === null) {
@@ -1568,7 +1993,7 @@ async function collectCouncil(options, positionals, ctx) {
           : "Wake: budget. Run council collect again."
     ];
     for (const notice of outcome.deliveries.filter((delivery) => delivery.kind === "notice")) {
-      lines.push(`Notice for ${notice.seat}: ${notice.text}`);
+      lines.push(`Notice for ${noticeTarget(notice)}: ${notice.text}`);
     }
     const text = lines.join("\n");
     emit(ctx.io, options.json, payload, text);
@@ -1651,7 +2076,7 @@ async function submitExtension(store, turn, { runId, seat, intentId, bytes, runD
   const lines = [`Recorded the reply of the stand-in ${actor} for ${seat} in round ${round}: ${state}.`];
   for (const delivery of passed.deliveries) {
     if (delivery.kind === "notice") {
-      lines.push(`Notice for ${delivery.seat}: ${delivery.text}`);
+      lines.push(`Notice for ${noticeTarget(delivery)}: ${delivery.text}`);
     }
   }
   emit(ctx.io, json, payload, lines.join("\n"));
@@ -1663,8 +2088,9 @@ async function submitCouncil(options, positionals, ctx) {
   const deadline = performance.now() + BUDGET_MS.submit;
   const [runId, seat] = positionals;
   if (!runId || !seat || positionals.length > 2 || !options.intent || !options.file) {
-    throw new CouncilRefusal("invalid-arguments", "Usage: council submit <run-id> <seat> --intent <intent-id> --file <answer.json> [--json]");
+    throw new CouncilRefusal("invalid-arguments", "Usage: council submit <run-id> <seat> --intent <intent-id> [--round 1|2] --file <answer.json> [--json]");
   }
+  const addressedRound = options.round === undefined ? null : roundOption(options.round);
   const intentId = String(options.intent);
   const cwd = resolveCommandCwd(options);
   let bytes;
@@ -1682,7 +2108,16 @@ async function submitCouncil(options, positionals, ctx) {
       throw new CouncilRefusal("unknown-run", unknownRunMessage(runId));
     }
     // An extension intent goes to the extension receipt, also when its extension is now off.
-    const turn = snapshot.ext.turns.find((row) => row.id === intentId && row.kind !== "followup") ?? null;
+    const turn = snapshot.ext.turns.find((row) => row.id === intentId) ?? null;
+    // With --round, the intent must belong to that round: a follow-up to round 2, a stand-in or
+    // carry to its own round, a core prompt to its attempt's round.
+    const intentRound = turn ? (turn.kind === "followup" ? 2 : turn.round) : (snapshot.attempts.find((row) => row.id === intentId)?.round ?? null);
+    if (addressedRound !== null && intentRound !== null && intentRound !== addressedRound) {
+      throw new CouncilRefusal("intent-not-open", `Intent ${intentId} is not open for ${seat} in round ${addressedRound}; nothing was recorded.`);
+    }
+    if (turn?.kind === "followup") {
+      return await submitFollowup(store, turn, { runId, seat, intentId, bytes, runDir, snapshot, deadline, ctx, json: options.json });
+    }
     if (turn) {
       return await submitExtension(store, turn, { runId, seat, intentId, bytes, runDir, stateDir, snapshot, deadline, ctx, json: options.json });
     }
@@ -1719,7 +2154,7 @@ async function submitCouncil(options, positionals, ctx) {
     const lines = [`Recorded the reply of ${seat} for round ${round}: ${state}.`];
     for (const delivery of passed.deliveries) {
       if (delivery.kind === "notice") {
-        lines.push(`Notice for ${delivery.seat}: ${delivery.text}`);
+        lines.push(`Notice for ${noticeTarget(delivery)}: ${delivery.text}`);
       } else if (delivery.seat === seat && delivery.intentId !== intentId) {
         lines.push(`New prompt for ${seat}: ${delivery.promptFile} (intent ${delivery.intentId}, reply by ${delivery.deadline}).`);
       }
@@ -1731,8 +2166,241 @@ async function submitCouncil(options, positionals, ctx) {
   }
 }
 
+// `council submit` for the intent of a Claude follow-up: the reply checked as a follow-up answer,
+// the extension receipt and the reduction. An invalid reply settles the follow-up once.
+async function submitFollowup(store, turn, { runId, seat, intentId, bytes, runDir, snapshot, deadline, ctx, json }) {
+  const verdict = followupAnswerVerdict(runDir, snapshot, bytes.toString("utf8"), null);
+  testPoint(POINTS.afterReplyValidation);
+  const receipt = await depositExtensionReceipt(store, { runId, seat, intentId, verdict, deadline });
+  testPoint(POINTS.beforeReduce);
+  try {
+    await reduceRun(store, { runId, round: 2, layer: ctx.layer, extensions: ctx.extensions, deadline });
+  } catch (error) {
+    if (receipt.ok && error instanceof StoreError) {
+      throw new CouncilRefusal("store-error", `The reply for intent ${intentId} was recorded, but the council could not be reduced: ${error.message}`);
+    }
+    throw error;
+  }
+  if (!receipt.ok) {
+    if (receipt.reason === "duplicate-receipt") {
+      throw new CouncilRefusal("duplicate-receipt", `A reply for intent ${intentId} was already recorded.`);
+    }
+    throw new CouncilRefusal("intent-not-open", `Intent ${intentId} is not open for ${seat}; nothing was recorded.`);
+  }
+  const after = readCouncil(store, runId);
+  const state = turnState(turn, eventsByTurn(after.ext.events)).state;
+  const actor = effectivePanel(after, 2).find((entry) => entry.seat === turn.seat)?.actor ?? turn.seat;
+  const deliveries = openDeliveries(after, runDir, Math.max(after.run.clock, wallNow()));
+  const payload = { runId, round: 2, seat, actor, intentId, ordinal: turn.ordinal, state, deliveries };
+  emit(ctx.io, json, payload, `Recorded the follow-up reply of ${actor} for ${seat}: ${state}.\nNext: run council status ${runId}.`);
+  return 0;
+}
+
 function readJsonObject(runDir, sha256) {
   return JSON.parse(readObject(runDir, sha256, "json").toString("utf8"));
+}
+
+// The exact job a provider follow-up of `seat` continues: the latest issued follow-up job of the
+// seat, also a failed one, else the job that gave its accepted Round 2 answer; null when none.
+function followupPredecessor(snapshot, seat) {
+  const byTurn = eventsByTurn(snapshot.ext?.events ?? []);
+  const issued = (snapshot.ext?.turns ?? [])
+    .filter((turn) => turn.kind === "followup" && turn.seat === seat && byTurn.get(turn.id)?.issue?.job_id)
+    .sort((a, b) => b.ordinal - a.ordinal);
+  if (issued.length > 0) {
+    return byTurn.get(issued[0].id).issue.job_id;
+  }
+  const seatRound = snapshot.seatRounds.find((row) => row.round === 2 && row.seat === seat);
+  return snapshot.attempts.find((row) => row.id === seatRound?.current_id)?.job_id ?? null;
+}
+
+// The refusal reason a provider follow-up's predecessor gives before admission (the usable
+// predecessor test), or null: an existing tip with a thread that is not ephemeral and could be
+// continued; a failed or cancelled tip only with unobserved-exit evidence. A live or unreleased
+// job is usable: the continuation waits for its release.
+function predecessorPreflight(view) {
+  const problem = predecessorProblem(view);
+  if (problem === "wait") {
+    return null;
+  }
+  if (problem) {
+    return problem;
+  }
+  const row = view.row;
+  if (row.ephemeral) {
+    return "predecessor not resumable";
+  }
+  const unobserved = row.provider_exit_unobserved === 1 || row.release_kind === "unobserved";
+  if (row.end_state === "failed" && !unobserved) {
+    return "predecessor failed";
+  }
+  if ((row.end_state === "cancelled" || row.cancelled_at !== null) && !unobserved) {
+    return "predecessor cancelled";
+  }
+  return null;
+}
+
+/**
+ * The checks of a follow-up before admission, in the refusal order after the feature flag: a
+ * successful closed Round 2, a current merge, a valid effective Round 2 actor for `seat`, an
+ * eligible target (a cluster of the current merge, or `stance` on a decision), no open follow-up
+ * of the seat, the limits, and for a provider actor a usable predecessor. Throws the CouncilRefusal
+ * of the first failed check; returns `{ entry, predecessorId, prompt }`.
+ */
+export function planFollowup(store, runDir, snapshot, { seat, target, question }) {
+  const run = snapshot.run;
+  const round2 = snapshot.rounds.find((row) => row.round === 2);
+  if (run.failed_at !== null || !round2 || round2.closed_at === null || round2.quorum !== 1) {
+    throw new CouncilRefusal("round-2-not-successful", "Follow-ups require a successful closed Round 2.");
+  }
+  const merge = currentMerge(runDir, snapshot);
+  if (!merge) {
+    throw new CouncilRefusal("stale-merge", "Council merge is stale. Run council merge again.");
+  }
+  const entry = effectivePanel(snapshot, 2).find((item) => item.seat === seat && item.valid) ?? null;
+  if (!entry) {
+    throw new CouncilRefusal("invalid-seat", `Seat ${seat} has no valid Round 2 actor.`);
+  }
+  const cluster = target === "stance" ? null : (merge.clusters.find((item) => item.id === target) ?? null);
+  if (target === "stance" ? run.kind !== "decision" : !cluster) {
+    throw new CouncilRefusal("invalid-target", `Finding ${target} is not an eligible follow-up target.`);
+  }
+  const counts = readFollowupCounts(store, { runId: run.id, seat });
+  if (counts.open) {
+    throw new CouncilRefusal("followup-open", `Seat ${seat} already has an open follow-up.`);
+  }
+  const limits = followupLimits({ seat, ...counts });
+  if (limits.length > 0) {
+    throw new CouncilRefusal(limits[0].error, limits.map((limit) => limit.message).join(" "));
+  }
+  let predecessorId = null;
+  if (entry.kind === "original" && entry.family !== "claude") {
+    predecessorId = followupPredecessor(snapshot, seat);
+    const problem = predecessorPreflight(predecessorId ? readJobView(store, predecessorId) : null);
+    if (problem) {
+      throw new CouncilRefusal("predecessor-unusable", `Seat ${seat} cannot continue: ${problem}.`);
+    }
+  }
+  const round1 = effectivePanel(snapshot, 1).find((item) => item.seat === seat && item.valid && item.actor === entry.actor) ?? null;
+  const prompt = renderFollowupPrompt({
+    brief: readObject(runDir, run.brief_sha256, "md").toString("utf8"),
+    lens: seatOf(snapshot, seat).lens,
+    round1: round1 ? readJsonObject(runDir, round1.answerSha256) : null,
+    round2: readJsonObject(runDir, entry.answerSha256),
+    target,
+    cluster,
+    question,
+    kind: run.kind,
+    options: JSON.parse(run.options_json ?? "[]"),
+    schemaText: fs.readFileSync(followupSchemaPath(), "utf8")
+  });
+  return { entry, predecessorId, prompt };
+}
+
+const ADMISSION_MESSAGES = {
+  "round-2-not-successful": () => "Follow-ups require a successful closed Round 2.",
+  "stale-merge": () => "Council merge is stale. Run council merge again.",
+  "followup-open": (seat) => `Seat ${seat} already has an open follow-up.`
+};
+
+// `council followup <run-id> <seat> --finding <cluster-id|stance> [--] <question>`: one question
+// to one seat about one merged finding (or its stance on a decision), after a successful Round 2.
+async function followupCouncil(options, positionals, ctx) {
+  const deadline = performance.now() + BUDGET_MS.submit;
+  const [runId, seat, ...words] = positionals;
+  const question = words.join(" ");
+  if (!runId || !seat || typeof options.finding !== "string" || options.finding === "") {
+    throw new CouncilRefusal("invalid-arguments", "Usage: council followup <run-id> <seat> --finding <cluster-id|stance> [--] <question> [--json]");
+  }
+  if (!question.trim()) {
+    throw new CouncilRefusal("invalid-arguments", "Supply one nonblank follow-up question.");
+  }
+  const target = options.finding;
+  const stateDir = resolveStateDir(resolveCommandCwd(options));
+  const runDir = runDirOf(stateDir, runId);
+  const store = await commandStore(stateDir, deadline);
+  try {
+    let snapshot = readCouncil(store, runId);
+    if (!snapshot) {
+      throw new CouncilRefusal("unknown-run", `Unknown council run ${runId}.`);
+    }
+    if (!ctx.extensions?.followups) {
+      throw new CouncilRefusal("extension-disabled", "Council extension followups is disabled.");
+    }
+    // The existing follow-ups settle first, so a finish that changed the council is seen.
+    if (snapshot.rounds.some((row) => row.round === 2)) {
+      await reduceRun(store, { runId, round: 2, layer: ctx.layer, extensions: ctx.extensions, deadline });
+      snapshot = readCouncil(store, runId);
+    }
+    const plan = planFollowup(store, runDir, snapshot, { seat, target, question });
+    const turnId = randomBytes(16).toString("hex");
+    const admitted = await admitFollowup(store, {
+      runId,
+      seat,
+      turnId,
+      requestId: randomBytes(16).toString("hex"),
+      target,
+      question,
+      promptSha256: installObject(runDir, plan.prompt, "md"),
+      predecessorId: plan.predecessorId,
+      mergeSha256: snapshot.run.merge_sha256,
+      inputRev: snapshot.run.input_rev,
+      deadline
+    });
+    if (!admitted.ok) {
+      if (admitted.limits) {
+        throw new CouncilRefusal(admitted.reason, admitted.limits.map((limit) => limit.message).join(" "));
+      }
+      if (admitted.reason === "unknown-run") {
+        throw new CouncilRefusal("unknown-run", `Unknown council run ${runId}.`);
+      }
+      throw new CouncilRefusal(admitted.reason, ADMISSION_MESSAGES[admitted.reason](seat));
+    }
+    const diagnostics = [];
+    const notes = [];
+    if (plan.predecessorId) {
+      const reserved = readCouncil(store, runId);
+      const turn = reserved.ext.turns.find((row) => row.id === turnId);
+      const outcome = await dispatchFollowup(store, stateDir, runDir, turn, {
+        layer: ctx.layer,
+        deadline,
+        run: reserved.run,
+        seat: seatOf(reserved, seat),
+        launch: ctx.advance?.launch,
+        decideNext: ctx.advance?.decideNext,
+        readRequester: ctx.readRequester,
+        diagnosticLines: notes
+      });
+      diagnostics.push(...outcome.diagnostics);
+      await reduceRun(store, { runId, round: 2, layer: ctx.layer, extensions: ctx.extensions, deadline });
+    }
+    writeDiagnostics(ctx.io, diagnostics, notes);
+    const after = readCouncil(store, runId);
+    const turn = after.ext.turns.find((row) => row.id === turnId);
+    const { state, issue, finish } = turnState(turn, eventsByTurn(after.ext.events));
+    const deliveries = openDeliveries(after, runDir, Math.max(after.run.clock, wallNow()));
+    const payload = { runId, seat, intentId: turnId, ordinal: turn.ordinal, state, jobId: issue?.job_id ?? null, deliveries, diagnostics };
+    if (finish && finish.code !== "valid") {
+      payload.error = "followup-failed";
+      payload.message = `Follow-up ${turnId} failed: ${finish.reason}.`;
+      if (options.json) {
+        emit(ctx.io, true, payload, "");
+      } else {
+        ctx.io.stderr(`${payload.message}\n`);
+      }
+      return 1;
+    }
+    const delivery = deliveries.find((item) => item.intentId === turnId);
+    const text = delivery
+      ? `Follow-up ${turn.ordinal} for ${seat}: give ${delivery.promptFile} to the agent of ${delivery.actor} and submit its reply with intent ${turnId} by ${delivery.deadline}.`
+      : issue
+        ? `Follow-up ${turn.ordinal} sent to ${seat} as job ${issue.job_id}. Next: run council collect ${runId} --round 2.`
+        : `Follow-up ${turn.ordinal} for ${seat} waits for its job to continue. Next: run council collect ${runId} --round 2.`;
+    emit(ctx.io, options.json, payload, text);
+    return 0;
+  } finally {
+    store.close();
+  }
 }
 
 /**
@@ -1768,13 +2436,7 @@ export async function crossExamine(runDir, deps) {
   if (round1.quorum !== 1 || snapshot.run.failed_at !== null) {
     throw refusalOf("no-quorum");
   }
-  // A seat started without a model override still ran on some model: the name its job recorded
-  // is scrubbed from the other seats' bundles too.
-  const jobModels = (seat) =>
-    snapshot.attempts
-      .filter((row) => row.seat === seat && row.round === 1 && row.job_id)
-      .map((row) => readJobView(store, row.job_id)?.row.model)
-      .filter(Boolean);
+  const jobModels = recordedModels(store, snapshot);
   // The effective Round 1 panel: valid originals, and each Round 1 stand-in that answered validly
   // under its actor key (`<seat>~r1`), which is carried into Round 2 for that seat.
   const { panel, answers, rows: actorRows } = round1Actors(runDir, snapshot, jobModels);
@@ -1832,7 +2494,9 @@ async function crossexamCouncil(options, positionals, ctx) {
   try {
     const passed = await crossExamine(runDirOf(stateDir, runId), { store, stateDir, runId, layer: ctx.layer, extensions: ctx.extensions, deadline, random: ctx.random, advance: ctx.advance });
     writeDiagnostics(ctx.io, passed.diagnostics, passed.notes);
-    const seats = readCouncil(store, runId).seatRounds.filter((row) => row.round === 2).length;
+    // The seats Round 2 went to: the ordinary seat rounds and the carried stand-ins.
+    const sentTo = readCouncil(store, runId);
+    const seats = sentTo.seatRounds.filter((row) => row.round === 2).length + sentTo.ext.turns.filter((turn) => turn.kind === "carry" && turn.round === 2).length;
     const payload = { runId, round: 2, seats, deliveries: passed.deliveries, ...(passed.diagnostics.length > 0 ? { diagnostics: passed.diagnostics } : {}) };
     emit(ctx.io, options.json, payload, `Round 2 sent to ${seats} seats.\nNext: run council status ${runId}.`);
     return 0;
@@ -1846,9 +2510,11 @@ async function crossexamCouncil(options, positionals, ctx) {
  * seat and round (a valid original, else its valid stand-in or carry). A seat answered by a
  * stand-in carries the stand-in's family (`claude`) for that round, no quorum family, and for a
  * fresh Round 2 stand-in its actor key for the findings it adds; each responder's letter map
- * names logical seats. `substitutions` lists every stand-in and carry of the run.
+ * names logical seats. `substitutions` lists every stand-in and carry of the run. With
+ * follow-ups on (`extensions.followups`) and follow-ups finished, `followups` lists them and
+ * `stances` holds each seat's most recent valid non-null follow-up stance.
  */
-export function mergeInput(runDir, snapshot) {
+export function mergeInput(runDir, snapshot, { extensions = {} } = {}) {
   const panels = { 1: effectivePanel(snapshot, 1), 2: effectivePanel(snapshot, 2) };
   const entryOf = (round, seat) => panels[round].find((entry) => entry.seat === seat && entry.valid) ?? null;
   const answersOf = (round) => Object.fromEntries(panels[round].filter((entry) => entry.valid).map((entry) => [entry.seat, readJsonObject(runDir, entry.answerSha256)]));
@@ -1882,8 +2548,78 @@ export function mergeInput(runDir, snapshot) {
     round2: answersOf(2),
     anonymisation,
     turns: { used: charges.turn + (snapshot.ext?.issued.total ?? 0), repairs: charges.repair, retries: charges.retry },
-    ...(standIns.length > 0 ? { substitutions: standIns } : {})
+    ...(standIns.length > 0 ? { substitutions: standIns } : {}),
+    ...followupInput(runDir, snapshot, extensions)
   };
+}
+
+/**
+ * The finished follow-ups of a run in ordinal order: `{ ordinal, intentId, seat, findingId,
+ * question, mergeSha256, state, issuedAt, jobId, answer, stance, at, reason, forceReason }`, with
+ * `answer` and `stance` from a valid answer (else null), `issuedAt` and `at` (the answer's event
+ * time) in milliseconds, and `forceReason` the decoded force record or null.
+ */
+export function followupEntries(runDir, snapshot) {
+  const byTurn = eventsByTurn(snapshot.ext?.events ?? []);
+  return (snapshot.ext?.turns ?? [])
+    .filter((turn) => turn.kind === "followup" && byTurn.get(turn.id)?.finish)
+    .sort((a, b) => a.ordinal - b.ordinal)
+    .map((turn) => {
+      const { issue, deposit, finish } = byTurn.get(turn.id);
+      const valid = finish.code === "valid";
+      const answer = valid ? readJsonObject(runDir, deposit.digest) : null;
+      return {
+        ordinal: turn.ordinal,
+        intentId: turn.id,
+        seat: turn.seat,
+        findingId: turn.target,
+        question: turn.question,
+        mergeSha256: turn.merge_sha256,
+        state: finish.code,
+        issuedAt: issue?.at ?? null,
+        jobId: issue?.job_id ?? null,
+        answer: answer?.answer ?? null,
+        stance: answer?.stance ?? null,
+        at: valid ? deposit.event_at : null,
+        reason: finish.reason ?? null,
+        forceReason: issue?.code ? JSON.parse(issue.code) : null
+      };
+    });
+}
+
+// The follow-up part of the merge input: nothing unless follow-ups are on and some finished.
+function followupInput(runDir, snapshot, extensions) {
+  if (!extensions.followups) {
+    return {};
+  }
+  const followups = followupEntries(runDir, snapshot);
+  if (followups.length === 0) {
+    return {};
+  }
+  const stances = {};
+  for (const entry of followups) {
+    if (entry.state === "valid" && entry.stance !== null) {
+      stances[entry.seat] = entry.stance;
+    }
+  }
+  return { followups, stances };
+}
+
+// The bytes of followups.json: each valid follow-up answer in ordinal order as `{ seat,
+// findingId, question, answer, at }`, and their digest.
+function followupsBytes(runDir, snapshot) {
+  const list = followupEntries(runDir, snapshot)
+    .filter((entry) => entry.state === "valid")
+    .map((entry) => ({ seat: entry.seat, findingId: entry.findingId, question: entry.question, answer: entry.answer, at: entry.at }));
+  const text = `${JSON.stringify(list, null, 2)}\n`;
+  return { text, sha256: createHash("sha256").update(text).digest("hex") };
+}
+
+// Publishes followups.json from the current snapshot while a fresh snapshot gives the same bytes.
+function publishFollowups(store, runDir, runId) {
+  const { text } = followupsBytes(runDir, readCouncil(store, runId));
+  const sha256 = installObject(runDir, text, "json");
+  return { sha256, published: publishExport(runDir, "followups.json", sha256, () => followupsBytes(runDir, readCouncil(store, runId)).sha256) };
 }
 
 function requireRun(store, runId) {
@@ -1978,14 +2714,17 @@ async function mergeCouncilCommand(options, positionals, ctx) {
     if (!round2 || round2.closed_at === null || round2.quorum !== 1) {
       throw new CouncilRefusal("round-2-not-closed", "Round 2 has not closed with a quorum; run council collect --round 2 first.");
     }
-    const merge = mergeCouncil(mergeInput(runDir, snapshot));
+    const merge = mergeCouncil(mergeInput(runDir, snapshot, { extensions: ctx.extensions }));
     const mergeSha256 = installObject(runDir, serializeMerge(merge), "json");
     const recorded = await recordMerge(store, { runId, mergeSha256, inputRev: snapshot.run.input_rev, deadline });
     if (!recorded.ok) {
       throw new CouncilRefusal("stale-input", "The council changed while merging; run council merge again.");
     }
     publishExport(runDir, "merge.json", mergeSha256, () => readCouncil(store, runId)?.run.merge_sha256 ?? null);
-    emit(ctx.io, options.json, { runId, mergeSha256, inputRev: snapshot.run.input_rev, merge }, clusterTable(merge));
+    if (ctx.extensions?.followups && snapshot.ext.turns.some((turn) => turn.kind === "followup")) {
+      publishFollowups(store, runDir, runId);
+    }
+    emit(ctx.io, options.json, { runId, mergeSha256, inputRev: snapshot.run.input_rev, unanimous: panelUnanimous(runDir, snapshot), merge }, clusterTable(merge));
     return 0;
   } finally {
     store.close();
@@ -2000,6 +2739,26 @@ export function briefClaims(briefText) {
 /** The verdict target of a merge cluster: its sorted finding ids, which no later merge renames. */
 export function clusterTarget(cluster) {
   return [...cluster.findings].sort().join(",");
+}
+
+/**
+ * Whether the panel of a successful council agreed (see `unanimousPanel`), from the base
+ * accepted answers of one snapshot; false before Round 2 closed with quorum, for a failed run, or
+ * when an answer object is missing or damaged.
+ */
+export function panelUnanimous(runDir, snapshot) {
+  const round2 = snapshot.rounds.find((row) => row.round === 2);
+  if (snapshot.run.failed_at !== null || !round2 || round2.closed_at === null || round2.quorum !== 1) {
+    return false;
+  }
+  try {
+    return unanimousPanel(mergeInput(runDir, snapshot));
+  } catch (error) {
+    if (error instanceof ObjectDamagedError) {
+      return false;
+    }
+    throw error;
+  }
 }
 
 /** The current merge object of a snapshot (merge_rev = input_rev), or null. */
@@ -2097,12 +2856,13 @@ const EXPORTS = {
   report: { file: "report.md", ext: "md", digest: (snapshot) => snapshot.run.report_sha256 }
 };
 
-// `council export <run-id> brief|map|merge|report`: rebuilds one export from its committed object.
+// `council export <run-id> brief|map|merge|report|followups`: rebuilds one export from its committed
+// object (followups.json from the current snapshot).
 async function exportCouncil(options, positionals, ctx) {
   const deadline = performance.now() + BUDGET_MS.submit;
   const [runId, name] = positionals;
-  if (!runId || positionals.length !== 2 || !Object.hasOwn(EXPORTS, name)) {
-    throw new CouncilRefusal("invalid-arguments", "Usage: council export <run-id> brief|map|merge|report [--json]");
+  if (!runId || positionals.length !== 2 || (!Object.hasOwn(EXPORTS, name) && name !== "followups")) {
+    throw new CouncilRefusal("invalid-arguments", "Usage: council export <run-id> brief|map|merge|report|followups [--json]");
   }
   const stateDir = resolveStateDir(resolveCommandCwd(options));
   const runDir = runDirOf(stateDir, runId);
@@ -2110,6 +2870,19 @@ async function exportCouncil(options, positionals, ctx) {
   try {
     const spec = EXPORTS[name];
     const snapshot = requireRun(store, runId);
+    if (name === "followups") {
+      const { sha256, published } = publishFollowups(store, runDir, runId);
+      if (!published) {
+        throw new CouncilRefusal("stale-input", "The follow-ups changed while they were exported; run council export again.");
+      }
+      const file = path.join(runDir, "followups.json");
+      emit(ctx.io, options.json, { runId, name, file, sha256 }, file);
+      return 0;
+    }
+    const run = snapshot.run;
+    if (name === "report" && run.report_sha256 && (run.report_input_rev !== run.input_rev || run.report_verdict_rev !== run.verdict_rev)) {
+      throw new CouncilRefusal("report-stale", "The council changed while reporting; run council report again.");
+    }
     if (name === "merge" && snapshot.run.failed_at !== null) {
       const { sha256, published } = publishFailedInventory(store, runDir, runId);
       if (!published) {
@@ -2213,8 +2986,9 @@ export function checkObjects(runDir, snapshot) {
 
 /**
  * The single next step of the leader, first match wins: `damaged` (with the digest), `collect`
- * for a pending stop (its oldest round), `report-failure` and `done` for a failed run, `collect`
- * for an open round, `crossexam`, `merge`, `verify` (with the clusters needing a verdict at the
+ * for a pending stop (its oldest round; a follow-up stop is owned by round 2), `report-failure`
+ * and `done` for a failed run, `collect` for an open round, `crossexam`, `collect` round 2 for
+ * an open follow-up, `merge`, `verify` (with the clusters needing a verdict at the
  * current input revision), `report`, else `done`. Pure: `t` is the status clock and `objects` the
  * digest check made after the snapshot. Returns `{ action, round, deliveries, clusters, damaged }`.
  */
@@ -2226,8 +3000,10 @@ export function nextAction(snapshot, { t, objects, runDir = "" }) {
     return result("damaged");
   }
   const pending = snapshot.stops.filter((stop) => stop.acknowledged_at === null);
-  if (pending.length > 0) {
-    const rounds = pending.map((stop) => snapshot.attempts.find((row) => row.job_id === stop.job_id)?.round ?? 1);
+  // A follow-up's pending stop is owned by Round 2.
+  const extPending = pendingExtensionStops(snapshot.ext);
+  if (pending.length > 0 || extPending.length > 0) {
+    const rounds = [...pending.map((stop) => snapshot.attempts.find((row) => row.job_id === stop.job_id)?.round ?? 1), ...extPending.map(() => 2)];
     return result("collect", Math.min(...rounds));
   }
   const reportCurrent = run.report_sha256 !== null && run.report_input_rev === run.input_rev && run.report_verdict_rev === run.verdict_rev;
@@ -2242,6 +3018,9 @@ export function nextAction(snapshot, { t, objects, runDir = "" }) {
   const round2 = snapshot.rounds.find((row) => row.round === 2);
   if (round1.quorum === 1 && !round2) {
     return result("crossexam", 2);
+  }
+  if (followupsOpen(snapshot)) {
+    return result("collect", 2);
   }
   if (round2 && round2.quorum === 1 && (run.merge_rev !== run.input_rev || !objects.mergeExport)) {
     return result("merge", 2);
@@ -2304,7 +3083,8 @@ async function statusCouncil(options, positionals, ctx) {
       rounds: snapshot.rounds.map((row) => roundObject(snapshot, row.round, { layer: ctx.layer, extensions: ctx.extensions })),
       deliveries: [...next.deliveries, ...notices],
       clusters: next.clusters,
-      cleanupPending: snapshot.stops.some((stop) => stop.acknowledged_at === null),
+      cleanupPending: snapshot.stops.some((stop) => stop.acknowledged_at === null) || pendingExtensionStops(snapshot.ext).length > 0,
+      unanimous: next.action === "damaged" ? false : panelUnanimous(runDir, snapshot),
       ...(next.damaged ? { damaged: next.damaged } : {})
     };
     // While the open round waits for its stand-in decision, status names the seats a collect would
@@ -2315,6 +3095,10 @@ async function statusCouncil(options, positionals, ctx) {
     }
     const lines = [`Council ${runId}: ${next.action}${next.round ? ` (round ${next.round})` : ""}.`];
     for (const delivery of next.deliveries) {
+      if (delivery.kind === "followup") {
+        lines.push(`Follow-up prompt for ${delivery.seat} (to the agent of ${delivery.actor}): ${delivery.promptFile} (intent ${delivery.intentId}, reply by ${delivery.deadline}).`);
+        continue;
+      }
       const who = delivery.actor ? `${delivery.seat} (stand-in ${delivery.actor}, a fresh council-member agent unless it carries its own earlier answer)` : delivery.seat;
       lines.push(`Prompt for ${who}: ${delivery.promptFile} (intent ${delivery.intentId}, reply by ${delivery.deadline}).`);
     }
@@ -2322,7 +3106,7 @@ async function statusCouncil(options, positionals, ctx) {
       lines.push(`Seat ${candidate.seat} ended round ${next.round} ${candidate.state} (${candidate.reason}); a collect asks a Claude stand-in for its lens.`);
     }
     for (const notice of notices) {
-      lines.push(`Notice for ${notice.seat}: ${notice.text}`);
+      lines.push(`Notice for ${noticeTarget(notice)}: ${notice.text}`);
     }
     lines.push(ACTION_TEXT[next.action](next, runId));
     emit(ctx.io, options.json, payload, lines.join("\n"));
@@ -2431,6 +3215,9 @@ export function renderFailedReport(runDir, snapshot) {
 export function renderCouncilReport(runDir, snapshot, merge) {
   const verdictOf = (cluster) => verdictFor(snapshot, cluster);
   const lines = ["# Council report", "", runLine(snapshot), "", ...seatTable(snapshot), "", notValidLine(snapshot), "", ...lateDeposits(snapshot), "", "## Verdict", "", confidenceLine(merge)];
+  if (unanimousPanel(mergeInput(runDir, snapshot))) {
+    lines.push("", "Unanimous panel: the leader adds a counterargument.");
+  }
   const unresolved = merge.clusters.filter((cluster) => cluster.severity === "P1" && !["verified", "rejected"].includes(verdictOf(cluster)?.verdict));
   if (unresolved.length > 0) {
     lines.push("", `Unresolved P1 findings: ${unresolved.map((cluster) => `${cluster.id} (${verdictOf(cluster)?.verdict ?? "no verdict"})`).join(", ")}.`);
@@ -2469,12 +3256,28 @@ export function renderCouncilReport(runDir, snapshot, merge) {
       }
     }
   }
+  if ((merge.followups ?? []).length > 0) {
+    lines.push("", "## Follow-ups", "");
+    for (const entry of merge.followups) {
+      lines.push(`- ${entry.seat} on ${entry.findingId} (follow-up ${entry.ordinal}): ${cellText(entry.question)}`);
+      if (entry.state === "valid") {
+        lines.push(`  Answer: ${cellText(entry.answer)}`);
+        if (entry.stance !== null) {
+          lines.push(`  Stance: ${entry.stance}`);
+        }
+      } else {
+        lines.push(`  No answer: ${entry.state} (${entry.reason}).`);
+      }
+    }
+  }
   lines.push("", "## Minority positions", "");
   const minority = [];
   if (merge.decision) {
     const eligible = effectivePanel(snapshot, 2).filter((entry) => entry.valid);
+    // A valid follow-up stance replaces the seat's Round 2 stance.
+    const overrides = new Map((merge.followups ?? []).filter((entry) => entry.state === "valid" && entry.stance !== null).map((entry) => [entry.seat, entry.stance]));
     for (const row of eligible) {
-      const stance = readJsonObject(runDir, row.answerSha256).stance;
+      const stance = overrides.get(row.seat) ?? readJsonObject(runDir, row.answerSha256).stance;
       if (!merge.decision.choice || stance !== merge.decision.choice) {
         minority.push(`- ${row.seat}: ${stance ?? "no stance"}`);
       }
@@ -2501,7 +3304,15 @@ async function reportCouncil(options, positionals, ctx) {
   const runDir = runDirOf(stateDir, runId);
   const store = await commandStore(stateDir, deadline);
   try {
-    const snapshot = requireRun(store, runId);
+    let snapshot = requireRun(store, runId);
+    if (followupsOpen(snapshot)) {
+      // A follow-up past its deadline settles first; one still open withholds the report.
+      await reduceRun(store, { runId, round: 2, layer: ctx.layer, extensions: ctx.extensions, deadline });
+      snapshot = requireRun(store, runId);
+      if (followupsOpen(snapshot)) {
+        throw new CouncilRefusal("followup-open-report", "A council follow-up is open. Wait for it to finish.");
+      }
+    }
     let text;
     let outcome;
     let requiredTargets = [];
@@ -2533,7 +3344,10 @@ async function reportCouncil(options, positionals, ctx) {
       deadline
     });
     if (!recorded.ok) {
-      throw new CouncilRefusal("stale-input", "The council changed while reporting; run council report again.");
+      if (recorded.reason === "followup-open") {
+        throw new CouncilRefusal("followup-open-report", "A council follow-up is open. Wait for it to finish.");
+      }
+      throw new CouncilRefusal("report-stale", "The council changed while reporting; run council report again.");
     }
     publishExport(runDir, "report.md", reportSha256, () => readCouncil(store, runId)?.run.report_sha256 ?? null);
     const file = path.join(runDir, "report.md");
@@ -2554,7 +3368,7 @@ const SUBCOMMANDS = {
     run: (parsed, ctx) => collectCouncil(parsed.options, parsed.positionals, ctx)
   },
   submit: {
-    args: { valueOptions: ["intent", "file"] },
+    args: { valueOptions: ["intent", "file", "round"] },
     run: (parsed, ctx) => submitCouncil(parsed.options, parsed.positionals, ctx)
   },
   crossexam: {
@@ -2564,6 +3378,10 @@ const SUBCOMMANDS = {
   merge: {
     args: {},
     run: (parsed, ctx) => mergeCouncilCommand(parsed.options, parsed.positionals, ctx)
+  },
+  followup: {
+    args: { valueOptions: ["finding"], dashPositionals: true },
+    run: (parsed, ctx) => followupCouncil(parsed.options, parsed.positionals, ctx)
   },
   verdict: {
     args: { valueOptions: ["strongest"], dashPositionals: true },

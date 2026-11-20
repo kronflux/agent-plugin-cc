@@ -1,7 +1,7 @@
 // The pure extension rows of the council: the shared lifecycle of an extension turn (X1 to X4 for
-// a Claude turn; the provider rows X5 to X8 are left to the follow-up extension), the carry cutoff
-// (S3), the substitution decision and its batch (S1, S2), the closure gate (S4) and the effective
-// panel of a round. No I/O, clock or randomness: callers pass the rows and the council time.
+// a Claude turn, X5 to X8 for a provider follow-up), the carry cutoff (S3), the substitution
+// decision and its batch (S1, S2), the closure gate (S4), the effective panel of a round and the
+// limits of a follow-up. No I/O, clock or randomness: callers pass the rows and the council time.
 
 /** The terminal states of an extension turn. */
 export const EXT_FINAL_STATES = new Set(["valid", "invalid", "timed-out", "quota-exhausted", "error"]);
@@ -217,4 +217,131 @@ export function effectivePanel(snapshot, round) {
 /** The sorted quorum families of a panel: the families of its valid original actors. */
 export function quorumFamilies(panel, sort = (families) => [...families].sort()) {
   return sort([...new Set(panel.filter((entry) => entry.valid && entry.quorumFamily).map((entry) => entry.quorumFamily))]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Follow-ups (E1): the provider rows X5 to X8, the limits of an opening, and the read projections.
+
+/** How long a council-first stop, or a foreign cancellation, may stay unsettled. */
+export const EXT_STOP_BOUND_MS = 120000;
+
+/** The persisted reason of each extension stop code. */
+export const EXT_STOP_REASONS = Object.freeze({ queue: "queue deadline expired", deadline: "execution deadline expired" });
+
+/** The most follow-ups one seat, and one run, may open. */
+export const FOLLOWUP_SEAT_LIMIT = 2;
+export const FOLLOWUP_RUN_LIMIT = 6;
+
+// X5: the finish an admitted provider deposit gives (the B5 mapping).
+function depositOutcome(deposit, stop, ack) {
+  switch (deposit.code) {
+    case "valid":
+      return { state: "valid", reason: null };
+    case "invalid":
+      return { state: "invalid", reason: deposit.reason ?? "schema validation failed" };
+    case "late":
+      return { state: "timed-out", reason: deposit.reason };
+    case "quota":
+      return { state: "quota-exhausted", reason: "quota exhausted" };
+    case "missing":
+      return { state: "error", reason: "job pruned or missing" };
+    case "cancelled":
+      return stop && ack?.code === "council" ? { state: "timed-out", reason: EXT_STOP_REASONS[stop.code] } : { state: "error", reason: "external cancellation" };
+    default:
+      return { state: "error", reason: deposit.reason ?? "provider failure" };
+  }
+}
+
+// The raw queue or execution bound of an unended exact job: the queue bound while its claim is
+// absent or late, else the execution bound from its claim.
+function jobBound(job, timeoutMs) {
+  const queueBy = job.created_at + timeoutMs;
+  const timelyClaim = job.claimed_at !== null && job.claimed_at !== undefined && job.claimed_at < queueBy;
+  return timelyClaim ? { due: job.claimed_at + timeoutMs, code: "deadline" } : { due: queueBy, code: "queue" };
+}
+
+/**
+ * The lifecycle of the run's follow-up turns, in `(created_at, id)` order: X1 to X4 (a reserved
+ * turn, and an issued Claude turn, as `lifecycleWrites`), then for an issued provider turn X5 (its
+ * admitted deposit finishes it by the B5 mapping), X6 (an unended exact job with no stop and no
+ * cancellation whose raw queue or execution bound `w` reached gets a stop), X7 (a council-first
+ * acknowledged stop of a still-unended job settles `timed-out` with the stop's cause once `t`
+ * reaches the acknowledgement plus 120 s) and X8 (a foreign cancellation of a still-unended job
+ * settles `error` once `w` reaches the cancellation request plus 120 s). An ended job without a
+ * deposit, and a missing job, await their observation. `jobs` maps a job id to its exact row.
+ * Returns `ext-finish` writes and `{ op: "ext-stop", turnId, seat, jobId, code }` writes.
+ */
+export function followupWrites(turns, events, { t, w, timeoutMs, jobs = {} }) {
+  const followups = [...(turns ?? [])].filter((turn) => turn.kind === "followup").sort(byCreation);
+  const writes = lifecycleWrites(followups, events, { t });
+  const byTurn = eventsByTurn(events);
+  const finish = (turn, outcome) =>
+    writes.push({ op: "ext-finish", turnId: turn.id, seat: turn.seat, round: null, kind: "followup", state: outcome.state, reason: outcome.reason });
+  for (const turn of followups) {
+    const { issue, deposit, stop, ack, finish: finished } = byTurn.get(turn.id) ?? {};
+    if (finished || !issue || issue.job_id === null || issue.job_id === undefined) {
+      continue;
+    }
+    if (deposit && deposit.after_close === 0) {
+      finish(turn, depositOutcome(deposit, stop, ack));
+      continue;
+    }
+    const job = jobs[issue.job_id] ?? null;
+    if (!job || job.end_state !== null) {
+      continue;
+    }
+    if (!stop && job.cancel_requested_at === null) {
+      const bound = jobBound(job, timeoutMs);
+      if (w >= bound.due) {
+        writes.push({ op: "ext-stop", turnId: turn.id, seat: turn.seat, jobId: issue.job_id, code: bound.code });
+      }
+      continue;
+    }
+    if (stop && ack?.code === "council") {
+      if (t >= ack.at + EXT_STOP_BOUND_MS) {
+        finish(turn, { state: "timed-out", reason: EXT_STOP_REASONS[stop.code] });
+      }
+      continue;
+    }
+    if (job.cancel_requested_at !== null && w >= job.cancel_requested_at + EXT_STOP_BOUND_MS) {
+      finish(turn, { state: "error", reason: "external cancellation did not settle" });
+    }
+  }
+  return writes;
+}
+
+/** Whether a follow-up turn has no finish yet (reserved or issued). */
+export function followupOpen(turn, byTurn) {
+  return turn.kind === "followup" && !byTurn.get(turn.id)?.finish;
+}
+
+/** The extension stops still waiting for their acknowledgement: `{ turnId, seat, jobId }`. */
+export function pendingExtensionStops(ext) {
+  const byTurn = eventsByTurn(ext?.events ?? []);
+  return (ext?.turns ?? [])
+    .filter((turn) => {
+      const events = byTurn.get(turn.id) ?? {};
+      return events.stop && !events.ack && events.issue?.job_id;
+    })
+    .map((turn) => ({ turnId: turn.id, seat: turn.seat, jobId: byTurn.get(turn.id).issue.job_id }));
+}
+
+/**
+ * The limits an opening for `seat` would pass, as refusals in seat, run, cap order: every
+ * follow-up turn the seat (and the run) already opened counts, also one that failed or expired
+ * unissued, and the member-turn cap needs `used + live + 1 <= cap`. Returns `[]` or
+ * `[{ error, message }]`; the first entry's code is the refusal and the messages join with a space.
+ */
+export function followupLimits({ seat, seatCount, runCount, used, live, cap }) {
+  const limits = [];
+  if (seatCount >= FOLLOWUP_SEAT_LIMIT) {
+    limits.push({ error: "seat-followup-limit", message: `Seat ${seat} has reached the limit of two follow-ups.` });
+  }
+  if (runCount >= FOLLOWUP_RUN_LIMIT) {
+    limits.push({ error: "run-followup-limit", message: "The run has reached the limit of six follow-ups." });
+  }
+  if (used + live + 1 > cap) {
+    limits.push({ error: "member-turn-limit", message: `The run has reached its cap of ${cap} member turns.` });
+  }
+  return limits;
 }

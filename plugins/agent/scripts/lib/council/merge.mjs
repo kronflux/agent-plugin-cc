@@ -111,14 +111,14 @@ function clusterSeverity(members) {
   return levels.length > 1 ? levels[1] : levels[0];
 }
 
-function decide(kind, options, eligible, round2) {
+function decide(kind, options, eligible, round2, overrides = {}) {
   if (kind !== "decision") {
     return null;
   }
   const counts = new Map();
   const stances = [];
   for (const { seat } of eligible) {
-    const stance = round2[seat]?.stance;
+    const stance = Object.hasOwn(overrides, seat) ? overrides[seat] : round2[seat]?.stance;
     const counted = typeof stance === "string" && options.includes(stance) ? stance : null;
     stances.push(counted);
     if (counted !== null) {
@@ -145,8 +145,10 @@ function decide(kind, options, eligible, round2) {
 // family, which authors, validates and challenges for it), `quorumFamily` (null when its Round 2
 // answer is a stand-in's) and `round2Key` (the actor key of a fresh Round 2 stand-in, which keys
 // the findings it adds). A response never validates a finding of its own logical seat.
-// `substitutions`, when not empty, is passed through to the output.
-export function mergeCouncil({ runId, kind, options = [], seats, round1 = {}, round2 = {}, anonymisation = {}, turns = {}, substitutions = [] }) {
+// `substitutions`, when not empty, is passed through to the output. `followups`, when not empty,
+// is passed through too; `stances` maps a seat to the stance a valid follow-up answer gave it,
+// which replaces its Round 2 stance in the decision.
+export function mergeCouncil({ runId, kind, options = [], seats, round1 = {}, round2 = {}, anonymisation = {}, turns = {}, substitutions = [], followups = [], stances = {} }) {
   const familyOf = new Map(seats.map((entry) => [entry.seat, authorFamily(entry, 2)]));
   const findings = collectFindings(seats, round1, round2);
   const eligible = seats.filter(({ seat }) => round1[seat] && round2[seat]);
@@ -240,7 +242,7 @@ export function mergeCouncil({ runId, kind, options = [], seats, round1 = {}, ro
       validSeats: eligible.length,
       families: sortFamilies(eligible.map((entry) => (entry.quorumFamily === undefined ? entry.family : entry.quorumFamily)).filter((family) => family !== null))
     },
-    decision: decide(kind, options, eligible, round2),
+    decision: decide(kind, options, eligible, round2, stances),
     clusters: clusters.map((entry) => entry.cluster),
     memberTurns: {
       used: turns.used ?? 0,
@@ -248,12 +250,51 @@ export function mergeCouncil({ runId, kind, options = [], seats, round1 = {}, ro
       repairs: turns.repairs ?? 0,
       retries: turns.retries ?? 0
     },
-    ...(substitutions.length > 0 ? { substitutions } : {})
+    ...(substitutions.length > 0 ? { substitutions } : {}),
+    ...(followups.length > 0 ? { followups } : {})
   };
 }
 
+/**
+ * Whether every seat agreed, from the base accepted answers (the merge inputs `round1`, `round2`
+ * and `anonymisation`; follow-up stances never count): every seat with a valid Round 1 answer has
+ * a valid Round 2 answer, every Round 2 response is `validate` and no Round 2 answer adds a
+ * finding, every Round 1 finding is validated by a different seat, and on a decision every seat
+ * gives the same non-null stance. A panel whose Round 1 has no findings qualifies.
+ */
+export function unanimousPanel({ kind, round1 = {}, round2 = {}, anonymisation = {} }) {
+  const seats = Object.keys(round1);
+  if (seats.length === 0 || seats.some((seat) => !round2[seat])) {
+    return false;
+  }
+  const validated = new Set();
+  for (const [responder, answer] of Object.entries(round2)) {
+    if ((answer.added ?? []).length > 0) {
+      return false;
+    }
+    for (const entry of answer.responses ?? []) {
+      if (entry.response !== "validate") {
+        return false;
+      }
+      const match = REF_PATTERN.exec(entry.finding ?? "");
+      const author = match ? anonymisation[responder]?.[match[1]] : null;
+      if (author && author !== responder) {
+        validated.add(`${author}-${match[2]}`);
+      }
+    }
+  }
+  if (seats.some((seat) => (round1[seat].findings ?? []).some((finding) => !validated.has(`${seat}-${finding.id}`)))) {
+    return false;
+  }
+  if (kind === "decision") {
+    const stances = seats.map((seat) => round2[seat].stance ?? null);
+    return stances[0] !== null && stances.every((stance) => stance === stances[0]);
+  }
+  return true;
+}
+
 const KEY_ORDER = {
-  merge: ["schema", "runId", "quorum", "decision", "clusters", "memberTurns", "substitutions"],
+  merge: ["schema", "runId", "quorum", "decision", "clusters", "memberTurns", "substitutions", "followups"],
   quorum: ["validSeats", "families"],
   decision: ["choice", "tally", "threshold", "confidence"],
   cluster: ["id", "severity", "severityRange", "label", "path", "line", "claim", "findings", "reportedBy", "validatedBy", "challenges"],

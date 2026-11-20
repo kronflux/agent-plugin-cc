@@ -684,7 +684,8 @@ claims the job (`claimed_at`). A seat past its limit gets one exact stop request
 round is sealed: `quorumAt` is that moment and `cutoffAt` is five minutes later, and neither moves
 afterwards. Each seat still working is told once that the other seats have answered and that it has
 five minutes to give its answer in the required JSON form. The leader passes this notice to the
-Claude seat's agent; a Codex seat with a running turn gets it as a message in that turn. A seat whose
+Claude seat's agent, and to the agent of a carried Claude stand-in (the notice then names its
+`actor`); a Codex seat with a running turn gets it as a message in that turn. A seat whose
 job has not started, and an Antigravity seat (which takes a message only by starting a new job), get
 no notice. The notice is not a prompt and needs no reply of its own, and a notice that cannot be
 sent is reported as a diagnostic. An answer that arrives before the cutoff counts as usual. At the
@@ -715,8 +716,8 @@ as `substitute (same family as leader)`. The member-turn cap stays two turns per
 `collect`, `crossexam`, `merge`, `verify`, `report`, `report-failure`, `damaged` or `done`, with
 the prompts to deliver (`deliveries`, each with its prompt file and intent id) and any cutoff notice
 for the Claude seat (a delivery with `kind` `notice`, the seat and the text), which is handed once.
-Claude's replies go back with `council submit <run-id> <seat> --intent <intent-id> --file
-<reply.json>`; a reply that arrives after its deadline or after the cutoff is refused. `council
+Claude's replies go back with `council submit <run-id> <seat> --intent <intent-id> [--round N]
+--file <reply.json>`; with `--round`, an intent of another round is refused, and a reply that arrives after its deadline or after the cutoff is refused. `council
 collect <run-id> --round N` runs in the background and returns when the round closes, a new prompt
 or a cutoff notice is ready, or its 9-minute budget ends. A closed round returns its stored result
 at once (`Round N closed with quorum.`, or the no-quorum text), after a short separate cleanup of
@@ -728,11 +729,36 @@ pending stop requests; `cleanupPending` says whether some are still outstanding.
 records your check; the report needs a verdict on every P1, consensus and cross-validated cluster.
 `council report` writes `report.md`. At most three councils run in a row on one subject.
 
+**Follow-up questions.** After Round 2 closed with a quorum and the merge is current, `council
+followup <run-id> <seat> --finding <cluster-id|stance> [--] <question>` asks one seat one question
+about one merged finding, or about its stance on a decision. A Codex or Antigravity seat answers by
+continuing the job that gave its accepted Round 2 answer, and `council collect <run-id> --round 2`
+collects the answer; a failed or cancelled job is not continued, so that seat takes no further
+follow-up. The Claude seat, or a Claude stand-in, gets a prompt among the deliveries (`kind`
+`followup`, with its `actor`), and its reply goes back with `council submit`. The answer is JSON
+`{ "answer": "...", "stance": null }`; on a decision a valid `stance` replaces that seat's vote in
+the next merge, and a `stance` on a review is invalid. Each seat answers at most two follow-ups and
+the run at most six, within the member-turn cap; a follow-up that fails or runs out of time still
+counts. A follow-up gets the run's time limit, and a job past it gets one exact stop request. A
+finished follow-up changes the council's inputs: run `council merge` again, record the verdicts
+again, and run `council report` again. While a follow-up is open, `council report` refuses with
+`A council follow-up is open. Wait for it to finish.` The merge lists the follow-ups under
+`followups`, the report lists each question and answer under `## Follow-ups`, and `merge` and
+`council export <run-id> followups` write `followups.json` with the valid answers.
+
+**Counterargument.** `council status` and `council merge` show `unanimous: true` when every seat
+agreed: every seat validated every other seat's findings, no seat challenged, skipped or added a
+finding, and on a decision every seat chose the same option. The skill then writes the strongest
+counterargument itself, checks it against the code, and states it with its assessment under
+`Counterargument (leader)` when it presents the report; the report says `Unanimous panel: the
+leader adds a counterargument.` The counterargument is not a finding and is not merged.
+
 **State.** A council's coordination state is in the job store's council tables; its brief,
 prompts, answers, map, merge and report are files named by their SHA-256 digest under
 `council/<run-id>/objects/` in the state folder, beside the exports `brief.md`, `merge.json`,
-`report.md` and `private/anonymisation.json`. `council export <run-id> brief|map|merge|report`
-rebuilds an export from its stored object. `store recover` archives the council rows with the
+`report.md`, `followups.json` and `private/anonymisation.json`. `council export <run-id>
+brief|map|merge|report|followups` rebuilds an export from its stored object (`followups.json` from
+the current answers). `store recover` archives the council rows with the
 rest of the store; the files stay readable, but that council cannot be continued. A council works
 in any folder, git repository or not.
 

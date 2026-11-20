@@ -971,7 +971,7 @@ test("the council skill and the council-member agent", () => {
   assert.match(skill.description, /Antigravity/);
   assert.match(skill.description, /Claude subagent/);
   const body = fs.readFileSync(skillFile, "utf8");
-  for (const text of ["council status", "--intent", "run_in_background", "SendMessage", "at most three", "no vote"]) {
+  for (const text of ["council status", "--intent", "run_in_background", "SendMessage", "at most three", "no vote", "council followup", "--finding stance", "followup-open-report", "unanimous", "Counterargument (leader)"]) {
     assert.ok(body.includes(text), `the council skill names ${text}`);
   }
   for (const action of ["collect", "crossexam", "merge", "verify", "report", "report-failure", "damaged", "done"]) {

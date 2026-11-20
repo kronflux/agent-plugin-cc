@@ -4,7 +4,7 @@ import { randomBytes } from "node:crypto";
 
 import { wallNow, withRetry } from "../store.mjs";
 import { reduceRound } from "./reduce.mjs";
-import { turnActor } from "./reduce-ext.mjs";
+import { followupLimits, followupWrites, turnActor } from "./reduce-ext.mjs";
 
 /**
  * The collection layer this release ships: 0 is one attempt per seat, 1 adds repair, retry and
@@ -19,7 +19,7 @@ export const COUNCIL_LAYER = 2;
  * object once and pass it as `extensions`; a disabled extension takes no new request, while the
  * reducer, the read projections and submit still settle extension work already committed.
  */
-export const COUNCIL_EXTENSIONS = Object.freeze({ followups: false, substitution: true, challenge: false });
+export const COUNCIL_EXTENSIONS = Object.freeze({ followups: true, substitution: true, challenge: false });
 
 /** How long a selected stop dispatch, or a foreign cancellation, may stay unsettled. */
 export const STOP_BOUND_MS = 120000;
@@ -723,6 +723,276 @@ export function stopHook({ jobId } = {}) {
   };
 }
 
+/**
+ * Thrown by the extension stop hook when W3 left an eligible exact job out of the selection; the
+ * stop request rolls back and the stop stays pending.
+ */
+export class CouncilStopSelectionError extends Error {
+  constructor() {
+    super("Exact stop selection omitted an eligible job.");
+    this.name = "CouncilStopSelectionError";
+  }
+}
+
+// An extension turn with its run clock and its events by kind, read in the caller's transaction.
+function extensionTurnContext(db, turnId) {
+  const turn = plain(
+    db
+      .prepare("SELECT x.*, ru.clock AS run_clock, ru.timeout_ms AS run_timeout_ms FROM council_ext_turns AS x JOIN council_runs AS ru ON ru.id = x.run_id WHERE x.id = ?")
+      .get(turnId)
+  );
+  if (!turn) {
+    return null;
+  }
+  const events = {};
+  for (const event of db.prepare("SELECT * FROM council_ext_events WHERE turn_id = ?").all(turnId)) {
+    events[event.kind] = plain(event);
+  }
+  return { turn, events };
+}
+
+// Whether a reserved extension turn may still be issued or refused at `t`.
+function extensionIssuable(context, t) {
+  const { turn, events } = context;
+  return !events.issue && !events.refusal && !events.finish && t < turn.issue_by;
+}
+
+/**
+ * The `withinDecision` hook of a provider follow-up's continuation of `predecessorId` for the
+ * reserved turn `intentId`. On a win it checks the reservation (no issue, refusal or finish,
+ * before `issue_by`), the exact predecessor and tip, the successor's predecessor, the release of
+ * the predecessor's execution (else `release-wait`) and, on an unforced call, that no force is now
+ * needed (else `force-required`); then it records the issue with the successor's job id and, on a
+ * forced call, COL's force JSON in `code`. On a loss to a successor it records the refusal
+ * `foreign successor <jobId>` while the turn is still issuable.
+ */
+export function extensionDecisionHook({ intentId, predecessorId, force = false, reasons = [] } = {}) {
+  return (db, { won, successorId, tipId }) => {
+    const context = extensionTurnContext(db, intentId);
+    if (!won) {
+      if (!successorId || !context) {
+        return;
+      }
+      const { t } = sampleTimes(context.turn.run_clock);
+      if (extensionIssuable(context, t)) {
+        db.prepare("INSERT INTO council_ext_events (turn_id, kind, at, reason) VALUES (?, 'refusal', ?, ?)").run(intentId, t, `foreign successor ${successorId}`);
+        writeClock(db, context.turn.run_id, t);
+      }
+      return;
+    }
+    if (!context) {
+      throw new CouncilFenceError("stale-attempt");
+    }
+    const { t } = sampleTimes(context.turn.run_clock);
+    if (context.turn.predecessor_id !== predecessorId || tipId !== predecessorId || !extensionIssuable(context, t)) {
+      throw new CouncilFenceError("stale-attempt");
+    }
+    const successor = db.prepare("SELECT continues FROM jobs WHERE id = ?").get(successorId);
+    const predecessor = plain(db.prepare("SELECT * FROM jobs WHERE id = ?").get(predecessorId));
+    if (!successor || successor.continues !== predecessorId || !predecessor) {
+      throw new CouncilFenceError("stale-attempt");
+    }
+    if (predecessor.claimed_at !== null && predecessor.exec_released_at === null) {
+      throw new CouncilFenceError("release-wait");
+    }
+    const evidence = forceEvidence(db, predecessor);
+    let forceReason = null;
+    if (!force) {
+      if (evidence.length > 0) {
+        throw new CouncilFenceError("force-required", { reasons: evidence });
+      }
+    } else {
+      const combined = orderedReasons([...reasons, ...evidence]);
+      forceReason = combined.length > 0 ? JSON.stringify({ predecessorId, reasons: combined }) : null;
+    }
+    db.prepare("INSERT INTO council_ext_events (turn_id, kind, at, job_id, code) VALUES (?, 'issue', ?, ?, ?)").run(intentId, t, successorId, forceReason);
+    writeClock(db, context.turn.run_id, t);
+  };
+}
+
+/**
+ * The `withinStop` hook of the exact stop request for an extension turn's job (P3): when the
+ * request selected `jobId` and the turn's stop is still unacknowledged, it records the
+ * acknowledgement, `council` when the job had no earlier cancel request and had not ended, else
+ * `foreign`, with `event_at` the commit wall time and `at` the council time. With the job not
+ * selected it records `ineligible` when the job is absent or no longer selectable, and throws
+ * CouncilStopSelectionError (rolling the request back) when an eligible job was left out.
+ */
+export function extensionStopHook({ intentId, jobId } = {}) {
+  return (db, { commitWall, selection }) => {
+    const context = extensionTurnContext(db, intentId);
+    if (!context || !context.events.stop || context.events.ack) {
+      return;
+    }
+    const t = Math.max(context.turn.run_clock, commitWall);
+    const entry = (selection ?? []).find((item) => item.jobId === jobId);
+    if (entry) {
+      const code = !entry.hadCancelRequest && !entry.wasEnded ? "council" : "foreign";
+      db.prepare("INSERT INTO council_ext_events (turn_id, kind, at, event_at, code) VALUES (?, 'ack', ?, ?, ?)").run(intentId, t, commitWall, code);
+    } else {
+      if (stopEligible(db, plain(db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId)))) {
+        throw new CouncilStopSelectionError();
+      }
+      db.prepare("INSERT INTO council_ext_events (turn_id, kind, at, code) VALUES (?, 'ack', ?, 'ineligible')").run(intentId, t);
+    }
+    writeClock(db, context.turn.run_id, t);
+  };
+}
+
+/**
+ * Records the exact refusal of a reserved extension turn (no issue, refusal or finish yet, before
+ * its `issue_by`); the reducer settles it (X1). Resolves to `{ ok: true }` or
+ * `{ ok: false, reason: "stale-turn" }`.
+ */
+export async function depositExtensionRefusal(store, { intentId, reason, deadline } = {}) {
+  if (typeof reason !== "string" || reason === "") {
+    throw new TypeError("A council extension refusal needs a reason.");
+  }
+  return transact(store, deadline, (db) => {
+    const context = extensionTurnContext(db, intentId);
+    if (!context) {
+      return { ok: false, reason: "stale-turn" };
+    }
+    const { t } = sampleTimes(context.turn.run_clock);
+    if (!extensionIssuable(context, t)) {
+      return { ok: false, reason: "stale-turn" };
+    }
+    db.prepare("INSERT INTO council_ext_events (turn_id, kind, at, reason) VALUES (?, 'refusal', ?, ?)").run(intentId, t, reason);
+    writeClock(db, context.turn.run_id, t);
+    return { ok: true };
+  });
+}
+
+/**
+ * Records the classified outcome of the exact job issued for a provider extension turn as its
+ * deposit, also after the turn finished (then `after_close` is 1 and the deposit is historical).
+ * Checks the binding, then an earlier deposit. `verdict` is `{ outcome, eventAt, answerSha256,
+ * errorsSha256, reason }`, `outcome` one of `valid`, `invalid`, `late`, `cancelled`, `quota`,
+ * `failure`, `missing`; `eventAt` is the job's end time, unused for `missing`. Resolves to
+ * `{ ok: true }` or `{ ok: false, reason }` (`binding-mismatch`, `duplicate-observation`).
+ */
+export async function depositExtensionObservation(store, { intentId, jobId, verdict, deadline } = {}) {
+  if (!verdict || !OBSERVATION_OUTCOMES.has(verdict.outcome)) {
+    throw new TypeError("A council extension observation needs a known outcome.");
+  }
+  const valid = verdict.outcome === "valid";
+  if (valid ? !isDigest(verdict.answerSha256) : typeof verdict.reason !== "string" || verdict.reason === "") {
+    throw new TypeError("A council extension observation needs a valid answer digest or a reason.");
+  }
+  if (verdict.outcome !== "missing" && !Number.isInteger(verdict.eventAt)) {
+    throw new TypeError("A council extension observation needs the job's end time as eventAt.");
+  }
+  return transact(store, deadline, (db) => {
+    const context = extensionTurnContext(db, intentId);
+    if (!context || !context.events.issue || context.events.issue.job_id === null || context.events.issue.job_id !== jobId) {
+      return { ok: false, reason: "binding-mismatch" };
+    }
+    if (context.events.deposit) {
+      return { ok: false, reason: "duplicate-observation" };
+    }
+    const { t } = sampleTimes(context.turn.run_clock);
+    db.prepare("INSERT INTO council_ext_events (turn_id, kind, at, event_at, code, reason, digest, after_close) VALUES (?, 'deposit', ?, ?, ?, ?, ?, ?)").run(
+      intentId,
+      t,
+      verdict.outcome === "missing" ? null : verdict.eventAt,
+      verdict.outcome,
+      valid ? null : verdict.reason,
+      valid ? verdict.answerSha256 : (verdict.errorsSha256 ?? null),
+      context.events.finish ? 1 : 0
+    );
+    writeClock(db, context.turn.run_id, t);
+    return { ok: true };
+  });
+}
+
+// The counts an opening for `seat` is limited by, read in the caller's transaction: the
+// follow-ups the seat and the run opened, the member turns used (issued core turns and extension
+// issues) and the live follow-up reservations.
+function followupCounts(db, runId, seat) {
+  const turns = db.prepare("SELECT id, seat FROM council_ext_turns WHERE run_id = ? AND kind = 'followup'").all(runId);
+  const kinds = (turnId) => new Set(db.prepare("SELECT kind FROM council_ext_events WHERE turn_id = ?").all(turnId).map((row) => row.kind));
+  let live = 0;
+  let open = false;
+  for (const turn of turns) {
+    const events = kinds(turn.id);
+    if (!events.has("finish")) {
+      if (turn.seat === seat) {
+        open = true;
+      }
+      if (!events.has("issue")) {
+        live += 1;
+      }
+    }
+  }
+  const coreTurns = db.prepare("SELECT count(*) AS n FROM council_attempts WHERE run_id = ? AND charge = 'turn' AND issued_at IS NOT NULL").get(runId).n;
+  const extIssues = db
+    .prepare("SELECT count(*) AS n FROM council_ext_events AS e JOIN council_ext_turns AS x ON x.id = e.turn_id WHERE x.run_id = ? AND e.kind = 'issue'")
+    .get(runId).n;
+  return { open, seatCount: turns.filter((turn) => turn.seat === seat).length, runCount: turns.length, used: coreTurns + extIssues, live };
+}
+
+/**
+ * The counts that limit a follow-up for `seat` now, from one read: `{ open, seatCount, runCount,
+ * used, live, cap }`; null for an unknown run.
+ */
+export function readFollowupCounts(store, { runId, seat }, opts = {}) {
+  return store.read((db) => {
+    const run = db.prepare("SELECT turn_cap FROM council_runs WHERE id = ?").get(runId);
+    return run ? { ...followupCounts(db, runId, seat), cap: run.turn_cap } : null;
+  }, opts);
+}
+
+/**
+ * Opens a follow-up in one transaction, after the command's checks of seat, target and prepared
+ * prompt: deposits the request and records its result, allocates the next run ordinal and inserts
+ * the turn with `issue_by = t + T`; a Claude turn (`predecessorId` null) is issued, and charged,
+ * at once, a provider turn is a reservation on `predecessorId`. Checks again, in the refusal
+ * order, a successful closed Round 2, the merge token (`mergeSha256` is the run's merge and
+ * `merge_rev = input_rev = inputRev`), an open follow-up of the seat, then the limits. Resolves to
+ * `{ ok: true, ordinal, issueBy }` or `{ ok: false, reason, limits? }` (`unknown-run`,
+ * `round-2-not-successful`, `stale-merge`, `followup-open`, or a limit code with `limits`).
+ */
+export async function admitFollowup(store, { runId, seat, turnId, requestId, target, question, promptSha256, predecessorId = null, mergeSha256, inputRev, deadline } = {}) {
+  if (!ATTEMPT_ID.test(String(turnId)) || !ATTEMPT_ID.test(String(requestId)) || !isDigest(promptSha256) || !isDigest(mergeSha256)) {
+    throw new TypeError("A council follow-up needs a turn id, a request id, its prompt digest and the merge digest.");
+  }
+  return transact(store, deadline, (db) => {
+    const run = plain(db.prepare("SELECT * FROM council_runs WHERE id = ?").get(runId));
+    if (!run) {
+      return { ok: false, reason: "unknown-run" };
+    }
+    const round2 = db.prepare("SELECT * FROM council_rounds WHERE run_id = ? AND round = 2").get(runId);
+    if (run.failed_at !== null || !round2 || round2.closed_at === null || round2.quorum !== 1) {
+      return { ok: false, reason: "round-2-not-successful" };
+    }
+    if (run.merge_sha256 !== mergeSha256 || run.merge_rev !== inputRev || run.input_rev !== inputRev) {
+      return { ok: false, reason: "stale-merge" };
+    }
+    const counts = followupCounts(db, runId, seat);
+    if (counts.open) {
+      return { ok: false, reason: "followup-open" };
+    }
+    const limits = followupLimits({ seat, ...counts, cap: run.turn_cap });
+    if (limits.length > 0) {
+      return { ok: false, reason: limits[0].error, limits };
+    }
+    const { t } = sampleTimes(run.clock);
+    const ordinal = db.prepare("SELECT coalesce(max(ordinal), 0) + 1 AS n FROM council_ext_turns WHERE run_id = ?").get(runId).n;
+    const payload = { seat, target, question, turnId, promptSha256, mergeSha256, inputRev };
+    db.prepare("INSERT INTO council_ext_requests (id, run_id, kind, at, payload) VALUES (?, ?, 'followup', ?, ?)").run(requestId, runId, t, JSON.stringify(payload));
+    db.prepare(
+      `INSERT INTO council_ext_turns (id, run_id, seat, kind, ordinal, created_at, issue_by, prompt_sha256, predecessor_id, target, question, merge_sha256, input_rev)
+       VALUES (?, ?, ?, 'followup', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(turnId, runId, seat, ordinal, t, t + run.timeout_ms, promptSha256, predecessorId, target, question, mergeSha256, inputRev);
+    if (predecessorId === null) {
+      db.prepare("INSERT INTO council_ext_events (turn_id, kind, at) VALUES (?, 'issue', ?)").run(turnId, t);
+    }
+    db.prepare("UPDATE council_ext_requests SET result = ? WHERE id = ?").run(JSON.stringify({ turnId, ordinal }), requestId);
+    writeClock(db, runId, t);
+    return { ok: true, ordinal, issueBy: t + run.timeout_ms };
+  });
+}
+
 function entriesMatch(entries, mapSha256, validSeats) {
   if (!Array.isArray(entries) || entries.length !== validSeats.length) {
     return false;
@@ -1142,8 +1412,9 @@ export async function recordVerdict(
 /**
  * Records the report object `reportSha256` rendered at `inputRev` and `verdictRev`, while both
  * revisions are current: outcome `failed` needs a failed run; outcome `council` needs the merge at
- * `inputRev` and a verdict at `inputRev` for every cluster target in `requiredTargets`. Resolves
- * to `{ ok: true }` or `{ ok: false, reason }` (`unknown-run`, `stale`, `not-reportable`).
+ * `inputRev` and a verdict at `inputRev` for every cluster target in `requiredTargets`; no
+ * follow-up may be open. Resolves to `{ ok: true }` or `{ ok: false, reason }` (`unknown-run`,
+ * `stale`, `followup-open`, `not-reportable`).
  */
 export async function recordReport(store, { runId, reportSha256, outcome, inputRev, verdictRev, requiredTargets = [], deadline } = {}) {
   if (!isDigest(reportSha256) || (outcome !== "council" && outcome !== "failed")) {
@@ -1156,6 +1427,15 @@ export async function recordReport(store, { runId, reportSha256, outcome, inputR
     }
     if (run.input_rev !== inputRev || run.verdict_rev !== verdictRev) {
       return { ok: false, reason: "stale" };
+    }
+    const openFollowup = db
+      .prepare(
+        `SELECT 1 FROM council_ext_turns AS x WHERE x.run_id = ? AND x.kind = 'followup'
+           AND NOT EXISTS (SELECT 1 FROM council_ext_events WHERE turn_id = x.id AND kind = 'finish')`
+      )
+      .get(runId);
+    if (openFollowup) {
+      return { ok: false, reason: "followup-open" };
     }
     if (outcome === "failed" ? run.failed_at === null : run.merge_rev !== inputRev) {
       return { ok: false, reason: "not-reportable" };
@@ -1205,6 +1485,7 @@ export function peekRound(store, { runId, round, layer = 0, extensions = {}, con
  * then the substitution gate before B9. `extensions` is the shipped flags object; `consent` is
  * `"disallow"` for a collect that declines stand-ins, else null; `prepared` maps a candidate seat
  * to its installed stand-in prompt digest (a candidate without one holds the decision).
+ * Every reduction also applies X1 to X8 to the run's follow-up turns (`followupWrites`).
  */
 export async function reduceRun(store, { runId, round, layer = 0, extensions = {}, consent = null, prepared = {}, deadline } = {}) {
   const seatCount = 5;
@@ -1225,8 +1506,53 @@ export async function reduceRun(store, { runId, round, layer = 0, extensions = {
     for (const write of writes) {
       applyWrite(db, view, write, t);
     }
+    // The run's follow-up turns settle in every reduction, whatever its round.
+    const followups = readFollowupView(db, runId);
+    const extWrites = followupWrites(followups.turns, followups.events, { t, w, timeoutMs: run.timeout_ms, jobs: followups.jobs });
+    for (const write of extWrites) {
+      applyFollowupWrite(db, runId, write, t);
+    }
     writeClock(db, runId, t);
     const closed = roundRow.closed_at !== null || writes.some((write) => write.op === "close");
-    return { ok: true, changed: writes.length > 0, closed };
+    return { ok: true, changed: writes.length + extWrites.length > 0, closed };
   });
+}
+
+// The run's follow-up turns, their events and the exact rows of their issued jobs.
+function readFollowupView(db, runId) {
+  const turns = db.prepare("SELECT * FROM council_ext_turns WHERE run_id = ? AND kind = 'followup' ORDER BY created_at, id").all(runId).map(plain);
+  if (turns.length === 0) {
+    return { turns, events: [], jobs: {} };
+  }
+  const events = db
+    .prepare(
+      `SELECT e.* FROM council_ext_events AS e JOIN council_ext_turns AS x ON x.id = e.turn_id
+       WHERE x.run_id = ? AND x.kind = 'followup' ORDER BY x.created_at, x.id, e.at, e.kind`
+    )
+    .all(runId)
+    .map(plain);
+  const jobs = {};
+  for (const event of events) {
+    if (event.kind === "issue" && event.job_id) {
+      const job = db.prepare(EXACT_JOB_SQL).get({ exactJobId: event.job_id });
+      if (job) {
+        jobs[event.job_id] = plain(job);
+      }
+    }
+  }
+  return { turns, events, jobs };
+}
+
+// A follow-up write: a finish (every follow-up finish raises the input revision once) or a stop.
+function applyFollowupWrite(db, runId, write, t) {
+  if (write.op === "ext-finish") {
+    db.prepare("INSERT INTO council_ext_events (turn_id, kind, at, code, reason) VALUES (?, 'finish', ?, ?, ?)").run(write.turnId, t, write.state, write.reason);
+    db.prepare("UPDATE council_runs SET input_rev = input_rev + 1 WHERE id = ?").run(runId);
+    return;
+  }
+  if (write.op === "ext-stop") {
+    db.prepare("INSERT INTO council_ext_events (turn_id, kind, at, code) VALUES (?, 'stop', ?, ?)").run(write.turnId, t, write.code);
+    return;
+  }
+  throw new TypeError(`Unknown council follow-up write: ${write.op}`);
 }

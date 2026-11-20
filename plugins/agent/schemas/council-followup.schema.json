@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-plugin:schema:council-followup:1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "answer",
+    "stance"
+  ],
+  "properties": {
+    "answer": {
+      "type": "string",
+      "minLength": 1
+    },
+    "stance": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

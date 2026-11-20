@@ -86,10 +86,11 @@ export async function depositSubstitutionOptIn(store, { runId, round, deadline }
 }
 
 /**
- * Records the validated reply to an issued Claude extension turn (a stand-in or a carry) as its
- * deposit. Checks, in order, the run, the turn's identity (run, seat, the expected `round` when
- * given, an issued Claude turn), an earlier deposit, then the open turn (no finish, open round,
- * receipt time before `issue_by`, and for a carry before a sealed round's cutoff). The deposit
+ * Records the validated reply to an issued Claude extension turn (a stand-in, a carry or a
+ * follow-up, which is addressed as round 2) as its deposit. Checks, in order, the run, the turn's
+ * identity (run, seat, the expected `round` when given, an issued Claude turn), an earlier
+ * deposit, then the open turn (no finish, receipt time before `issue_by`; for a stand-in or carry
+ * an open round, and for a carry before a sealed round's cutoff). The deposit
  * stores `event_at = at = t`, the outcome and the answer (or errors) digest. `verdict` is
  * `{ outcome: "valid" | "invalid", answerSha256, errorsSha256, reason }`. Resolves to
  * `{ ok: true, round }` or `{ ok: false, reason, round? }` (`unknown-run`, `intent-not-open`,
@@ -111,20 +112,28 @@ export async function depositExtensionReceipt(store, { runId, seat, round = null
     if (!turn || turn.run_id !== runId) {
       return { ok: false, reason: "intent-not-open" };
     }
-    const turnRound = turn.round;
+    // A follow-up is addressed in Round 2, after that round closed.
+    const followup = turn.kind === "followup";
+    const turnRound = followup ? 2 : turn.round;
     const issue = db.prepare("SELECT * FROM council_ext_events WHERE turn_id = ? AND kind = 'issue'").get(intentId);
-    if (turn.seat !== seat || (round !== null && turnRound !== round) || turn.kind === "followup" || !issue || issue.job_id !== null) {
+    if (turn.seat !== seat || (round !== null && turnRound !== round) || !issue || issue.job_id !== null) {
       return { ok: false, reason: "intent-not-open", round: turnRound };
     }
     if (db.prepare("SELECT 1 FROM council_ext_events WHERE turn_id = ? AND kind = 'deposit'").get(intentId)) {
       return { ok: false, reason: "duplicate-receipt", round: turnRound };
     }
     const t = councilTime(run.clock);
-    const roundRow = db.prepare("SELECT closed_at, cutoff_at FROM council_rounds WHERE run_id = ? AND round = ?").get(runId, turnRound);
     const finished = db.prepare("SELECT 1 FROM council_ext_events WHERE turn_id = ? AND kind = 'finish'").get(intentId);
-    const cutOff = turn.kind === "carry" && roundRow.cutoff_at !== null && t >= roundRow.cutoff_at;
-    if (finished || roundRow.closed_at !== null || t >= turn.issue_by || cutOff) {
-      return { ok: false, reason: "intent-not-open", round: turnRound };
+    if (followup) {
+      if (finished || t >= turn.issue_by) {
+        return { ok: false, reason: "intent-not-open", round: turnRound };
+      }
+    } else {
+      const roundRow = db.prepare("SELECT closed_at, cutoff_at FROM council_rounds WHERE run_id = ? AND round = ?").get(runId, turnRound);
+      const cutOff = turn.kind === "carry" && roundRow.cutoff_at !== null && t >= roundRow.cutoff_at;
+      if (finished || roundRow.closed_at !== null || t >= turn.issue_by || cutOff) {
+        return { ok: false, reason: "intent-not-open", round: turnRound };
+      }
     }
     const valid = verdict.outcome === "valid";
     db.prepare("INSERT INTO council_ext_events (turn_id, kind, at, event_at, code, reason, digest) VALUES (?, 'deposit', ?, ?, ?, ?, ?)").run(

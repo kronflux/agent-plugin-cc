@@ -196,6 +196,39 @@ function checkRound2(answer, context, errors) {
   checkDecisionStance(answer, context, errors);
 }
 
+/**
+ * Checks a follow-up answer, the canonical `{ answer, stance? }` with no other key: `answer` a
+ * nonblank string, `stance` absent, null or a string; a non-null stance must name one of
+ * `options` on a decision and is refused on a review. Null normalizes to omission. Returns
+ * `{ ok: true, errors: [], answer }` with the normalized answer, or `{ ok: false, errors }`.
+ */
+export function validateFollowupAnswer(answer, { kind, options = [] } = {}) {
+  if (!answer || typeof answer !== "object" || Array.isArray(answer)) {
+    return { ok: false, errors: [`answer: expected an object, got ${describe(answer)}`] };
+  }
+  const errors = [];
+  for (const key of Object.keys(answer)) {
+    if (key !== "answer" && key !== "stance") {
+      errors.push(`${key}: is not an allowed property`);
+    }
+  }
+  if (typeof answer.answer !== "string" || !answer.answer.trim()) {
+    errors.push(`answer: must be a nonblank string, got ${describe(answer.answer)}`);
+  }
+  const stance = answer.stance ?? null;
+  if (stance !== null && typeof stance !== "string") {
+    errors.push(`stance: must be a string or null, got ${describe(stance)}`);
+  } else if (stance !== null && kind !== "decision") {
+    errors.push("stance: must be null on a review");
+  } else if (stance !== null && !options.includes(stance)) {
+    errors.push(`stance: must be one of ${options.map(describe).join(", ")}, got ${describe(stance)}`);
+  }
+  if (errors.length > 0) {
+    return { ok: false, errors };
+  }
+  return { ok: true, errors: [], answer: stance === null ? { answer: answer.answer } : { answer: answer.answer, stance } };
+}
+
 // ---------------------------------------------------------------------------------------------
 // Classification of an exact provider job, and the validation context of a seat's answer.
 
