@@ -63,7 +63,7 @@ const TARGETS = [
       },
       {
         label: "plugins[agent].version",
-        get: (json) => findMarketplacePlugin(json).version,
+        get: (json) => json.plugins?.find((entry) => entry?.name === "agent")?.version,
         set: (json, version) => {
           findMarketplacePlugin(json).version = version;
         }
@@ -99,7 +99,7 @@ function parseArgs(argv) {
       options.check = true;
     } else if (arg === "--root") {
       const root = argv[i + 1];
-      if (!root) {
+      if (!root || root.startsWith("-")) {
         throw new Error("--root requires a directory.");
       }
       options.root = root;
@@ -137,14 +137,30 @@ function findMarketplacePlugin(json) {
   return plugin;
 }
 
-function readJson(root, file) {
-  const filePath = path.join(root, file);
-  return JSON.parse(fs.readFileSync(filePath, "utf8"));
+// Returns the parsed file with the line ending and indent it uses, so a rewrite keeps both.
+function readManifest(root, file) {
+  const text = fs.readFileSync(path.join(root, file), "utf8");
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Cannot parse ${file}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  requireObject(json, file);
+  return {
+    json,
+    eol: text.includes("\r\n") ? "\r\n" : "\n",
+    indent: text.match(/^([ \t]+)"/m)?.[1] ?? "  "
+  };
 }
 
-function writeJson(root, file, json) {
-  const filePath = path.join(root, file);
-  fs.writeFileSync(filePath, `${JSON.stringify(json, null, 2)}\n`);
+function readJson(root, file) {
+  return readManifest(root, file).json;
+}
+
+function writeJson(root, file, { json, eol, indent }) {
+  const text = `${JSON.stringify(json, null, indent)}\n`;
+  fs.writeFileSync(path.join(root, file), eol === "\r\n" ? text.replace(/\n/g, "\r\n") : text);
 }
 
 function readPackageVersion(root) {
@@ -172,24 +188,31 @@ function checkVersions(root, expectedVersion) {
   return mismatches;
 }
 
+// Every target is read and updated in memory first, so a target that cannot be bumped, such
+// as one that is not a JSON object or has no version field, leaves all files unchanged.
 function bumpVersion(root, version) {
-  const changedFiles = [];
+  const pending = [];
 
   for (const target of TARGETS) {
-    const json = readJson(root, target.file);
-    const before = JSON.stringify(json);
+    const manifest = readManifest(root, target.file);
+    const before = JSON.stringify(manifest.json);
 
     for (const value of target.values) {
-      value.set(json, version);
+      if (typeof value.get(manifest.json) !== "string") {
+        throw new Error(`${target.file} has no ${value.label} to update.`);
+      }
+      value.set(manifest.json, version);
     }
 
-    if (JSON.stringify(json) !== before) {
-      writeJson(root, target.file, json);
-      changedFiles.push(target.file);
+    if (JSON.stringify(manifest.json) !== before) {
+      pending.push({ file: target.file, manifest });
     }
   }
 
-  return changedFiles;
+  for (const { file, manifest } of pending) {
+    writeJson(root, file, manifest);
+  }
+  return pending.map(({ file }) => file);
 }
 
 function main() {
