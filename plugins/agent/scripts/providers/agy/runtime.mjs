@@ -96,13 +96,21 @@ function shorten(text, limit = 96) {
   return normalized.length <= limit ? normalized : `${normalized.slice(0, limit - 3)}...`;
 }
 
+function isSuccess(result) {
+  return String(result?.status ?? "").toUpperCase() === "SUCCESS";
+}
+
 /**
- * Runs one agy process for `prompt` and resolves when every turn it started has its result.
- * Messages taken from `messageInbox` while a turn runs are written to the same process; each
- * starts a turn of its own, and the message counts as received when agy starts that turn.
+ * Runs one agy process for `prompt` and resolves when the process has exited and its output is
+ * read. Messages taken from `messageInbox` while a turn runs are written to the same process;
+ * each starts a turn of its own, and the message counts as received when agy starts that turn.
+ * `turnOutcomes` lists each turn's result status; the run fails when the prompt turn (the first)
+ * or the last turn did not succeed. `terminate` stops the process tree by id (default
+ * `terminateProcessTree`).
  */
 export function runAgyTurn(cwd, options = {}) {
   const env = options.env ?? process.env;
+  const terminate = options.terminate ?? terminateProcessTree;
   const timeoutMs = options.timeoutMs ?? readAgyTurnTimeoutMs(env);
   const args = buildAgyArgs({ ...options, timeoutMs });
   const plan = resolveCommand("agy", args, env);
@@ -136,6 +144,7 @@ export function runAgyTurn(cwd, options = {}) {
   return new Promise((resolve) => {
     let settled = false;
     let inboxTimer = null;
+    let exitTimer = null;
 
     const finish = () => {
       if (settled) {
@@ -143,26 +152,39 @@ export function runAgyTurn(cwd, options = {}) {
       }
       settled = true;
       clearTimeout(timer);
+      clearTimeout(exitTimer);
       clearInterval(inboxTimer);
       for (const message of state.awaitingTurn) {
         report(message.id, { status: "unconfirmed" });
       }
+      const first = state.results[0] ?? null;
       const last = state.results.at(-1) ?? null;
-      const succeeded = !state.error && last && String(last.status ?? "").toUpperCase() === "SUCCESS";
+      const failedTurn = [first, last].find((result) => result && !isSuccess(result)) ?? null;
+      const succeeded = !state.error && Boolean(last) && !failedTurn;
       resolve({
         status: succeeded ? 0 : 1,
         conversationId: state.conversationId ?? last?.conversation_id ?? null,
         turnId: `turn-${state.results.length || 1}`,
         finalMessage: state.turnTexts.filter(Boolean).join("\n\n") || (typeof last?.response === "string" ? last.response : ""),
         structuredOutput: last?.structured_output ?? null,
-        error: state.error ?? (last && !succeeded ? { message: `agy ended the turn with status ${last.status}.` } : null),
-        stderr: state.stderr.trim()
+        error: state.error ?? (failedTurn ? { message: `agy ended the turn with status ${failedTurn.status}.` } : null),
+        stderr: state.stderr.trim(),
+        turnOutcomes: state.results.map((result, index) => ({ turnId: `turn-${index + 1}`, status: String(result.status ?? "") }))
       });
+    };
+
+    // A failed stop must not end the worker; the process may already be gone.
+    const stopTree = () => {
+      try {
+        terminate(child.pid);
+      } catch {
+        // The turn already reports its own outcome.
+      }
     };
 
     const stop = (message) => {
       state.error ??= { message };
-      terminateProcessTree(child.pid);
+      stopTree();
       finish();
     };
 
@@ -174,9 +196,15 @@ export function runAgyTurn(cwd, options = {}) {
       state.stderr += chunk;
     });
     child.on("error", (error) => stop(`agy could not be started: ${error.message}`));
-    child.on("exit", (code) => {
+    // A write to an agy that has closed its input fails the turn instead of the worker.
+    child.stdin.on("error", (error) => {
+      state.error ??= { message: `agy closed its input: ${error.message}` };
+    });
+    // "close" comes after stdout has ended, so every line agy wrote has been read by then.
+    child.on("close", (code, signal) => {
       if (state.results.length < state.turnsStarted) {
-        state.error ??= { message: `agy exited with code ${code} before the turn finished.${state.stderr.trim() ? `\n${state.stderr.trim()}` : ""}` };
+        const ending = code === null && signal ? `was ended by ${signal}` : `exited with code ${code}`;
+        state.error ??= { message: `agy ${ending} before the turn finished.${state.stderr.trim() ? `\n${state.stderr.trim()}` : ""}` };
       }
       finish();
     });
@@ -247,12 +275,15 @@ export function runAgyTurn(cwd, options = {}) {
           state.results.push(result);
           state.turnTexts.push(state.turnText || String(result.response ?? "").trim());
           state.turnText = "";
+          // Text of a response that never reached DONE belongs to this turn only.
+          state.agentText = "";
           state.conversationId = result.conversation_id ?? state.conversationId;
-          emit(onProgress, `Turn ${String(result.status ?? "").toUpperCase() === "SUCCESS" ? "completed" : String(result.status ?? "ended").toLowerCase()}.`, { phase: "finalizing" });
+          emit(onProgress, `Turn ${isSuccess(result) ? "completed" : String(result.status ?? "ended").toLowerCase()}.`, { phase: "finalizing" });
           if (state.results.length >= state.turnsStarted) {
             child.stdin.end();
-            const exitTimer = setTimeout(() => {
-              terminateProcessTree(child.pid);
+            clearTimeout(exitTimer);
+            exitTimer = setTimeout(() => {
+              stopTree();
               finish();
             }, EXIT_WAIT_MS);
             exitTimer.unref?.();

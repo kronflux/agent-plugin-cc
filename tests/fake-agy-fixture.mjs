@@ -5,7 +5,21 @@ import { writeExecutable } from "./helpers.mjs";
 
 // A stand-in for the Antigravity CLI (agy 1.2.10). In stream-json print mode it answers each
 // stdin line with the init, step_update, and result events agy emits, one turn at a time, and
-// records every run in agy-state.json next to the script.
+// records every run in agy-state.json next to the script; `pids` lists the process id of every
+// print-mode process.
+//
+// Behaviours other than "ok":
+// - "slow" and "hang": each turn takes 3 s or 10 min.
+// - "two-messages": each turn writes two agent messages.
+// - "models-fail": `agy models` fails as when nobody is signed in.
+// - "exit-before-stdin": exits with code 2 before reading stdin.
+// - "result-then-exit": on the first line writes init, one agent message and a SUCCESS result
+//   with "early-exit-answer-7f3", then exits at once.
+// - "fail-first-turn": holds turn 1 until a second line arrives or 10 s pass, then ends turn 1
+//   with status ERROR and a response whose braces are not JSON; the second line gets a normal
+//   SUCCESS turn. With --json-schema (a review) turn 1 fails at once.
+// - "result-before-done": holds turn 1 the same way, then writes the text delta "partial-" and
+//   the result without a DONE agent step; later turns answer normally.
 export function installFakeAgy(binDir, behavior = "ok") {
   const statePath = path.join(binDir, "agy-state.json");
   const scriptPath = path.join(binDir, "agy");
@@ -17,6 +31,12 @@ const STATE_PATH = ${JSON.stringify(statePath)};
 const BEHAVIOR = ${JSON.stringify(behavior)};
 const args = process.argv.slice(2);
 
+const LOCK_PATH = STATE_PATH + ".lock";
+
+function pause(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 function loadState() {
   return fs.existsSync(STATE_PATH) ? JSON.parse(fs.readFileSync(STATE_PATH, "utf8")) : { runs: [], nextConversation: 1 };
 }
@@ -25,6 +45,33 @@ function saveState(state) {
   const temp = STATE_PATH + "." + process.pid + ".tmp";
   fs.writeFileSync(temp, JSON.stringify(state, null, 2));
   fs.renameSync(temp, STATE_PATH);
+}
+
+// Parallel fake agy processes share the state file. Each change is read, applied and written
+// while holding a lock file created exclusively ("wx"); after 5 s a waiting process goes ahead.
+function updateState(change) {
+  let locked = false;
+  for (let attempt = 0; attempt < 500 && !locked; attempt += 1) {
+    try {
+      fs.closeSync(fs.openSync(LOCK_PATH, "wx"));
+      locked = true;
+    } catch (error) {
+      if (error.code !== "EEXIST") {
+        break;
+      }
+      pause(10);
+    }
+  }
+  try {
+    const state = loadState();
+    const value = change(state);
+    saveState(state);
+    return value;
+  } finally {
+    if (locked) {
+      fs.rmSync(LOCK_PATH, { force: true });
+    }
+  }
 }
 
 function argValue(name) {
@@ -54,30 +101,65 @@ if (args[0] === "models") {
   process.exit(0);
 }
 
-const state = loadState();
-const conversationId = argValue("--conversation") || "conv-" + state.nextConversation++;
-const run = { args, conversationId, inputs: [], pid: process.pid };
-state.runs.push(run);
-saveState(state);
-const runIndex = state.runs.length - 1;
+const { conversationId, runIndex } = updateState((state) => {
+  const id = argValue("--conversation") || "conv-" + state.nextConversation++;
+  state.runs.push({ args, conversationId: id, inputs: [], pid: process.pid });
+  state.pids = [...(state.pids || []), process.pid];
+  return { conversationId: id, runIndex: state.runs.length - 1 };
+});
+
+if (BEHAVIOR === "exit-before-stdin") {
+  process.exit(2);
+}
+
+// Writes synchronously, so every event is out before an immediate process.exit.
+function emitNow(event) {
+  fs.writeSync(1, JSON.stringify(event) + "\\n");
+}
 
 function emit(event) {
   process.stdout.write(JSON.stringify(event) + "\\n");
 }
 
 function record(update) {
-  const current = loadState();
-  Object.assign(current.runs[runIndex], update);
-  saveState(current);
+  updateState((current) => {
+    Object.assign(current.runs[runIndex], update);
+  });
 }
 
-emit({ event: "init", conversation_id: conversationId, init: { cwd: process.cwd(), tools: [], permission_mode: "always-proceed" } });
+const initEvent = { event: "init", conversation_id: conversationId, init: { cwd: process.cwd(), tools: [], permission_mode: "always-proceed" } };
+if (BEHAVIOR !== "result-then-exit") {
+  emit(initEvent);
+}
 
+const HOLD_FIRST_TURN = BEHAVIOR === "fail-first-turn" || BEHAVIOR === "result-before-done";
 const queue = [];
 let busy = false;
 let inputClosed = false;
 let turns = 0;
 let step = 0;
+// Ends the held first turn; set while turn 1 waits for a second line.
+let releaseFirstTurn = null;
+
+function holdFirstTurn() {
+  const release = () => {
+    if (releaseFirstTurn !== release) {
+      return;
+    }
+    releaseFirstTurn = null;
+    clearTimeout(fallback);
+    if (BEHAVIOR === "fail-first-turn") {
+      emit({ event: "result", result: { conversation_id: conversationId, status: "ERROR", response: "Error: the model request failed {code: 7}", duration_seconds: 0.1, num_turns: turns } });
+    } else {
+      emit({ event: "step_update", step_update: { conversation_id: conversationId, step_index: step, state: "ACTIVE", step_type: "agent_response", text_delta: "partial-" } });
+      emit({ event: "result", result: { conversation_id: conversationId, status: "SUCCESS", response: "partial-", duration_seconds: 0.1, num_turns: turns } });
+    }
+    busy = false;
+    runNext();
+  };
+  const fallback = setTimeout(release, 10000);
+  releaseFirstTurn = release;
+}
 
 function runNext() {
   if (busy) {
@@ -93,6 +175,14 @@ function runNext() {
   busy = true;
   turns += 1;
   emit({ event: "step_update", step_update: { conversation_id: conversationId, step_index: step++, state: "DONE", step_type: "user_input" } });
+  if (HOLD_FIRST_TURN && turns === 1) {
+    holdFirstTurn();
+    // A review sends no second line, so its first turn fails at once.
+    if (BEHAVIOR === "fail-first-turn" && args.includes("--json-schema")) {
+      releaseFirstTurn();
+    }
+    return;
+  }
   const delay = BEHAVIOR === "slow" ? 3000 : BEHAVIOR === "hang" ? 600000 : 50;
   setTimeout(() => {
     const response = "reply: " + content;
@@ -117,10 +207,21 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   }
   const message = JSON.parse(line);
   const content = message && message.message ? message.message.content : "";
-  const current = loadState();
-  current.runs[runIndex].inputs.push(content);
-  saveState(current);
+  updateState((current) => {
+    current.runs[runIndex].inputs.push(content);
+  });
+  if (BEHAVIOR === "result-then-exit") {
+    const answer = "early-exit-answer-7f3";
+    emitNow(initEvent);
+    emitNow({ event: "step_update", step_update: { conversation_id: conversationId, step_index: 0, state: "DONE", step_type: "agent_response", text_delta: answer } });
+    emitNow({ event: "result", result: { conversation_id: conversationId, status: "SUCCESS", response: answer, duration_seconds: 0.1, num_turns: 1 } });
+    process.exit(0);
+  }
   queue.push(content);
+  if (releaseFirstTurn) {
+    releaseFirstTurn();
+    return;
+  }
   runNext();
 }).on("close", () => {
   inputClosed = true;

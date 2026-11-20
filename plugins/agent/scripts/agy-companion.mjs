@@ -143,15 +143,20 @@ async function handleSetup(argv) {
 }
 
 // The newest agy task of this Claude session that has a conversation, else of the repository.
+// A queued or running agy task of this session (of any session when none is set) blocks the
+// resume, including a queued one that has no conversation yet.
 function resolveLatestConversation(workspaceRoot) {
   const sessionId = process.env[SESSION_ID_ENV] ?? null;
-  const tasks = sortJobsNewestFirst(listJobs(workspaceRoot)).filter(
-    (job) => job.provider === agyProvider.id && job.jobClass === "task" && job.threadId
+  const agyTasks = sortJobsNewestFirst(listJobs(workspaceRoot)).filter(
+    (job) => job.provider === agyProvider.id && job.jobClass === "task"
   );
-  const active = tasks.find((job) => job.status === "queued" || job.status === "running");
+  const active = agyTasks.find(
+    (job) => (job.status === "queued" || job.status === "running") && (!sessionId || job.sessionId === sessionId)
+  );
   if (active) {
     throw new Error(`Task ${active.id} is still running. Use /agent:status before continuing it.`);
   }
+  const tasks = agyTasks.filter((job) => job.threadId);
   return (sessionId ? tasks.find((job) => job.sessionId === sessionId) : null) ?? tasks[0] ?? null;
 }
 
@@ -290,6 +295,9 @@ function parseReviewOutput(result) {
 }
 
 async function handleReview(argv) {
+  // --background and --wait are accepted because the command wrapper passes its arguments
+  // through; the wrapper decides background execution, and the review itself always runs in
+  // the foreground of this process.
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["base", "scope", "model", "effort", "cwd"],
     booleanOptions: ["json", "background", "wait"]
@@ -347,7 +355,11 @@ async function handleReview(argv) {
           ...(result.error ? { failureMessage: result.error.message } : {})
         },
         rendered: renderReviewResult(parsed, meta),
-        summary: parsed.parsed?.summary ?? parsed.parseError ?? "Antigravity review finished.",
+        // A failed run reports its own failure; a parse error only explains a successful run.
+        summary:
+          result.status !== 0
+            ? result.error?.message ?? parsed.parseError ?? "Antigravity review failed."
+            : parsed.parsed?.summary ?? parsed.parseError ?? "Antigravity review finished.",
         jobTitle: "Antigravity Review",
         jobClass: "review",
         targetLabel: context.target.label
