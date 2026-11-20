@@ -81,7 +81,7 @@ export async function reconcileJobLiveness(cwd, options = {}) {
         try {
           await interruptTurn(workspaceRoot, job);
         } catch {
-          // The job fails either way; an unreachable broker leaves nothing to interrupt.
+          // The job fails either way; a turn that cannot be reached leaves nothing to interrupt.
         }
       }
     }

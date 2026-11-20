@@ -40,8 +40,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { readJsonFile } from "../../lib/fs.mjs";
-import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
-import { loadBrokerSession } from "./broker-lifecycle.mjs";
+import { CodexAppServerClient } from "./app-server.mjs";
 import { binaryAvailable } from "../../lib/process.mjs";
 import { validateModelSelection } from "./model-catalog.mjs";
 
@@ -748,38 +747,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
 }
 
 async function withAppServer(cwd, fn) {
-  let client = null;
-  try {
-    client = await CodexAppServerClient.connect(cwd);
-    const result = await fn(client);
-    await client.close();
-    return result;
-  } catch (error) {
-    const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
-    const shouldRetryDirect =
-      (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
-      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
-
-    if (client) {
-      await client.close().catch(() => {});
-      client = null;
-    }
-
-    if (!shouldRetryDirect) {
-      throw error;
-    }
-
-    const directClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
-    try {
-      return await fn(directClient);
-    } finally {
-      await directClient.close();
-    }
-  }
-}
-
-async function withDirectAppServer(cwd, fn) {
-  const client = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+  const client = await CodexAppServerClient.connect(cwd);
   try {
     return await fn(client);
   } finally {
@@ -1095,21 +1063,11 @@ export function getCodexAvailability(cwd) {
   };
 }
 
-export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) {
-  const endpoint = env?.[BROKER_ENDPOINT_ENV] ?? loadBrokerSession(cwd)?.endpoint ?? null;
-  if (endpoint) {
-    return {
-      mode: "shared",
-      label: "shared session",
-      detail: "This Claude session is configured to reuse one shared Codex runtime.",
-      endpoint
-    };
-  }
-
+export function getSessionRuntimeStatus() {
   return {
     mode: "direct",
     label: "direct startup",
-    detail: "No shared Codex runtime is active yet. The first review or task command will start one on demand.",
+    detail: "Each Codex command starts its own app server and stops it when done.",
     endpoint: null
   };
 }
@@ -1131,10 +1089,7 @@ export async function getCodexAuthStatus(cwd, options = {}) {
 
   let client = null;
   try {
-    client = await CodexAppServerClient.connect(cwd, {
-      env: options.env,
-      reuseExistingBroker: true
-    });
+    client = await CodexAppServerClient.connect(cwd, { env: options.env });
     const status = await getCodexAuthStatusFromClient(client, cwd);
     return { ...status, userAgent: client.serverInfo?.userAgent ?? null };
   } catch (error) {
@@ -1155,7 +1110,7 @@ export async function readCodexRateLimits(cwd) {
   if (!availability.available) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/agent:codex-setup`.");
   }
-  const client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
+  const client = await CodexAppServerClient.connect(cwd);
   try {
     return await client.request("account/rateLimits/read", {});
   } finally {
@@ -1185,7 +1140,7 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
 
   let client = null;
   try {
-    client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
+    client = await CodexAppServerClient.connect(cwd);
     await client.request("turn/interrupt", { threadId, turnId });
     return {
       attempted: true,
@@ -1273,7 +1228,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
     throw new Error("A Claude session source path is required.");
   }
 
-  return withDirectAppServer(cwd, async (client) => {
+  return withAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Importing Claude session into Codex.", "transferring");
     const contentSha256 = sourceContentSha256(options.sourcePath);
     const importStartedAtMs = Date.now();

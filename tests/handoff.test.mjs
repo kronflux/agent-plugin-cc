@@ -1,16 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
-import test, { after } from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run, stopTestBrokers } from "./helpers.mjs";
+import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
-
-after(stopTestBrokers);
 
 function makeRepo() {
   const repo = makeTempDir();

@@ -8,19 +8,13 @@
  * @typedef {import("./app-server-protocol").InitializeCapabilities} InitializeCapabilities
  */
 import fs from "node:fs";
-import net from "node:net";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
-import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { resolveCommand, terminateProcessTree } from "../../lib/process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
-
-export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
-export const BROKER_BUSY_RPC_CODE = -32001;
 
 const NON_INTERACTIVE_DENIAL_REASON = "Non-interactive Codex runner: no operator to approve.";
 
@@ -386,88 +380,14 @@ export class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 }
 
-class BrokerCodexAppServerClient extends AppServerClientBase {
-  constructor(cwd, options = {}) {
-    super(cwd, options);
-    this.transport = "broker";
-    this.endpoint = options.brokerEndpoint;
-  }
-
-  async initialize() {
-    await new Promise((resolve, reject) => {
-      const target = parseBrokerEndpoint(this.endpoint);
-      this.socket = net.createConnection({ path: target.path });
-      this.socket.setEncoding("utf8");
-      this.socket.on("connect", resolve);
-      this.socket.on("data", (chunk) => {
-        this.handleChunk(chunk);
-      });
-      this.socket.on("error", (error) => {
-        if (!this.exitResolved) {
-          reject(error);
-        }
-        this.handleExit(error);
-      });
-      this.socket.on("close", () => {
-        this.handleExit(this.exitError);
-      });
-    });
-
-    this.serverInfo = await this.request("initialize", {
-      clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
-      capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
-    });
-    this.notify("initialized", {});
-  }
-
-  async close() {
-    if (this.closeStarted) {
-      await this.exitPromise;
-      return;
-    }
-
-    this.closeStarted = true;
-    this.closed = true;
-    if (!this.socket) {
-      // No socket was opened, so no close event will ever settle the client.
-      this.handleExit(null);
-      return;
-    }
-    this.socket.end();
-    await this.exitPromise;
-  }
-
-  sendMessage(message) {
-    const line = `${JSON.stringify(message)}\n`;
-    const socket = this.socket;
-    if (!socket) {
-      throw new Error("codex app-server broker connection is not connected.");
-    }
-    socket.write(line);
-  }
-}
-
 export class CodexAppServerClient {
   static async connect(cwd, options = {}) {
-    let brokerEndpoint = null;
-    if (!options.disableBroker) {
-      brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
-      if (!brokerEndpoint && options.reuseExistingBroker) {
-        brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
-      }
-      if (!brokerEndpoint && !options.reuseExistingBroker) {
-        const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
-        brokerEndpoint = brokerSession?.endpoint ?? null;
-      }
-    }
-    const client = brokerEndpoint
-      ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
-      : new SpawnedCodexAppServerClient(cwd, options);
+    const client = new SpawnedCodexAppServerClient(cwd, options);
     try {
       await client.initialize();
     } catch (error) {
       // A client whose handshake failed is never returned, so it is closed here to end the
-      // app-server process or socket it opened.
+      // app-server process it started.
       await client.close().catch(() => {});
       throw error;
     }

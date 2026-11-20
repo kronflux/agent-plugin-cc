@@ -1,22 +1,20 @@
 import fs from "node:fs";
 import path from "node:path";
-import test, { after } from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run, stopTestBrokers } from "./helpers.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/agent/scripts/providers/codex/broker-lifecycle.mjs";
+import { initGitRepo, makeTempDir, run, waitUntil } from "./helpers.mjs";
 import { resolveStateDir } from "../plugins/agent/scripts/lib/state.mjs";
+import { isProcessAlive } from "../plugins/agent/scripts/lib/process.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "agent");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
-
-after(stopTestBrokers);
 
 // Reads every job record in a state directory, newest update first.
 function readJobsState(stateDir) {
@@ -27,6 +25,39 @@ function readJobsState(stateDir) {
     .map((name) => JSON.parse(fs.readFileSync(path.join(jobsDir, name), "utf8")))
     .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
   return { jobs };
+}
+
+// Reads the process ids of every fake app server started with this bin folder, in start order.
+function readAppServerPids(binDir) {
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  if (!fs.existsSync(statePath)) {
+    return [];
+  }
+  return JSON.parse(fs.readFileSync(statePath, "utf8")).appServerPids ?? [];
+}
+
+// Registers a cleanup that stops, by its own id, every listed process the test started and has
+// not yet seen exit. A process seen exiting is skipped, so a reused id is never signalled.
+function stopLeftoverProcesses(t, getPids, exited) {
+  t.after(() => {
+    for (const pid of getPids()) {
+      if (Number.isInteger(pid) && !exited.has(pid) && isProcessAlive(pid)) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // The process exited between the check and the signal.
+        }
+      }
+    }
+  });
+}
+
+// Waits until every listed process has exited and records each one as exited.
+async function waitForExit(pids, exited, describe) {
+  await waitUntil(() => pids.every((pid) => !isProcessAlive(pid)), { timeoutMs: 5000, describe });
+  for (const pid of pids) {
+    exited.add(pid);
+  }
 }
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
@@ -780,34 +811,27 @@ test("task can finish after subagent work even if the parent turn/completed even
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
-test("task using the shared broker still completes when Codex spawns subagents", () => {
+test("task on its own app server completes when Codex spawns subagents", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "with-subagent");
+  const exited = new Set();
+  stopLeftoverProcesses(t, () => readAppServerPids(binDir), exited);
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
-  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
-
-  const env = buildEnv(binDir);
-  const review = run("node", [SCRIPT, "review"], {
-    cwd: repo,
-    env
-  });
-  assert.equal(review.status, 0, review.stderr);
-
-  if (!loadBrokerSession(repo)) {
-    return;
-  }
 
   const result = run("node", [SCRIPT, "task", "challenge the current design"], {
     cwd: repo,
-    env
+    env: buildEnv(binDir)
   });
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  const pids = readAppServerPids(binDir);
+  assert.ok(pids.length >= 1, "no app server was started");
+  await waitForExit(pids, exited, "every app server to exit");
 });
 
 test("task --background enqueues a detached worker and exposes per-job status", async () => {
@@ -1629,11 +1653,13 @@ test("cancel with a job id can still target an active job from another Claude se
   assert.equal(state.jobs[0].status, "cancelled");
 });
 
-test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async () => {
+test("cancel stops a running job's worker and its app-server", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
-  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
   installFakeCodex(binDir, "interruptible-slow-task");
+  const exited = new Set();
+  let workerPid = null;
+  stopLeftoverProcesses(t, () => [workerPid, ...readAppServerPids(binDir)], exited);
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });
@@ -1644,53 +1670,32 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
     cwd: repo,
     env
   });
-
   assert.equal(launched.status, 0, launched.stderr);
-  const launchPayload = JSON.parse(launched.stdout);
-  const jobId = launchPayload.jobId;
+  const { jobId } = JSON.parse(launched.stdout);
   assert.ok(jobId);
 
   const stateDir = resolveStateDir(repo);
-  const runningJob = await waitFor(() => {
-    const state = readJobsState(stateDir);
-    const job = state.jobs.find((candidate) => candidate.id === jobId);
-    if (job?.status === "running" && job.threadId && job.turnId) {
-      return job;
-    }
-    return null;
-  }, { timeoutMs: 15000 });
+  const runningJob = await waitUntil(
+    () => {
+      const job = readJobsState(stateDir).jobs.find((candidate) => candidate.id === jobId);
+      const running = job?.status === "running" && Number.isInteger(job.pid);
+      return running && readAppServerPids(binDir).length === 1 ? job : null;
+    },
+    { timeoutMs: 15000, describe: "the job to run with one app server" }
+  );
+  workerPid = runningJob.pid;
+  const [appServerPid] = readAppServerPids(binDir);
+  assert.equal(isProcessAlive(workerPid), true, "the worker exited before cancel");
+  assert.equal(isProcessAlive(appServerPid), true, "the app server exited before cancel");
 
-  const cancelResult = run("node", [SCRIPT, "cancel", jobId, "--json"], {
-    cwd: repo,
-    env
-  });
+  const cancelResult = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
 
   assert.equal(cancelResult.status, 0, cancelResult.stderr);
   const cancelPayload = JSON.parse(cancelResult.stdout);
   assert.equal(cancelPayload.status, "cancelled");
-  assert.equal(cancelPayload.turnInterruptAttempted, true);
-  assert.equal(cancelPayload.turnInterrupted, true);
-
-  await waitFor(() => {
-    const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
-    return fakeState.lastInterrupt ?? null;
-  });
-
-  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
-  assert.deepEqual(fakeState.lastInterrupt, {
-    threadId: runningJob.threadId,
-    turnId: runningJob.turnId
-  });
-
-  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
-    cwd: repo,
-    env,
-    input: JSON.stringify({
-      hook_event_name: "SessionEnd",
-      cwd: repo
-    })
-  });
-  assert.equal(cleanup.status, 0, cleanup.stderr);
+  assert.equal(cancelPayload.turnInterruptAttempted, false);
+  await waitForExit([workerPid, appServerPid], exited, "the worker and its app server to exit");
+  assert.equal(fs.existsSync(path.join(stateDir, "broker.json")), false, "a shared runtime record exists");
 });
 
 test("session end fully cleans up jobs for the ending session", async (t) => {
@@ -2011,12 +2016,12 @@ test("stop hook runs the actual task when auth status looks stale", () => {
   assert.match(payload.reason, /Missing empty-state guard/i);
 });
 
-test("commands lazily start and reuse one shared app-server after first use", async () => {
+test("each command starts its own app server and stops it", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
-  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
-
   installFakeCodex(binDir);
+  const exited = new Set();
+  stopLeftoverProcesses(t, () => readAppServerPids(binDir), exited);
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });
@@ -2024,87 +2029,28 @@ test("commands lazily start and reuse one shared app-server after first use", as
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
 
   const env = buildEnv(binDir);
-
-  const review = run("node", [SCRIPT, "review"], {
-    cwd: repo,
-    env
-  });
-  assert.equal(review.status, 0, review.stderr);
-
-  const brokerSession = loadBrokerSession(repo);
-  if (!brokerSession) {
-    return;
+  // setup checks the login and review runs a turn, so each talks to Codex; status reads only
+  // local job records.
+  for (const [args, started] of [
+    [["setup", "--json"], 1],
+    [["review"], 1],
+    [["status"], 0]
+  ]) {
+    const before = readAppServerPids(binDir);
+    const result = run("node", [SCRIPT, ...args], { cwd: repo, env });
+    assert.equal(result.status, 0, result.stderr);
+    const after = readAppServerPids(binDir);
+    assert.equal(after.length, before.length + started, `app servers started by ${args[0]}`);
+    await waitForExit(after, exited, `every app server to exit after ${args[0]}`);
   }
-
-  const adversarial = run("node", [SCRIPT, "adversarial-review"], {
-    cwd: repo,
-    env
-  });
-  assert.equal(adversarial.status, 0, adversarial.stderr);
-
-  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
-  assert.equal(fakeState.appServerStarts, 1);
-
-  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
-    cwd: repo,
-    env,
-    input: JSON.stringify({
-      hook_event_name: "SessionEnd",
-      cwd: repo
-    })
-  });
-  assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
-test("setup reuses an existing shared app-server without starting another one", () => {
-  const repo = makeTempDir();
-  const binDir = makeTempDir();
-  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
-
-  installFakeCodex(binDir);
-  initGitRepo(repo);
-  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
-  run("git", ["add", "README.md"], { cwd: repo });
-  run("git", ["commit", "-m", "init"], { cwd: repo });
-  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
-
-  const env = buildEnv(binDir);
-
-  const review = run("node", [SCRIPT, "review"], {
-    cwd: repo,
-    env
-  });
-  assert.equal(review.status, 0, review.stderr);
-
-  const brokerSession = loadBrokerSession(repo);
-  if (!brokerSession) {
-    return;
-  }
-
-  const setup = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: repo,
-    env
-  });
-  assert.equal(setup.status, 0, setup.stderr);
-
-  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
-  assert.equal(fakeState.appServerStarts, 1);
-
-  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
-    cwd: repo,
-    env,
-    input: JSON.stringify({
-      hook_event_name: "SessionEnd",
-      cwd: repo
-    })
-  });
-  assert.equal(cleanup.status, 0, cleanup.stderr);
-});
-
-test("status reports shared session runtime when a lazy broker is active", () => {
+test("status reports direct startup after a command ran", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
+  const exited = new Set();
+  stopLeftoverProcesses(t, () => readAppServerPids(binDir), exited);
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });
@@ -2116,39 +2062,42 @@ test("status reports shared session runtime when a lazy broker is active", () =>
     env: buildEnv(binDir)
   });
   assert.equal(review.status, 0, review.stderr);
+  await waitForExit(readAppServerPids(binDir), exited, "the review's app server to exit");
 
-  if (!loadBrokerSession(repo)) {
-    return;
-  }
-
-  const result = run("node", [SCRIPT, "status"], {
+  const result = run("node", [SCRIPT, "status", "--json"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Session runtime: shared session/);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.sessionRuntime.mode, "direct");
+  assert.equal(payload.sessionRuntime.endpoint, null);
 });
 
-test("setup and status honor --cwd when reading shared session runtime", () => {
+test("setup and status honor --cwd for the session runtime", async (t) => {
   const targetWorkspace = makeTempDir();
   const invocationWorkspace = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const exited = new Set();
+  stopLeftoverProcesses(t, () => readAppServerPids(binDir), exited);
+  const env = buildEnv(binDir);
 
-  saveBrokerSession(targetWorkspace, {
-    endpoint: "unix:/tmp/fake-broker.sock"
-  });
-
-  const status = run("node", [SCRIPT, "status", "--cwd", targetWorkspace], {
-    cwd: invocationWorkspace
+  const status = run("node", [SCRIPT, "status", "--cwd", targetWorkspace, "--json"], {
+    cwd: invocationWorkspace,
+    env
   });
   assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /Session runtime: shared session/);
+  assert.equal(JSON.parse(status.stdout).sessionRuntime.mode, "direct");
 
   const setup = run("node", [SCRIPT, "setup", "--cwd", targetWorkspace, "--json"], {
-    cwd: invocationWorkspace
+    cwd: invocationWorkspace,
+    env
   });
   assert.equal(setup.status, 0, setup.stderr);
   const payload = JSON.parse(setup.stdout);
-  assert.equal(payload.sessionRuntime.mode, "shared");
-  assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+  assert.equal(payload.sessionRuntime.mode, "direct");
+  assert.equal(payload.sessionRuntime.endpoint, null);
+  await waitForExit(readAppServerPids(binDir), exited, "the setup app server to exit");
 });

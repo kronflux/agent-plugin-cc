@@ -1,13 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import test, { after } from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run, stopTestBrokers } from "./helpers.mjs";
+import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import {
   buildStatusSnapshot,
   readJobProgressPreview,
@@ -21,8 +21,6 @@ import { listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
-
-after(stopTestBrokers);
 
 // The PID of a process that has already exited.
 function exitedPid() {

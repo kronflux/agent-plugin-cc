@@ -148,7 +148,7 @@ test("a failed initialize closes the app server it started", async (t) => {
   const cwd = makeTempDir(t);
   installFakeCodex(binDir, "initialize-fails");
   await assert.rejects(
-    CodexAppServerClient.connect(cwd, { env: buildEnv(binDir), disableBroker: true }),
+    CodexAppServerClient.connect(cwd, { env: buildEnv(binDir) }),
     /initialize failed/
   );
   const pids = readFakeState(binDir).appServerPids;
@@ -167,7 +167,7 @@ test("a write while a request is pending and the app server's stdin is gone reje
   const binDir = makeTempDir(t);
   const cwd = makeTempDir(t);
   installFakeCodex(binDir, "close-stdin-on-turn");
-  const client = await CodexAppServerClient.connect(cwd, { env: buildEnv(binDir), disableBroker: true });
+  const client = await CodexAppServerClient.connect(cwd, { env: buildEnv(binDir) });
   t.after(() => client.close());
   let stdinClosed = null;
   client.setNotificationHandler((notification) => {

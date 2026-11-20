@@ -305,8 +305,8 @@ Examples:
 
 ### `/agent:cancel`
 
-Cancels an active background job of either agent. A Codex turn is interrupted first; an
-Antigravity job has its processes stopped.
+Cancels an active background job of either agent. Cancel stops the job's worker and the
+processes it started.
 
 Examples:
 
@@ -461,6 +461,10 @@ Yes. If you already use Codex, the plugin picks up the same [configuration](#com
 Yes. Because the plugin uses your local Codex CLI, your existing sign-in method and config still apply.
 
 If you need to point the built-in OpenAI provider at a different endpoint, set `openai_base_url` in your [Codex config](https://developers.openai.com/codex/config-advanced/#config-and-state-locations).
+
+## Security notes
+
+When Codex runs a delegated task and an MCP server asks for consent through an elicitation, the runner answers on your behalf, because a delegated run has no operator to ask. It declines requests in `form`, `openai/form`, `openaiForm` or `url` mode, because it cannot fill in a form or open a URL. It accepts a request with no `mode` or an unknown `mode` with empty content, because declining blocks the MCP tool call that raised it.
 
 ## Development
 

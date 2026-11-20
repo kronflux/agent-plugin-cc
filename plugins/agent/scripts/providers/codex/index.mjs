@@ -1,11 +1,10 @@
 import { fileURLToPath } from "node:url";
 
-import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { readTurnResultFromRollout } from "./rollout.mjs";
-import { getSessionRuntimeStatus, interruptAppServerTurn } from "./runtime.mjs";
+import { getSessionRuntimeStatus } from "./runtime.mjs";
 
-// Codex runs through its app server, shared per repository by a broker. The capabilities name
-// what this plugin's Codex driver supports.
+// Each Codex command runs in its own app server, started and stopped by that command. The
+// capabilities name what this plugin's Codex driver supports.
 export const codexProvider = Object.freeze({
   id: "codex",
   label: "Codex",
@@ -35,18 +34,18 @@ export const codexProvider = Object.freeze({
     return `codex resume ${threadId}`;
   },
 
-  interruptTurn(cwd, { threadId, turnId }) {
-    return interruptAppServerTurn(cwd, { threadId, turnId });
+  // A running turn lives in the worker's own app server, which ends when the worker is stopped.
+  interruptTurn() {
+    return {
+      attempted: false,
+      interrupted: false,
+      transport: null,
+      detail: "The turn runs in the worker's own app server; cancel stops the worker instead."
+    };
   },
 
-  // A dead worker's turn keeps running in a shared broker, so it is interrupted there. Without
-  // a broker the turn ran in an app server owned by the worker and ended with it.
-  async interruptOrphanedTurn(workspaceRoot, job) {
-    if (!loadBrokerSession(workspaceRoot)) {
-      return;
-    }
-    await interruptAppServerTurn(workspaceRoot, { threadId: job.threadId, turnId: job.turnId });
-  },
+  // A dead worker's turn ran in an app server owned by the worker and ended with it.
+  async interruptOrphanedTurn() {},
 
   sessionRuntimeStatus(env, workspaceRoot) {
     return getSessionRuntimeStatus(env, workspaceRoot);

@@ -5,20 +5,15 @@ import process from "node:process";
 import { spawn, spawnSync } from "node:child_process";
 import { after } from "node:test";
 
-import { loadBrokerSession, sendBrokerShutdown } from "../plugins/agent/scripts/providers/codex/broker-lifecycle.mjs";
-
-const gitRepos = new Set();
-
 const tempDirs = new Set();
 
 function removeDir(dir) {
   fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 
-// Stops test brokers, then removes every folder still registered when the test file ends and
-// reports any it cannot remove.
+// Removes every folder still registered when the test file ends and reports any it cannot
+// remove.
 after(async () => {
-  await stopTestBrokers();
   const deadline = Date.now() + 10000;
   for (const dir of tempDirs) {
     try {
@@ -172,24 +167,7 @@ export function run(command, args, options = {}) {
   return result;
 }
 
-// Brokers are detached and outlive the test that started them. A test file that starts
-// them registers this as its `after` hook: each repository's broker gets the broker's own
-// shutdown request on its endpoint, so a stale PID can never reach an unrelated process.
-export async function stopTestBrokers() {
-  const endpoints = [...gitRepos].map((repo) => loadBrokerSession(repo)?.endpoint).filter(Boolean);
-  gitRepos.clear();
-  await Promise.all(
-    endpoints.map((endpoint) =>
-      Promise.race([
-        sendBrokerShutdown(endpoint),
-        new Promise((resolve) => setTimeout(resolve, 2000).unref())
-      ])
-    )
-  );
-}
-
 export function initGitRepo(cwd) {
-  gitRepos.add(cwd);
   run("git", ["init", "-b", "main"], { cwd, check: true, shell: false });
   run("git", ["config", "user.name", "Codex Plugin Tests"], { cwd, check: true, shell: false });
   run("git", ["config", "user.email", "tests@example.com"], { cwd, check: true, shell: false });

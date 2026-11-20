@@ -3,17 +3,6 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { terminateProcessTree } from "./lib/process.mjs";
-import { BROKER_ENDPOINT_ENV } from "./providers/codex/app-server.mjs";
-import {
-  clearBrokerSession,
-  isBrokerProcess,
-  LOG_FILE_ENV,
-  loadBrokerSession,
-  PID_FILE_ENV,
-  requestBrokerShutdownIfIdle,
-  teardownBrokerSession
-} from "./providers/codex/broker-lifecycle.mjs";
 import { terminateJobProcesses } from "./lib/job-control.mjs";
 import { listJobs, removeJob } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./providers/codex/claude-session-transfer.mjs";
@@ -66,68 +55,15 @@ function cleanupSessionJobs(cwd, sessionId) {
   }
 }
 
-// A broker that exited, for example after its idle timeout, leaves its session record and
-// files behind; they are removed so the next command starts a new broker without probing.
-function removeExitedBrokerSession(cwd) {
-  const session = loadBrokerSession(cwd);
-  if (!session || isBrokerProcess(session.pid)) {
-    return;
-  }
-  teardownBrokerSession({
-    endpoint: session.endpoint ?? null,
-    pidFile: session.pidFile ?? null,
-    logFile: session.logFile ?? null,
-    sessionDir: session.sessionDir ?? null
-  });
-  clearBrokerSession(cwd);
-}
-
 function handleSessionStart(input) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
-  try {
-    removeExitedBrokerSession(input.cwd || process.cwd());
-  } catch {
-    // A failed cleanup must not stop the session from starting.
-  }
 }
 
 async function handleSessionEnd(input) {
   const cwd = input.cwd || process.cwd();
-  const brokerSession =
-    loadBrokerSession(cwd) ??
-    (process.env[BROKER_ENDPOINT_ENV]
-      ? {
-          endpoint: process.env[BROKER_ENDPOINT_ENV],
-          pidFile: process.env[PID_FILE_ENV] ?? null,
-          logFile: process.env[LOG_FILE_ENV] ?? null
-        }
-      : null);
-  const brokerEndpoint = brokerSession?.endpoint ?? null;
-  const pidFile = brokerSession?.pidFile ?? null;
-  const logFile = brokerSession?.logFile ?? null;
-  const sessionDir = brokerSession?.sessionDir ?? null;
-  const pid = brokerSession?.pid ?? null;
-
-  // This session's jobs stop first, so their connections no longer count against the broker.
-  // The broker then stops only if no other session is using it.
   cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
-  if (!brokerEndpoint) {
-    return;
-  }
-  if ((await requestBrokerShutdownIfIdle(brokerEndpoint)) === "busy") {
-    return;
-  }
-  teardownBrokerSession({
-    endpoint: brokerEndpoint,
-    pidFile,
-    logFile,
-    sessionDir,
-    pid,
-    killProcess: terminateProcessTree
-  });
-  clearBrokerSession(cwd);
 }
 
 async function main() {
