@@ -193,7 +193,7 @@ Examples:
 With `--worktree`, Codex works in a new git worktree on the branch `agent/<job-id>`, created from
 your last commit, so your checkout stays untouched. Uncommitted changes in your checkout are not
 in the worktree. The result names the worktree path. Review or merge the branch, then remove the
-worktree with `git worktree remove <path>`.
+worktree with the command the result prints; see [Delegate worktrees](#delegate-worktrees).
 
 You can also just ask for a task to be delegated to Codex:
 
@@ -586,6 +586,47 @@ The plugin keeps one `config.json` per repository in its state folder (under `CL
 - `models` holds the delegation setting of each agent, described under [Models and effort](#models-and-effort). A `null` value means the agent default applies.
 
 The hook that starts each Claude Code session exports `AGENT_PLUGIN_SESSION_ID` and `AGENT_PLUGIN_TRANSCRIPT_PATH` for the commands of that session.
+
+## Delegate worktrees
+
+A job started with `--worktree`, or a fleet member with `worktree: true`, works in its own git
+worktree: the folder `worktrees/<job-id>` in the plugin's state folder for the repository, on the
+new branch `agent/<job-id>`, created from your last commit. A job that continues it works in the
+same worktree. The plugin never merges the branch; you review and merge it.
+
+```bash
+node "<plugin root>/scripts/agent-companion.mjs" worktree list
+node "<plugin root>/scripts/agent-companion.mjs" worktree remove <job-id|label> [--force]
+```
+
+`worktree list` (`--json` for a machine-readable reply) shows every worktree the plugin created in
+the repository: job id, label, branch, path, whether it has uncommitted changes, how many commits it
+has that your current branch does not, and its job's state. A worktree whose job the store has
+since deleted shows `job pruned`.
+
+`worktree remove` removes the worktree and deletes its branch only when all of these hold:
+
+- The job and every job that continues it have finished (`completed`, `failed` or `cancelled`), and each has released its provider process.
+- The worktree has no uncommitted changes, including untracked files.
+- Your current branch contains every commit of the branch. The branch's upstream does not matter.
+
+Otherwise it exits with code 1, says which condition failed, and names the git command that shows
+the work. The branch is deleted only while it still points at the commit that was checked. The result
+of a worktree job prints the exact `worktree remove` command to run.
+
+`worktree remove --force` drops the last two conditions: it removes the worktree with
+`git worktree remove --force`, deletes the branch, and discards the uncommitted changes and the
+commits your current branch does not have. Its output names what was discarded and, when the branch
+held such commits, the `git branch` command that restores it from its last commit. The job must still
+have finished and released its provider process.
+
+Session end and the store's cleanup never remove a worktree and print nothing about it.
+
+While a removal runs it holds the marker file `worktrees/.removing-<job-id>` in the state folder,
+and a job that would continue in that worktree does not start. A removal that was stopped, for
+example by closing its terminal, can leave the marker behind; every later removal then refuses with
+the marker's path. Only when no removal is running and no Claude Code session uses the repository,
+delete that file and run the command again.
 
 ## Job store
 

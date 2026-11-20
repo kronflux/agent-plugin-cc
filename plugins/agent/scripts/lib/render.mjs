@@ -1,4 +1,11 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { getProvider } from "./providers.mjs";
+import { NODE_LAUNCH_FLAGS } from "./store.mjs";
+
+// The neutral companion, whose `worktree remove` a worktree note names.
+const AGENT_COMPANION = fileURLToPath(new URL("../agent-companion.mjs", import.meta.url));
 
 // Results name the provider that produced them; callers pass its label.
 function labelFor(meta) {
@@ -241,7 +248,9 @@ function renderWorktreeNote(meta) {
   if (!meta?.worktreePath) {
     return "";
   }
-  return `\nWorktree: ${meta.worktreePath} (branch ${meta.worktreeBranch}). ${labelFor(meta)} worked there, not in your checkout. When you are done with it, run: git worktree remove "${meta.worktreePath}"\n`;
+  // The worktree folder is named after the first job of its chain, which `worktree remove` takes.
+  const command = ["node", ...NODE_LAUNCH_FLAGS, `"${AGENT_COMPANION}"`, "worktree", "remove", path.basename(meta.worktreePath)].join(" ");
+  return `\nWorktree: ${meta.worktreePath} (branch ${meta.worktreeBranch}). ${labelFor(meta)} worked there, not in your checkout. When its work is merged, remove it with: ${command}\n`;
 }
 
 export function renderTaskResult(parsedResult, meta) {

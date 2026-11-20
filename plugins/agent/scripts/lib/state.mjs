@@ -836,12 +836,50 @@ function isUniqueViolation(error) {
 }
 
 /**
+ * The marker a removal of the worktree at `worktreePath` holds while it runs:
+ * `.removing-<folder name>` next to the folder.
+ */
+export function worktreeRemovalMarker(worktreePath) {
+  return path.join(path.dirname(worktreePath), `.removing-${path.basename(worktreePath)}`);
+}
+
+/**
+ * True when a job may not use the worktree at `worktreePath`: its removal marker exists, or the
+ * folder is gone. The marker is checked first and the folder second; a removal deletes its marker
+ * only after the folder is gone, so no order of the two leaves a worker with a folder under
+ * removal. `hooks.beforeMarkerCheck` and `hooks.afterMarkerCheck` run around the marker check.
+ */
+export function worktreeUnavailable(worktreePath, hooks = null) {
+  hooks?.beforeMarkerCheck?.();
+  const marked = fs.existsSync(worktreeRemovalMarker(worktreePath));
+  hooks?.afterMarkerCheck?.();
+  if (marked) {
+    return true;
+  }
+  return !fs.existsSync(worktreePath);
+}
+
+function requestWorktreePath(requestJson) {
+  try {
+    const worktreePath = JSON.parse(requestJson ?? "{}")?.worktree?.path;
+    return typeof worktreePath === "string" && worktreePath ? worktreePath : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Claims a queued job for one worker, under admission (the job must be in its provider's oldest
  * eligible cohort) and thread exclusivity. A refusal by admission, barrier or a held thread is
- * recorded on the job and resets its launch attempts.
+ * recorded on the job and resets its launch attempts. After a claim commits, the worktree the job
+ * runs in is checked outside the transaction (worktreeUnavailable); when it is under removal or
+ * gone the result also carries `worktreeUnavailable: true`, and the worker must release the
+ * execution without starting its provider. `hooks` is passed to that check.
  */
-export function claimExecution(store, jobId, { pid, startToken, groupId = null, limits = {} }, opts = {}) {
-  return store.transact((db) => {
+export function claimExecution(store, jobId, { pid, startToken, groupId = null, limits = {}, hooks = null }, opts = {}) {
+  let worktreePath = null;
+  const claim = store.transact((db) => {
+    worktreePath = null;
     const row = getJobRow(db, jobId);
     if (!row) {
       throw new UnknownJobError({ ref: jobId });
@@ -888,8 +926,13 @@ export function claimExecution(store, jobId, { pid, startToken, groupId = null, 
       return { claimed: false, reason: "claimed" };
     }
     logCohort(jobId, eligibility, "claimed");
+    worktreePath = requestWorktreePath(row.request_json);
     return { claimed: true, execGen: row.exec_gen + 1 };
   }, opts);
+  if (claim.claimed && worktreePath && worktreeUnavailable(worktreePath, hooks)) {
+    return { ...claim, worktreeUnavailable: true };
+  }
+  return claim;
 }
 
 // The predicate every write of a worker's execution carries: the claim of this generation, not

@@ -465,6 +465,9 @@ export class WorkerRun {
       );
       if (claim.claimed) {
         this.execGen = claim.execGen;
+        if (claim.worktreeUnavailable) {
+          return this.endWorktreeUnavailable(view);
+        }
         break;
       }
       if (claim.reason === "thread-busy" && performance.now() - claimStarted < THREAD_BUSY_LIMIT_MS) {
@@ -907,6 +910,31 @@ export class WorkerRun {
       this.log(`the fenced state could not be recorded before the deadline: ${error?.message ?? error}`);
     }
     this.log(`release left to reconciliation: ${reason}`);
+  }
+
+  // A claimed job whose worktree is under removal or gone ends failed with the reason `worktree
+  // removed` and releases its execution without starting its provider, then the provider's cohort
+  // is launched into the freed place.
+  async endWorktreeUnavailable(view) {
+    this.job = view.row;
+    this.log("the job's worktree is under removal or gone; the provider is not started");
+    await this.write((opts) =>
+      recordEnd(
+        this.store,
+        this.jobId,
+        {
+          state: "failed",
+          by: "worker",
+          execGen: this.execGen,
+          reason: "worktree removed",
+          error: "The job's worktree was removed or is being removed, so the job did not run."
+        },
+        opts
+      )
+    );
+    await this.write((opts) => releaseExecution(this.store, this.jobId, this.execGen, { kind: "confirmed" }, opts));
+    await this.launchCohort();
+    return 0;
   }
 
   // A released execution frees an admission place, so the provider's cohort is launched; a member

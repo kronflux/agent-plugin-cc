@@ -9,6 +9,7 @@ import * as resumeCommand from "./commands/resume.mjs";
 import * as sendCommand from "./commands/send.mjs";
 import * as statusCommand from "./commands/status.mjs";
 import * as storeCommand from "./commands/store.mjs";
+import * as worktreeCommand from "./commands/worktree.mjs";
 import { HelpRequested } from "./lib/companion-cli.mjs";
 import { checkRuntime, runtimeGateMessage } from "./lib/store.mjs";
 
@@ -20,7 +21,8 @@ const SUBCOMMANDS = {
   resume: resumeCommand,
   cancel: cancelCommand,
   store: storeCommand,
-  fleet: fleetCommand
+  fleet: fleetCommand,
+  worktree: worktreeCommand
 };
 
 function printUsage(subcommand = null) {

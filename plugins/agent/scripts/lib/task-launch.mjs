@@ -6,7 +6,7 @@ import process from "node:process";
 
 import { createWorktree, removeWorktree } from "./git.mjs";
 import { interpolateTemplate, loadPromptTemplate } from "./prompts.mjs";
-import { readCohort, readJobView, recordLaunchAttempt, resolveStateDir } from "./state.mjs";
+import { readCohort, readJobView, recordLaunchAttempt, resolveStateDir, worktreeRemovalMarker } from "./state.mjs";
 import { boundary, NODE_LAUNCH_FLAGS, wallNow } from "./store.mjs";
 
 // How long send waits for the agent to confirm a message by default.
@@ -23,11 +23,21 @@ export function shorten(text, limit = 96) {
   return `${normalized.slice(0, limit - 3)}...`;
 }
 
+/** The folder of the worktree of job `jobId`: `<stateDir>/worktrees/<jobId>`. */
+export function worktreePathFor(stateDir, jobId) {
+  return path.join(stateDir, "worktrees", jobId);
+}
+
+/** The branch of the worktree of job `jobId`: `agent/<jobId>`. */
+export function worktreeBranchFor(jobId) {
+  return `agent/${jobId}`;
+}
+
 // A worktree job gets its own checkout of HEAD under the state directory, on the new branch
 // agent/<job-id>. The job's record stays with the repository; only the agent works in the worktree.
 export function attachWorktree(job) {
-  const worktreePath = path.join(resolveStateDir(job.workspaceRoot), "worktrees", job.id);
-  const worktreeBranch = `agent/${job.id}`;
+  const worktreePath = worktreePathFor(resolveStateDir(job.workspaceRoot), job.id);
+  const worktreeBranch = worktreeBranchFor(job.id);
   createWorktree(job.workspaceRoot, worktreePath, worktreeBranch);
   return { ...job, worktreePath, worktreeBranch };
 }
@@ -125,7 +135,8 @@ function timeLeft(deadline) {
 /**
  * Launches a detached worker for a queued job after committing the launch attempt; a refused
  * attempt (not in its provider's cohort, held thread, barrier, claimed, ended or launched less than
- * 5 seconds ago) spawns nothing and resolves to null. The job read, the provider module load and
+ * 5 seconds ago) spawns nothing and resolves to null, as does a job whose worktree is under removal,
+ * which records no attempt. The job read, the provider module load and
  * the boundary log come before the attempt; once the attempt commits, the spawn follows in the same
  * synchronous run, so a committed attempt always spawns. With `deadline` (a `performance.now()`
  * value) the attempt transaction checks it as its last step before COMMIT: once it has passed
@@ -137,6 +148,12 @@ export async function launchWorker(store, stateDir, jobId, { deadline = undefine
   }
   const view = readJobView(store, jobId);
   if (!view) {
+    return null;
+  }
+  // A job whose worktree is under removal is not launched now; a later scan launches it once the
+  // removal has ended. A worktree that is gone is left to the worker, whose claim ends the job.
+  const worktreePath = view.request?.worktree?.path;
+  if (worktreePath && fs.existsSync(worktreeRemovalMarker(worktreePath))) {
     return null;
   }
   const entry = workerEntry(view.provider);

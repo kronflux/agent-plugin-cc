@@ -104,7 +104,7 @@ function branchExists(repoRoot, branch) {
 
 // A path in a form two spellings of one folder share: resolved, through symlinks and short names
 // where the folder or its parent exists, and in lower case on Windows.
-function comparablePath(target) {
+export function comparablePath(target) {
   const resolved = path.resolve(target);
   let real = resolved;
   try {
@@ -227,6 +227,76 @@ export function removeWorktree(repoRoot, worktreePath, branch) {
       throw new Error(formatCommandFailure(deleted));
     }
   }
+}
+
+/**
+ * The worktrees of the repository at `repoRoot` from `git worktree list --porcelain`, the main
+ * checkout first: `{ path, branch, head }`, `branch` the full ref name or null when detached.
+ */
+export function listGitWorktrees(repoRoot) {
+  const entries = [];
+  let current = null;
+  for (const line of gitChecked(repoRoot, ["worktree", "list", "--porcelain"]).stdout.split(/\r?\n/)) {
+    if (line.startsWith("worktree ")) {
+      current = { path: path.resolve(line.slice("worktree ".length)), branch: null, head: null };
+      entries.push(current);
+    } else if (current && line.startsWith("HEAD ")) {
+      current.head = line.slice("HEAD ".length);
+    } else if (current && line.startsWith("branch ")) {
+      current.branch = line.slice("branch ".length);
+    }
+  }
+  return entries;
+}
+
+/** True when the worktree at `worktreePath` has staged, unstaged or untracked changes. */
+export function worktreeIsDirty(worktreePath) {
+  return gitChecked(worktreePath, ["status", "--porcelain"]).stdout.trim() !== "";
+}
+
+/** The number of commits on the local branch `branch` that the checkout's HEAD does not have. */
+export function commitsAhead(repoRoot, branch) {
+  return Number.parseInt(gitChecked(repoRoot, ["rev-list", "--count", `HEAD..refs/heads/${branch}`]).stdout.trim(), 10) || 0;
+}
+
+// The first non-empty line of a failed git command's error output.
+function firstErrorLine(result) {
+  const text = `${result.stderr ?? ""}\n${result.stdout ?? ""}`;
+  return (
+    text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean) ?? (result.error ? result.error.message : `git exited ${result.status}`)
+  );
+}
+
+/**
+ * Removes a clean worktree and then its branch, only while the branch still points at
+ * `expectedSha`: `git worktree remove <path>` (never forced), then `git update-ref -d
+ * refs/heads/<branch> <expectedSha>`. Returns `{ worktreeRemoved, branchDeleted, error }`, with
+ * git's first error line when a step failed.
+ */
+export function removeGitWorktree(repoRoot, worktreePath, branch, expectedSha) {
+  const removed = git(repoRoot, ["worktree", "remove", worktreePath]);
+  if (removed.error || removed.status !== 0) {
+    return { worktreeRemoved: false, branchDeleted: false, error: firstErrorLine(removed) };
+  }
+  const deleted = git(repoRoot, ["update-ref", "-d", `refs/heads/${branch}`, expectedSha]);
+  if (deleted.error || deleted.status !== 0) {
+    return { worktreeRemoved: true, branchDeleted: false, error: firstErrorLine(deleted) };
+  }
+  return { worktreeRemoved: true, branchDeleted: true, error: null };
+}
+
+/** The commit a local branch points at, or null when it does not exist. */
+export function branchCommit(repoRoot, branch) {
+  const result = git(repoRoot, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}^{commit}`]);
+  return result.status === 0 ? result.stdout.trim() : null;
+}
+
+/** True when `commit` is an ancestor of, or equal to, the checkout's HEAD. */
+export function isAncestorOfHead(repoRoot, commit) {
+  return git(repoRoot, ["merge-base", "--is-ancestor", commit, "HEAD"]).status === 0;
 }
 
 export function getRepoRoot(cwd) {
