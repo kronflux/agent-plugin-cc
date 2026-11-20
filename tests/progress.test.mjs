@@ -1,12 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run, stopWaiting, waitUntil as sharedWaitUntil } from "./helpers.mjs";
+import { initGitRepo, makeTempDir, run, stopOwnedProcess, stopWaiting, waitUntil as sharedWaitUntil } from "./helpers.mjs";
 import { listJobs, markJobCancelled, readJobFile, resolveJobFile, writeJobFile } from "../plugins/agent/scripts/lib/state.mjs";
 import { runTrackedJob } from "../plugins/agent/scripts/lib/tracked-jobs.mjs";
 
@@ -47,19 +47,6 @@ function startMonitor(repo, env, { graceMs = 300, pluginData = null } = {}) {
     output.text += chunk;
   });
   return { child, output };
-}
-
-// Stops a process this file started, by its own id.
-function stopProcessById(pid) {
-  if (process.platform === "win32") {
-    spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-  } else {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // Already gone.
-    }
-  }
 }
 
 async function waitUntil(predicate, timeoutMs) {
@@ -145,7 +132,7 @@ test("the monitor exits when its Claude process is gone", async () => {
 
   const code = await new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      stopProcessById(child.pid);
+      stopOwnedProcess(child, { tree: true });
       reject(new Error("the monitor did not exit within 10 s"));
     }, 10000);
     child.on("close", (exitCode) => {

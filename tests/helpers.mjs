@@ -2,8 +2,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { spawn, spawnSync } from "node:child_process";
+import { ChildProcess, spawn, spawnSync } from "node:child_process";
 import { after } from "node:test";
+import { pathToFileURL } from "node:url";
 
 const tempDirs = new Set();
 
@@ -88,18 +89,157 @@ export async function waitUntil(predicate, { timeoutMs = 10000, intervalMs = 100
   );
 }
 
+const PROCESS_LIB = pathToFileURL(path.join(import.meta.dirname, "..", "plugins", "agent", "scripts", "lib", "process.mjs")).href;
+
+/**
+ * How often stopOwnedProcess ended each way in this test process: `stopped`, `exited` (the
+ * target had already ended), `mismatch` (the id now belongs to another process), `unproved`
+ * (no held child and no start token, or the identity could not be read) and `failed`.
+ */
+export const ownedStopCounts = { stopped: 0, exited: 0, mismatch: 0, unproved: 0, failed: 0 };
+
+function count(result) {
+  ownedStopCounts[result] += 1;
+  return result;
+}
+
+function heldAndRunning(child) {
+  return Number.isInteger(child.pid) && child.exitCode === null && child.signalCode === null;
+}
+
+function signalAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function taskkill(pid, tree) {
+  const result = spawnSync("taskkill", ["/PID", String(pid), ...(tree ? ["/T"] : []), "/F"], { windowsHide: true, stdio: "ignore" });
+  return result.status === 0;
+}
+
+// The identities of `pids` and of this process, read in one query.
+async function readIdentities(pids) {
+  const { readProcessIdentities } = await import(PROCESS_LIB);
+  return readProcessIdentities([...pids, process.pid], { deadline: performance.now() + 15000 });
+}
+
+async function stopHeldChild(child, tree) {
+  if (!heldAndRunning(child)) {
+    return "exited";
+  }
+  if (tree && process.platform === "win32") {
+    // The parent's open handle keeps Windows from giving the id to another process.
+    return taskkill(child.pid, true) ? "stopped" : heldAndRunning(child) ? "failed" : "exited";
+  }
+  if (tree) {
+    // A POSIX group stop only for a group this child leads, never this process's own group. An
+    // unreaped leader keeps its group id from being reused.
+    const identities = await readIdentities([child.pid]);
+    const observed = identities.get(child.pid);
+    const own = identities.get(process.pid);
+    if (heldAndRunning(child) && observed?.state === "present" && observed.groupId === child.pid && own?.groupId !== child.pid) {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+        return "stopped";
+      } catch {
+        // The group is gone; the child's own stop below decides.
+      }
+    }
+  }
+  if (!heldAndRunning(child)) {
+    return "exited";
+  }
+  // ChildProcess.kill uses the child's own handle on Windows and its unreaped id on POSIX.
+  return child.kill("SIGKILL") ? "stopped" : heldAndRunning(child) ? "failed" : "exited";
+}
+
+function isRecordedIdentity(target) {
+  return (
+    target !== null &&
+    typeof target === "object" &&
+    Number.isInteger(target.pid) &&
+    target.pid > 0 &&
+    target.pid !== process.pid &&
+    typeof target.startToken === "string" &&
+    target.startToken !== ""
+  );
+}
+
+/**
+ * Stops processes this test started, each only when it can prove at that moment that the id is
+ * still that process's: a held ChildProcess whose exitCode and signalCode are both null, or a
+ * recorded `{ pid, startToken }` whose live identity, read with readProcessIdentity, has that
+ * token. Anything else (a bare pid, a null token, an unreadable identity) is skipped and counted
+ * in ownedStopCounts. Recorded identities are checked in one query, each stopped right after it.
+ *
+ * Without `tree` only the process itself is stopped: ChildProcess.kill("SIGKILL") for a held
+ * child, `taskkill /PID <pid> /F` or SIGKILL for a recorded identity. With `tree` Windows runs
+ * `taskkill /PID <pid> /T /F`, and POSIX signals the process group the target leads, never this
+ * process's own. Resolves to one result per target, in order: stopped, exited, mismatch,
+ * unproved or failed. A held child without `tree` is stopped before the call returns.
+ */
+export async function stopOwnedProcesses(targets, { tree = false } = {}) {
+  const results = new Array(targets.length);
+  const recorded = [];
+  const pending = [];
+  targets.forEach((target, index) => {
+    if (target instanceof ChildProcess) {
+      pending.push(stopHeldChild(target, tree).then((result) => (results[index] = count(result))));
+    } else if (!isRecordedIdentity(target)) {
+      results[index] = count("unproved");
+    } else if (!signalAlive(target.pid)) {
+      // A signal 0 probe stops nothing; an id with no process needs no stop.
+      results[index] = count("exited");
+    } else {
+      recorded.push(index);
+    }
+  });
+  await Promise.all(pending);
+  if (recorded.length === 0) {
+    return results;
+  }
+  const { confirmIdentity } = await import(PROCESS_LIB);
+  const identities = await readIdentities(recorded.map((index) => targets[index].pid));
+  const own = identities.get(process.pid);
+  for (const index of recorded) {
+    const target = targets[index];
+    const observed = identities.get(target.pid);
+    const verdict = confirmIdentity(target, observed);
+    if (verdict !== "present") {
+      results[index] = count(verdict === "absent" ? (observed?.state === "present" ? "mismatch" : "exited") : "unproved");
+      continue;
+    }
+    if (process.platform === "win32") {
+      results[index] = count(taskkill(target.pid, tree) ? "stopped" : signalAlive(target.pid) ? "failed" : "exited");
+      continue;
+    }
+    const group = tree && observed.groupId === target.pid && own?.groupId !== target.pid;
+    try {
+      process.kill(group ? -target.pid : target.pid, "SIGKILL");
+      results[index] = count("stopped");
+    } catch (error) {
+      results[index] = count(error?.code === "ESRCH" ? "exited" : "failed");
+    }
+  }
+  return results;
+}
+
+/** One target of stopOwnedProcesses; resolves to its result. */
+export async function stopOwnedProcess(target, options = {}) {
+  return (await stopOwnedProcesses([target], options))[0];
+}
+
 // Stops the child and every process it started. On POSIX the child leads its own process group,
 // so the group signal also reaches descendants that inherited its pipes.
 function killChildTree(child) {
-  if (process.platform === "win32") {
-    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-    return;
-  }
-  try {
-    process.kill(-child.pid, "SIGKILL");
-  } catch {
-    child.kill("SIGKILL");
-  }
+  stopOwnedProcess(child, { tree: true }).catch((error) => {
+    process.stderr.write(`could not stop the timed-out child ${child.pid}: ${error.message}
+`);
+  });
 }
 
 // How long a timed-out call waits for the child's pipes to close after the stop.

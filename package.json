@@ -6,7 +6,7 @@
   "description": "Delegate work and code review from Claude Code to Codex and other agent CLIs.",
   "license": "Apache-2.0",
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=22.22.3"
   },
   "scripts": {
     "bump-version": "node scripts/bump-version.mjs",

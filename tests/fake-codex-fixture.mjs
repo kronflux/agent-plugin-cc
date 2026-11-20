@@ -1,8 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { pathToFileURL } from "node:url";
 
 import { writeExecutable } from "./helpers.mjs";
+
+const PROCESS_LIB = pathToFileURL(path.join(import.meta.dirname, "..", "plugins", "agent", "scripts", "lib", "process.mjs")).href;
 
 function listEfforts(names) {
   return names.map((reasoningEffort) => ({ reasoningEffort, description: reasoningEffort }));
@@ -63,7 +66,11 @@ export const FAKE_DEBUG_SOL_MODELS = [
 //   SIGTERM and never exits.
 // - "debug-models-floods": `codex debug models` records its pid in debugModelsPids and prints
 //   16 MiB of output without a complete JSON document, then never exits.
-export function installFakeCodex(binDir, behavior = "review-ok") {
+//
+// With `{ recordIdentities: true }` every app server and `codex debug models` process also adds
+// `{ pid, startToken, key }` to processIdentities once readProcessIdentity has read its own
+// identity, so a test can stop it with stopOwnedProcesses; `key` names the pid list it is in.
+export function installFakeCodex(binDir, behavior = "review-ok", { recordIdentities = false } = {}) {
   const statePath = path.join(binDir, "fake-codex-state.json");
   const scriptPath = path.join(binDir, "codex");
   const source = `#!/usr/bin/env node
@@ -75,6 +82,8 @@ const readline = require("node:readline");
 
 	const STATE_PATH = ${JSON.stringify(statePath)};
 	const BEHAVIOR = ${JSON.stringify(behavior)};
+	const RECORD_IDENTITIES = ${JSON.stringify(recordIdentities)};
+	const PROCESS_LIB = ${JSON.stringify(PROCESS_LIB)};
 	const LIST_MODELS = ${JSON.stringify(FAKE_LIST_MODELS)};
 	const DEBUG_DEFAULT_MODELS = ${JSON.stringify(FAKE_DEBUG_DEFAULT_MODELS)};
 	const DEBUG_SOL_MODELS = ${JSON.stringify(FAKE_DEBUG_SOL_MODELS)};
@@ -168,6 +177,26 @@ function withStateLock(fn) {
 
 function saveState(state) {
   withStateLock(() => writeState(state));
+}
+
+// Adds this process's own identity, once read, to processIdentities.
+function recordOwnIdentity(key) {
+  if (!RECORD_IDENTITIES) {
+    return;
+  }
+  import(PROCESS_LIB)
+    .then((lib) => lib.readProcessIdentity(process.pid, { deadline: performance.now() + 30000 }))
+    .then((identity) => {
+      if (identity.state !== "present") {
+        return;
+      }
+      withStateLock(() => {
+        const identityState = loadState();
+        identityState.processIdentities = [...(identityState.processIdentities || []), { pid: process.pid, startToken: identity.startToken, key }];
+        saveState(identityState);
+      });
+    })
+    .catch(() => {});
 }
 
 function writeState(state) {
@@ -481,6 +510,7 @@ if (args[0] === "debug" && args[1] === "models") {
       hangState.debugModelsPids = [...(hangState.debugModelsPids || []), process.pid];
       saveState(hangState);
     });
+    recordOwnIdentity("debugModelsPids");
     process.on("SIGTERM", () => {});
     setInterval(() => {}, 60000);
     return;
@@ -491,6 +521,7 @@ if (args[0] === "debug" && args[1] === "models") {
       floodState.debugModelsPids = [...(floodState.debugModelsPids || []), process.pid];
       saveState(floodState);
     });
+    recordOwnIdentity("debugModelsPids");
     const block = "x".repeat(1024 * 1024);
     let written = 0;
     const pump = () => {
@@ -522,6 +553,7 @@ withStateLock(() => {
   bootIndex = bootState.appServerStarts;
   saveState(bootState);
 });
+recordOwnIdentity("appServerPids");
 // The catalog app server of catalog-initialize-hangs stays alive until it is killed.
 const initializeHangs = BEHAVIOR === "catalog-initialize-hangs" && bootIndex === 1;
 if (initializeHangs) {

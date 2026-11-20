@@ -4,15 +4,20 @@ import process from "node:process";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { makeTempDir } from "./helpers.mjs";
+import { makeTempDir, stopOwnedProcesses } from "./helpers.mjs";
+import { startHelperProcess } from "./store-fixtures.mjs";
 import {
   binaryAvailable,
   readProcessCommandLines,
+  readProcessIdentities,
+  readProcessIdentity,
   resolveCommand,
   runCommand,
   runCommandChecked,
+  stopTree,
   terminateProcessTree
 } from "../plugins/agent/scripts/lib/process.mjs";
+import { leaderState } from "../plugins/agent/scripts/lib/state.mjs";
 
 const windowsOnly = { skip: process.platform !== "win32" && "Windows command resolution" };
 
@@ -298,4 +303,86 @@ test("a batch-file plan sets NoDefaultCurrentDirectoryInExePath and keeps the re
   assert.equal(plan.options.env.nodefaultcurrentdirectoryinexepath, undefined);
   assert.equal(plan.options.env.KEEP, "yes");
   assert.equal(plan.options.env.PATH, dir);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Exact identities and verified stops
+
+function bumpToken(token) {
+  const match = /^(.*?)(\d+)$/.exec(token);
+  return `${match[1]}${(BigInt(match[2]) + 1n).toString()}`;
+}
+
+async function waitAbsent(pids, timeoutMs = 10000) {
+  const until = Date.now() + timeoutMs;
+  for (;;) {
+    const identities = await readProcessIdentities(pids, { deadline: performance.now() + 5000 });
+    if (pids.every((pid) => identities.get(pid)?.state === "absent")) {
+      return true;
+    }
+    if (Date.now() > until) {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+// Stops the helper's child through its recorded identity and the helper through its handle.
+function stopHelper(helper) {
+  const child = helper.childPid ? [{ pid: helper.childPid, startToken: helper.childStartToken }] : [];
+  return stopOwnedProcesses([...child, helper.process]);
+}
+
+test("stopTree stops nothing when the token differs by one unit", async (t) => {
+  const helper = await startHelperProcess();
+  t.after(() => stopHelper(helper));
+  const observed = await readProcessIdentity(helper.pid, { deadline: performance.now() + 5000 });
+  assert.equal(observed.state, "present");
+  const reused = { pid: helper.pid, startToken: bumpToken(observed.startToken) };
+  assert.equal(await stopTree(reused, { deadline: performance.now() + 5000, expectedGroupId: observed.groupId }), "mismatch");
+  assert.equal((await readProcessIdentity(helper.pid, { deadline: performance.now() + 5000 })).state, "present");
+});
+
+test("stopTree stops a verified helper process and its child", async (t) => {
+  const helper = await startHelperProcess({ child: true });
+  t.after(() => stopHelper(helper));
+  assert.ok(helper.childPid, "the helper did not report its child");
+  const observed = await readProcessIdentity(helper.pid, { deadline: performance.now() + 5000 });
+  const identity = { pid: helper.pid, startToken: observed.startToken };
+  const result = await stopTree(identity, { deadline: performance.now() + 10000, expectedGroupId: observed.groupId });
+  assert.equal(result, "stopped");
+  assert.equal(await waitAbsent([helper.pid, helper.childPid]), true);
+  assert.equal(await stopTree(identity, { deadline: performance.now() + 5000, expectedGroupId: observed.groupId }), "absent");
+});
+
+test("a batched identity query of 20 processes finishes within 1,500 ms on Windows", { timeout: 120000 }, async (t) => {
+  const helpers = [];
+  t.after(() => Promise.all(helpers.map(stopHelper)));
+  for (let index = 0; index < 20; index += 1) {
+    helpers.push(await startHelperProcess());
+  }
+  const started = performance.now();
+  const identities = await readProcessIdentities(
+    helpers.map((helper) => helper.pid),
+    { deadline: performance.now() + 10000 }
+  );
+  const elapsed = performance.now() - started;
+  t.diagnostic(`batched identity query of 20 processes on ${process.platform}: ${Math.round(elapsed)} ms`);
+  assert.ok(helpers.every((helper) => identities.get(helper.pid)?.state === "present"));
+  if (process.platform === "win32") {
+    assert.ok(elapsed <= 1500, `the query took ${Math.round(elapsed)} ms`);
+  }
+});
+
+test("leaderState answers none, unknown, gone and alive", async (t) => {
+  const helper = await startHelperProcess();
+  t.after(() => stopHelper(helper));
+  const observed = await readProcessIdentity(helper.pid, { deadline: performance.now() + 5000 });
+  const row = (fields) => ({ row: { leader_pid: helper.pid, leader_start_token: observed.startToken, ...fields } });
+  assert.equal(leaderState(row({ leader_pid: null }), observed), "none");
+  assert.equal(leaderState(row({ leader_start_token: null }), observed), "unknown");
+  assert.equal(leaderState(row({}), { state: "unknown", reason: "timed out" }), "unknown");
+  assert.equal(leaderState(row({}), observed), "alive");
+  assert.equal(leaderState(row({ leader_start_token: bumpToken(observed.startToken) }), observed), "gone");
+  assert.equal(leaderState(row({}), { state: "absent" }), "gone");
 });

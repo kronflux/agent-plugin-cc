@@ -4,9 +4,12 @@ import process from "node:process";
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
-import { initGitRepo, makeCommittedRepo, makeTempDir, run, spawnJson, stopWaiting, waitUntil } from "./helpers.mjs";
+import { initGitRepo, makeCommittedRepo, makeTempDir, ownedStopCounts, run, spawnJson, stopOwnedProcess, stopWaiting, waitUntil } from "./helpers.mjs";
+
+const PROCESS_LIB = pathToFileURL(path.resolve(import.meta.dirname, "..", "plugins", "agent", "scripts", "lib", "process.mjs")).href;
 
 test("waitUntil treats a throwing predicate as not yet", async () => {
   let calls = 0;
@@ -76,21 +79,28 @@ test("spawnJson rejects on timeout and stops the child", { timeout: 60000 }, asy
 });
 
 test("spawnJson stops a timed-out child's descendants that hold its output", { timeout: 60000 }, async (t) => {
+  // Registered before the folder, so it runs before the folder is removed.
+  let identityFile = null;
+  t.after(() => (identityFile && fs.existsSync(identityFile) ? stopOwnedProcess(JSON.parse(fs.readFileSync(identityFile, "utf8"))) : null));
   const dir = makeTempDir(t);
   const pidFile = path.join(dir, "grandchild.txt");
-  // The grandchild inherits the child's stdout and stderr and would keep them open.
+  identityFile = path.join(dir, "grandchild-identity.json");
+  // The grandchild inherits the child's stdout and stderr and would keep them open. The child,
+  // which holds the grandchild, also records the grandchild's identity once it has read it.
   const script = [
     'const { spawn } = require("node:child_process");',
     'const grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "inherit" });',
     `require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(grandchild.pid));`,
+    `import(${JSON.stringify(PROCESS_LIB)})`,
+    "  .then((lib) => lib.readProcessIdentity(grandchild.pid, { deadline: performance.now() + 30000 }))",
+    "  .then((identity) => {",
+    "    if (identity.state === \"present\") {",
+    `      require("node:fs").writeFileSync(${JSON.stringify(identityFile)}, JSON.stringify({ pid: grandchild.pid, startToken: identity.startToken }));`,
+    "    }",
+    "  });",
     "setInterval(() => {}, 1000);"
   ].join("\n");
   let grandchildPid = null;
-  t.after(() => {
-    if (grandchildPid && processExists(grandchildPid)) {
-      process.kill(grandchildPid, "SIGKILL");
-    }
-  });
 
   const outcome = await Promise.race([
     spawnJson(process.execPath, ["-e", script], { timeoutMs: 4000 }).then(
@@ -164,4 +174,172 @@ test("makeCommittedRepo returns a repository with one commit", (t) => {
   const repo = makeCommittedRepo(t);
   const result = run("git", ["rev-list", "--count", "HEAD"], { cwd: repo, check: true });
   assert.equal(result.stdout.trim(), "1");
+});
+
+// Lines that may signal or taskkill a process outside stopOwnedProcess, each with its reason.
+// An entry matches a line of `file` that contains `text`.
+const STOP_ALLOWLIST = [];
+
+// The text between the parenthesis at `open` and its match, or null when it is not closed.
+function callArguments(source, open) {
+  let depth = 0;
+  let quote = null;
+  for (let index = open; index < source.length; index += 1) {
+    const char = source[index];
+    if (quote) {
+      if (char === "\\") {
+        index += 1;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") {
+      quote = char;
+    } else if (char === "(" || char === "[" || char === "{") {
+      depth += 1;
+    } else if (char === ")" || char === "]" || char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(open + 1, index);
+      }
+    }
+  }
+  return null;
+}
+
+// Splits call arguments at their top-level commas.
+function splitArguments(text) {
+  const parts = [];
+  let depth = 0;
+  let quote = null;
+  let start = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (quote) {
+      if (char === "\\") {
+        index += 1;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") {
+      quote = char;
+    } else if ("([{".includes(char)) {
+      depth += 1;
+    } else if (")]}".includes(char)) {
+      depth -= 1;
+    } else if (char === "," && depth === 0) {
+      parts.push(text.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  parts.push(text.slice(start).trim());
+  return parts.filter((part) => part !== "");
+}
+
+// Every process.kill call with a signal other than 0, and every taskkill spawn, outside comments,
+// in the test files other than tests/helpers.mjs and outside the allowlist: `{ file, line, text }`.
+export function findUnownedStops(testsDir) {
+  const found = [];
+  for (const name of fs.readdirSync(testsDir).filter((entry) => entry.endsWith(".mjs")).sort()) {
+    if (name === "helpers.mjs") {
+      continue;
+    }
+    const source = fs.readFileSync(path.join(testsDir, name), "utf8");
+    const lineOf = (index) => source.slice(0, index).split("\n").length;
+    const lineText = (line) => source.split("\n")[line - 1].trim();
+    const hits = [];
+    for (const match of source.matchAll(/process\.kill\s*\(/g)) {
+      const args = callArguments(source, match.index + match[0].length - 1);
+      const parts = args === null ? [] : splitArguments(args);
+      if (parts.length >= 2 && parts[1] === "0") {
+        continue;
+      }
+      hits.push(lineOf(match.index));
+    }
+    for (const match of source.matchAll(/\b(?:spawn|spawnSync|execFile|execFileSync|exec|execSync|runBounded)\s*\(\s*["'`]taskkill\b/g)) {
+      hits.push(lineOf(match.index));
+    }
+    for (const line of hits) {
+      const text = lineText(line);
+      if (text.startsWith("//") || text.startsWith("*")) {
+        continue;
+      }
+      if (!STOP_ALLOWLIST.some((entry) => entry.file === name && text.includes(entry.text))) {
+        found.push({ file: name, line, text });
+      }
+    }
+  }
+  return found;
+}
+
+test("no test file signals or taskkills a process outside stopOwnedProcess", () => {
+  const found = findUnownedStops(import.meta.dirname);
+  assert.deepEqual(
+    found.map((entry) => `${entry.file}:${entry.line}: ${entry.text}`),
+    [],
+    `${found.length} unowned stops`
+  );
+});
+
+test("the stop guard flags signals and taskkill spawns and passes signal 0 probes and comments", (t) => {
+  const dir = makeTempDir(t);
+  // The calls are assembled, so this file itself holds none for the guard to find.
+  const kill = ["process", "kill"].join(".");
+  const spawnTaskkill = ["spawnSync(", '"task', 'kill"'].join("");
+  fs.writeFileSync(
+    path.join(dir, "sample.test.mjs"),
+    [
+      `${kill}(pid, 0);`,
+      `${kill}(pid);`,
+      `${kill}(child.pid, "SIGKILL");`,
+      `// ${kill}(pid) in a comment`,
+      `${spawnTaskkill}, ["/PID", String(pid), "/F"]);`,
+      ""
+    ].join("\n")
+  );
+  fs.writeFileSync(path.join(dir, "helpers.mjs"), `${kill}(pid, "SIGKILL");\n`);
+  assert.deepEqual(
+    findUnownedStops(dir).map((entry) => `${entry.file}:${entry.line}`),
+    ["sample.test.mjs:2", "sample.test.mjs:3", "sample.test.mjs:5"]
+  );
+});
+
+function spawnSleeper() {
+  return spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });
+}
+
+test("stopOwnedProcess stops a held running child and skips one that has exited", { timeout: 30000 }, async (t) => {
+  const child = spawnSleeper();
+  t.after(() => stopOwnedProcess(child));
+  await new Promise((resolve) => child.once("spawn", resolve));
+  const exited = new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
+  assert.equal(await stopOwnedProcess(child), "stopped");
+  await exited;
+  assert.equal(await stopOwnedProcess(child), "exited");
+});
+
+test("stopOwnedProcess stops a recorded identity only when its start token matches", { timeout: 60000 }, async (t) => {
+  const child = spawnSleeper();
+  t.after(() => stopOwnedProcess(child));
+  await new Promise((resolve) => child.once("spawn", resolve));
+  const { readProcessIdentity } = await import(PROCESS_LIB);
+  const observed = await readProcessIdentity(child.pid, { deadline: performance.now() + 15000 });
+  assert.equal(observed.state, "present");
+  const before = { ...ownedStopCounts };
+  const otherToken = String(observed.startToken).replace(/(\d+)$/, (digits) => String(BigInt(digits) + 1n));
+
+  assert.equal(await stopOwnedProcess(child.pid), "unproved");
+  assert.equal(await stopOwnedProcess({ pid: child.pid, startToken: null }), "unproved");
+  assert.equal(await stopOwnedProcess({ pid: child.pid, startToken: otherToken }), "mismatch");
+  assert.equal(child.exitCode, null);
+  assert.equal(child.signalCode, null);
+  assert.equal(ownedStopCounts.unproved - before.unproved, 2);
+  assert.equal(ownedStopCounts.mismatch - before.mismatch, 1);
+
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  assert.equal(await stopOwnedProcess({ pid: child.pid, startToken: observed.startToken }), "stopped");
+  await exited;
 });

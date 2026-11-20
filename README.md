@@ -420,6 +420,23 @@ The plugin keeps one `config.json` per repository in its state folder (under `CL
 
 The hook that starts each Claude Code session exports `AGENT_PLUGIN_SESSION_ID` and `AGENT_PLUGIN_TRANSCRIPT_PATH` for the commands of that session.
 
+## Job store
+
+A background worker stops its own agent process through the process handle it opened when it
+started that process. While the worker holds the handle and has not seen the process exit, Windows
+cannot give the process id to another process, so `taskkill /T /F` reaches the agent's own tree. The
+stop counts as a tree stop only when `taskkill` succeeds on a process that was still running. On
+Linux the agent process leads its own process group. The plugin signals that group, and it treats
+the agent's processes as gone only when the kernel reports the group empty.
+
+Residual risk of stopping a process on Windows without the worker's handle: when a worker has died
+and a later check or hook stops a worker or an agent process, it first reads that process's id and
+start time, and stops nothing when they differ from the recorded ones. `taskkill` then receives only
+the process id. If the process exits and Windows gives its id to a new process in the short time
+between that check and `taskkill` opening the process, the new process and its children are stopped
+instead, and the stop counts as a verified tree stop of the old process. Windows reuses process ids,
+but rarely this quickly.
+
 ## Antigravity
 
 The plugin also drives the Antigravity CLI (`agy`). Its jobs appear in `/agent:status`, and

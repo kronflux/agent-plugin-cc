@@ -24,15 +24,16 @@ export async function run(argv) {
   await reconcileJobLiveness(cwd);
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
-  const { payload, nextJob } = await cancelJob(workspaceRoot, job, existing);
-  outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+  const { payload, report } = await cancelJob(workspaceRoot, job, existing);
+  outputCommandResult(payload, report, options.json);
 }
 
 /**
  * Cancels a job: marks it cancelled, asks its provider to interrupt the turn, stops its
  * processes, and records it as cancelled. `existing` is the job's stored record read before the
- * call; the record is read again after the cancel marker is written. Returns the command payload
- * and the job as reported.
+ * call; the record is read again after the cancel marker is written. Returns the command payload,
+ * the job as reported, and the rendered report. When the job's process could not be verified, it
+ * is not stopped, and the payload's `processWarning` and the report say it may still be running.
  */
 export async function cancelJob(workspaceRoot, job, existing, deps = {}) {
   const {
@@ -73,7 +74,13 @@ export async function cancelJob(workspaceRoot, job, existing, deps = {}) {
     }
   }
   const [termination] = terminate([{ ...job, ...current }]);
-  if (termination?.outcome === "pid-reused") {
+  const processWarning =
+    termination?.outcome === "unverified"
+      ? `Process ${termination.pid} could not be verified as this job's, so it was not stopped; it may still be running.`
+      : null;
+  if (processWarning) {
+    appendLogLine(job.logFile, processWarning);
+  } else if (termination?.outcome === "pid-reused") {
     appendLogLine(job.logFile, `Process ${termination.pid} no longer belongs to this job; it was not stopped.`);
   } else if (termination?.outcome === "failed") {
     appendLogLine(job.logFile, `Stopping process ${termination.pid} failed: ${termination.detail}`);
@@ -112,7 +119,9 @@ export async function cancelJob(workspaceRoot, job, existing, deps = {}) {
     status: "cancelled",
     title: job.title,
     turnInterruptAttempted: interrupt.attempted,
-    turnInterrupted: interrupt.interrupted
+    turnInterrupted: interrupt.interrupted,
+    ...(processWarning ? { processWarning } : {})
   };
-  return { payload, nextJob };
+  const report = renderCancelReport(nextJob) + (processWarning ? `\n**Warning:** ${processWarning}\n` : "");
+  return { payload, nextJob, report };
 }

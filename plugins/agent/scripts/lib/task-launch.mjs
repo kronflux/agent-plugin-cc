@@ -1,10 +1,12 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import process from "node:process";
 
 import { createWorktree, removeWorktree } from "./git.mjs";
-import { generateJobId, resolveStateDir } from "./state.mjs";
+import { generateJobId, readCohort, readJobView, recordLaunchAttempt, resolveStateDir } from "./state.mjs";
+import { boundary, NODE_LAUNCH_FLAGS, wallNow } from "./store.mjs";
 import { createJobRecord } from "./tracked-jobs.mjs";
 
 // How long send waits for the agent to confirm a message by default, and how long a provider's
@@ -146,6 +148,69 @@ export function readTaskManifest(cwd, file) {
   });
 }
 
+// ---------------------------------------------------------------------------------------------
+// Questions at a turn boundary
+
+/** The fixed line `--allow-questions` adds to what a job sends. */
+export const QUESTION_INSTRUCTION =
+  "If you cannot continue without an answer from the requester, end your reply with one final line of the form AGENT-QUESTION: <one question>.";
+const QUESTION_MARKER = "AGENT-QUESTION:";
+
+export class QuestionSchemaError extends Error {
+  constructor(rule) {
+    super(rule);
+    this.name = "QuestionSchemaError";
+    this.rule = rule;
+  }
+}
+
+/** Throws QuestionSchemaError unless `schema` can take the added optional `question` property. */
+export function validateQuestionSchema(schema) {
+  const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+  if (!isObject(schema) || schema.type !== "object" || !isObject(schema.properties)) {
+    throw new QuestionSchemaError("the output schema root must be an object schema with properties");
+  }
+  if (Object.prototype.hasOwnProperty.call(schema.properties, "question")) {
+    throw new QuestionSchemaError("the output schema already defines a question property");
+  }
+}
+
+/** A copy of `schema` with an added optional string property `question`. */
+export function augmentSchemaForQuestions(schema) {
+  const copy = structuredClone(schema);
+  copy.properties = { ...copy.properties, question: { type: "string" } };
+  return copy;
+}
+
+/**
+ * The question a turn asked, when questions are allowed: a non-empty structured `question`, else
+ * a final non-empty text line that starts with `AGENT-QUESTION:`. An empty structured `question`
+ * is removed from the returned JSON.
+ */
+export function extractQuestion({ text = "", json = null, allowQuestions = false } = {}) {
+  if (!allowQuestions) {
+    return { question: null, json };
+  }
+  let output = json;
+  if (json && typeof json === "object" && !Array.isArray(json) && Object.prototype.hasOwnProperty.call(json, "question")) {
+    if (typeof json.question === "string" && json.question.trim()) {
+      return { question: json.question.trim(), json };
+    }
+    output = { ...json };
+    delete output.question;
+  }
+  const lastLine = String(text ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .at(-1);
+  if (lastLine && lastLine.startsWith(QUESTION_MARKER)) {
+    const question = lastLine.slice(QUESTION_MARKER.length).trim();
+    return { question: question || null, json: output };
+  }
+  return { question: null, json: output };
+}
+
 // Another provider's follow-up turn is started by that provider's companion as a new
 // background task on the same thread.
 export function startTurnWithProviderCompanion(cwd, provider, job, text, deps = { spawnSyncImpl: spawnSync }) {
@@ -176,4 +241,87 @@ export function startTurnWithProviderCompanion(cwd, provider, job, text, deps = 
     throw new Error(`${label} printed no job id for the new turn.`);
   }
   return { status: "started", jobId: job.id, newJobId, threadId: job.threadId };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Launching workers for queued store jobs
+
+// The provider registry imports the provider modules, which import this module, so it is loaded
+// when a worker is first launched.
+const requireModule = createRequire(import.meta.url);
+
+function workerEntry(providerId) {
+  return process.env.AGENT_PLUGIN_TEST_WORKER_ENTRY || requireModule("./providers.mjs").getProvider(providerId).companionScript;
+}
+
+function timeLeft(deadline) {
+  return deadline === undefined || deadline === null ? Infinity : deadline - performance.now();
+}
+
+/**
+ * Launches a detached worker for a queued job after committing the launch attempt; a refused
+ * attempt (not in its provider's cohort, held thread, barrier, claimed, ended or launched less than
+ * 5 seconds ago) spawns nothing and resolves to null. The job read, the provider module load and
+ * the boundary log come before the attempt; once the attempt commits, the spawn follows in the same
+ * synchronous run, so a committed attempt always spawns. With `deadline` (a `performance.now()`
+ * value) the attempt transaction checks it as its last step before COMMIT: once it has passed
+ * nothing is counted and nothing spawns. A spawn already started may finish after the deadline.
+ */
+export async function launchWorker(store, stateDir, jobId, { deadline = undefined } = {}) {
+  if (timeLeft(deadline) <= 0) {
+    return null;
+  }
+  const view = readJobView(store, jobId);
+  if (!view) {
+    return null;
+  }
+  const entry = workerEntry(view.provider);
+  const args = [...NODE_LAUNCH_FLAGS, entry, "worker", "--state-dir", stateDir, "--job", jobId];
+  boundary("spawn");
+  let attempt;
+  try {
+    attempt = recordLaunchAttempt(store, jobId, { now: wallNow() }, deadline === undefined ? {} : { deadline });
+  } catch (error) {
+    if (deadline !== undefined && timeLeft(deadline) <= 0) {
+      return null;
+    }
+    throw error;
+  }
+  if (!attempt.ok) {
+    return null;
+  }
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(process.execPath, args, { detached: true, stdio: "ignore", windowsHide: true });
+    } catch {
+      resolve(null);
+      return;
+    }
+    child.once("error", () => resolve(null));
+    child.once("spawn", () => {
+      child.unref();
+      resolve({ pid: child.pid });
+    });
+  });
+}
+
+/**
+ * The launch a releasing worker runs: one worker per job of its provider's cohort; resolves to
+ * the ids launched. With `deadline`, a member's launch starts only before it, checked just before
+ * each member; members not launched wait for the next scan. `launch` replaces launchWorker in
+ * tests.
+ */
+export async function launchEligible(store, stateDir, providerId, { deadline = undefined, launch = launchWorker } = {}) {
+  const { cohort } = readCohort(store, providerId);
+  const launched = [];
+  for (const jobId of cohort) {
+    if (timeLeft(deadline) <= 0) {
+      break;
+    }
+    if (await launch(store, stateDir, jobId, { deadline })) {
+      launched.push(jobId);
+    }
+  }
+  return launched;
 }

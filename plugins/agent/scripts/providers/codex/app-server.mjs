@@ -284,12 +284,17 @@ export class SpawnedCodexAppServerClient extends AppServerClientBase {
   async initialize() {
     const env = this.options.env ?? process.env;
     const spawnPlan = resolveCommand("codex", ["app-server"], env);
+    // `ownProcessGroup: true` (the background worker's driver passes it; off by default) makes the
+    // app server lead its own process group on Linux, so the worker can signal its whole tree and
+    // check its closure as one group. Without it the app server stays in its caller's group, where
+    // a Ctrl+C or a closed terminal reaches it.
     this.attachProcess(
       spawn(spawnPlan.file, spawnPlan.args, {
         cwd: this.cwd,
         env,
         stdio: ["pipe", "pipe", "pipe"],
         ...spawnPlan.options,
+        detached: this.options.ownProcessGroup === true && process.platform === "linux",
         windowsHide: true
       })
     );

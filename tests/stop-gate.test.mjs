@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -12,13 +11,21 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(ROOT, "plugins", "agent", "scripts", "stop-review-gate-hook.mjs");
 
-function leftoverPromptFiles() {
-  return fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("agent-stop-review-"));
+// The temp folder variables of one gate's hook runs: the hook writes its prompt file to
+// os.tmpdir(), so each gate gets a folder of its own that no other test process writes to.
+function tempEnv(promptDir) {
+  return { TEMP: promptDir, TMP: promptDir, TMPDIR: promptDir };
+}
+
+// The prompt files the hook runs of `gate` left in the gate's own temp folder.
+function leftoverPromptFiles(gate) {
+  return fs.readdirSync(gate.promptDir).filter((name) => name.startsWith("agent-stop-review-"));
 }
 
 function setupGate(behavior) {
   const repo = makeTempDir();
   const binDir = makeTempDir();
+  const promptDir = makeTempDir();
   installFakeCodex(binDir, behavior);
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
@@ -26,13 +33,18 @@ function setupGate(behavior) {
   run("git", ["commit", "-m", "init"], { cwd: repo });
   const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo, env: buildEnv(binDir) });
   assert.equal(setup.status, 0, setup.stderr);
-  return { repo, binDir };
+  // The folder the leftover checks list is the one os.tmpdir() names for the hook.
+  const resolved = run(process.execPath, ["-e", "process.stdout.write(require('node:os').tmpdir())"], {
+    env: { ...buildEnv(binDir), ...tempEnv(promptDir) }
+  });
+  assert.equal(path.resolve(resolved.stdout), path.resolve(promptDir));
+  return { repo, binDir, promptDir };
 }
 
-function runStopHook({ repo, binDir }, message = "I updated the retry logic.", extraEnv = {}) {
+function runStopHook({ repo, binDir, promptDir }, message = "I updated the retry logic.", extraEnv = {}) {
   const result = run("node", [STOP_HOOK], {
     cwd: repo,
-    env: { ...buildEnv(binDir), ...extraEnv },
+    env: { ...buildEnv(binDir), ...tempEnv(promptDir), ...extraEnv },
     input: JSON.stringify({ cwd: repo, session_id: "sess-gate", last_assistant_message: message })
   });
   assert.equal(result.status, 0, result.stderr);
@@ -81,7 +93,7 @@ test("the gate reviews a 200,000-character message", () => {
   assert.doesNotMatch(decision?.reason ?? "", /The stop-time Codex review failed/);
   const prompt = JSON.parse(fs.readFileSync(path.join(gate.binDir, "fake-codex-state.json"), "utf8")).lastTurnStart.prompt;
   assert.ok(prompt.includes(message.slice(-100)));
-  assert.deepEqual(leftoverPromptFiles(), []);
+  assert.deepEqual(leftoverPromptFiles(gate), []);
 });
 
 test("a failed review leaves no prompt file behind", () => {
@@ -89,7 +101,7 @@ test("a failed review leaves no prompt file behind", () => {
   const { decision } = runStopHook(gate);
   assert.equal(decision.decision, "block");
   assert.match(decision.reason, /The stop-time Codex review failed/);
-  assert.deepEqual(leftoverPromptFiles(), []);
+  assert.deepEqual(leftoverPromptFiles(gate), []);
 });
 
 // Loaded with --import into the hook: a write to the prompt file stores a few bytes and then

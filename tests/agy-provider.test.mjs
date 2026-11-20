@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
 import { installFakeAgy, readFakeAgyState } from "./fake-agy-fixture.mjs";
-import { initGitRepo, makeTempDir, run, waitUntil } from "./helpers.mjs";
+import { initGitRepo, makeTempDir, run, stopOwnedProcesses, waitUntil } from "./helpers.mjs";
 import { isProcessAlive } from "../plugins/agent/scripts/lib/process.mjs";
 import { runAgyTurn } from "../plugins/agent/scripts/providers/agy/runtime.mjs";
 import { readStoredJob } from "../plugins/agent/scripts/lib/job-control.mjs";
@@ -17,18 +17,21 @@ const AGY = path.join(ROOT, "plugins", "agent", "scripts", "agy-companion.mjs");
 const COMPANION = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
 const NEUTRAL = path.join(ROOT, "plugins", "agent", "scripts", "agent-companion.mjs");
 
-// Stops, by id, each fake agy process of this test that is still alive; every id in the state
-// file belongs to a process the test's own fake agy started.
-function stopFakeAgyProcesses(binDir) {
-  for (const pid of readFakeAgyState(binDir).pids ?? []) {
-    if (isProcessAlive(pid)) {
-      try {
-        process.kill(pid);
-      } catch {
-        // It exited in the meantime.
-      }
-    }
-  }
+// The recorded identities of the fake agy processes of this test, once every listed process
+// that still runs has recorded its own (or 10 s have passed).
+async function fakeAgyIdentities(binDir, pids) {
+  const identities = () => readFakeAgyState(binDir).identities ?? [];
+  await waitUntil(() => pids.every((pid) => !isProcessAlive(pid) || identities().some((entry) => entry.pid === pid)), {
+    timeoutMs: 10000,
+    describe: "the fake agy processes to record their identities"
+  }).catch(() => {});
+  return identities();
+}
+
+// Stops, through stopOwnedProcesses, each fake agy process of this test that recorded its
+// identity.
+async function stopFakeAgyProcesses(binDir) {
+  await stopOwnedProcesses(await fakeAgyIdentities(binDir, readFakeAgyState(binDir).pids ?? []));
 }
 
 function makeRepo(behavior, t) {

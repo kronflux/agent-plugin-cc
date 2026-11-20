@@ -5,6 +5,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { readHookInputJson } from "./fs.mjs";
+import { readProcessIdentity } from "./process.mjs";
 
 // Everything the plugin assumes about Claude Code, its host: the variables Claude Code sets, the
 // session variables the SessionStart hook exports, the profile folder that holds transcripts,
@@ -135,4 +136,20 @@ export function writeSessionEnv({ sessionId, transcriptPath, pluginDataDir }, en
 /** The text a Stop hook prints to keep the session from ending. */
 export function formatBlockDecision(reason) {
   return JSON.stringify({ decision: "block", reason });
+}
+
+/**
+ * The identity a new job records as its requester: the session id, the Claude Code process id,
+ * and that process's start token (null when it cannot be read).
+ */
+export async function readRequesterIdentity(env = process.env) {
+  const sessionId = getSessionId(env);
+  const hostPid = getHostPid(env);
+  const leaderPid = hostPid === null ? null : Number(hostPid);
+  let leaderStartToken = null;
+  if (leaderPid !== null) {
+    const identity = await readProcessIdentity(leaderPid, { deadline: performance.now() + 5000 });
+    leaderStartToken = identity.state === "present" ? identity.startToken : null;
+  }
+  return { sessionId, leaderPid, leaderStartToken };
 }

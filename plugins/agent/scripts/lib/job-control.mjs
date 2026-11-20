@@ -1,10 +1,12 @@
 import fs from "node:fs";
 
 import { getProvider, providerForJob } from "./providers.mjs";
-import { isProcessAlive, readProcessCommandLines, terminateProcessTree } from "./process.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile, upsertJob } from "./state.mjs";
+import { isProcessAlive, readProcessCommandLines, readProcessIdentities, terminateProcessTree } from "./process.mjs";
+import { getConfig, leaderState, listJobs, readJobFile, resolveJobFile, scanWorkspace, upsertJob } from "./state.mjs";
 import { getSessionId } from "./host.mjs";
 import { nowIso } from "./tracked-jobs.mjs";
+import { openStore, RETRY_BUDGETS } from "./store.mjs";
+import { launchWorker } from "./task-launch.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
@@ -106,7 +108,8 @@ export async function reconcileJobLiveness(cwd, options = {}) {
 /**
  * Stops the processes of active jobs. A PID is signalled only when its command line still
  * identifies the job, so a PID reused by an unrelated process is left alone. When the lookup
- * itself fails, the PID is signalled.
+ * itself fails, nothing is signalled and each job's outcome is `unverified`: its process may
+ * still be running.
  */
 export function terminateJobProcesses(jobs, options = {}) {
   const readCommandLines = options.readCommandLines ?? readProcessCommandLines;
@@ -115,10 +118,13 @@ export function terminateJobProcesses(jobs, options = {}) {
   const commandLines = targets.length > 0 ? readCommandLines(targets.map((job) => job.pid)) : new Map();
 
   return targets.map((job) => {
-    if (commandLines && !commandLines.has(job.pid)) {
+    if (!commandLines) {
+      return { jobId: job.id, pid: job.pid, outcome: "unverified" };
+    }
+    if (!commandLines.has(job.pid)) {
       return { jobId: job.id, pid: job.pid, outcome: "not-running" };
     }
-    if (commandLines && !commandLines.get(job.pid).includes(jobProcessMarker(job))) {
+    if (!commandLines.get(job.pid).includes(jobProcessMarker(job))) {
       return { jobId: job.id, pid: job.pid, outcome: "pid-reused" };
     }
     try {
@@ -470,4 +476,36 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
   }
 
   throw new Error("No active jobs to cancel.");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Store reconciliation
+
+/** The leader state of each view, from one batched identity query bounded by `deadline`. */
+export async function readLeaderStates(views, { deadline } = {}) {
+  const pids = views.map((view) => view.row.leader_pid).filter((pid) => Number.isInteger(pid));
+  const identities = await readProcessIdentities(pids, { deadline: deadline ?? performance.now() + 5000 });
+  return new Map(views.map((view) => [view.id, leaderState(view, identities.get(view.row.leader_pid) ?? { state: "unknown", reason: "not queried" })]));
+}
+
+/**
+ * Opens the workspace's store, runs one scan whose launches go through `launchWorker`, and closes
+ * the store. `budget` names the busy allowance per statement (RETRY_BUDGETS); `leaderCheck`
+ * defaults to batched leader identities.
+ */
+export async function reconcileStore(stateDir, { deadline, budget = "command", leaderCheck = null } = {}) {
+  const attemptMs = RETRY_BUDGETS[budget]?.attemptMs ?? RETRY_BUDGETS.command.attemptMs;
+  const store = openStore(stateDir, { deadline, busyTimeoutMs: attemptMs });
+  try {
+    return await scanWorkspace(store, {
+      deadline,
+      stateDir,
+      attemptMs,
+      launch: (jobId) => launchWorker(store, stateDir, jobId),
+      heartbeats: null,
+      leaderCheck: leaderCheck ?? ((views) => readLeaderStates(views, { deadline }))
+    });
+  } finally {
+    store.close();
+  }
 }

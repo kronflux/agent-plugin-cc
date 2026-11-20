@@ -201,3 +201,22 @@ test("reads skip a shared fallback state root that is not private to the caller"
   assert.equal(warnings.length, 1, warnings.join(""));
   assert.match(warnings[0], /^warning: .*not a private folder owned by you.*; its jobs are not read\n$/);
 });
+
+test("resolveStateDir returns the plugin-data root and nothing reads the temp root through it", async (t) => {
+  const workspace = makeTempDir(t);
+  const pluginDataDir = makeTempDir(t);
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  t.after(() => {
+    process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+  });
+  const stateDir = resolveStateDir(workspace);
+  assert.equal(path.dirname(stateDir), path.join(pluginDataDir, "state"));
+  const { openStore } = await import("../plugins/agent/scripts/lib/store.mjs");
+  openStore(stateDir).close();
+  assert.equal(fs.existsSync(path.join(stateDir, "store", "state.db")), true);
+  const tempRoot = path.join(os.tmpdir(), typeof process.getuid === "function" ? `agent-plugin-${process.getuid()}` : "agent-plugin");
+  assert.equal(fs.existsSync(path.join(tempRoot, path.basename(stateDir), "store")), false);
+  const storeSource = fs.readFileSync(new URL("../plugins/agent/scripts/lib/store.mjs", import.meta.url), "utf8");
+  assert.equal(storeSource.includes("candidateStateDirs"), false);
+});

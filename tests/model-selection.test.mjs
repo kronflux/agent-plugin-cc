@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildEnv, FAKE_DEBUG_SOL_MODELS, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { makeCommittedRepo, makeTempDir } from "./helpers.mjs";
+import { makeCommittedRepo, makeTempDir, stopOwnedProcesses, waitUntil } from "./helpers.mjs";
 import { launchManifestTasks } from "../plugins/agent/scripts/codex-companion.mjs";
 import { sortJobsNewestFirst } from "../plugins/agent/scripts/lib/job-control.mjs";
 import { isProcessAlive } from "../plugins/agent/scripts/lib/process.mjs";
@@ -62,10 +62,10 @@ test("listCatalogModels gives up after the catalog timeout", async () => {
 
 // Command-line tests: each runs the Codex companion against a fake Codex.
 
-function makeRepo(t, behavior = "catalog-default") {
+function makeRepo(t, behavior = "catalog-default", fakeOptions = {}) {
   const repo = makeCommittedRepo(t);
   const binDir = makeTempDir(t);
-  installFakeCodex(binDir, behavior);
+  installFakeCodex(binDir, behavior, fakeOptions);
   return { repo, binDir, env: buildEnv(binDir) };
 }
 
@@ -351,8 +351,8 @@ test("a follow-up with --model configured keeps the inherited effort", (t) => {
   assert.deepEqual(warningLines(resumed.stderr, "of the continued job"), []);
 });
 
-test("a codex debug models run that floods its output is stopped and the catalog is unavailable", { timeout: 60000 }, (t) => {
-  const ctx = makeRepo(t, "debug-models-floods");
+test("a codex debug models run that floods its output is stopped and the catalog is unavailable", { timeout: 60000 }, async (t) => {
+  const ctx = makeRepo(t, "debug-models-floods", { recordIdentities: true });
   const script = [
     `const { readDebugModels } = await import(${JSON.stringify(pathToFileURL(MODEL_CATALOG).href)});`,
     "const started = Date.now();",
@@ -366,7 +366,7 @@ test("a codex debug models run that floods its output is stopped and the catalog
     timeout: 30000,
     windowsHide: true
   });
-  const running = stopRecordedProcesses(ctx, "debugModelsPids");
+  const running = await stopRecordedProcesses(ctx, "debugModelsPids");
   assert.equal(result.status, 0, result.stderr);
   assert.equal((fakeState(ctx).debugModelsPids ?? []).length, 1);
   const report = JSON.parse(result.stdout);
@@ -448,27 +448,27 @@ test("a stored setting applies to the next task", (t) => {
   assert.equal(job.effortSource, "setting");
 });
 
-// Stops, by id, each process the fake Codex of this test recorded under `key` that is still
-// running, and returns the ids it found running.
-function stopRecordedProcesses(ctx, key) {
+// Stops, through stopOwnedProcesses, each process the fake Codex of this test recorded under `key`
+// with its start token, and returns the recorded ids a signal 0 probe found running. A running
+// process is given time to record its identity first.
+async function stopRecordedProcesses(ctx, key) {
   const running = (fakeState(ctx)[key] ?? []).filter((pid) => isProcessAlive(pid));
-  for (const pid of running) {
-    try {
-      process.kill(pid);
-    } catch {
-      // It exited in the meantime.
-    }
-  }
+  const identities = () => (fakeState(ctx).processIdentities ?? []).filter((entry) => entry.key === key);
+  await waitUntil(() => running.every((pid) => !isProcessAlive(pid) || identities().some((entry) => entry.pid === pid)), {
+    timeoutMs: 15000,
+    describe: "the running processes to record their identities"
+  }).catch(() => {});
+  await stopOwnedProcesses(identities());
   return running;
 }
 
-test("a catalog app server that never answers initialize is stopped and the task ends", { timeout: 60000 }, (t) => {
-  const repo = makeRepo(t, "catalog-initialize-hangs");
+test("a catalog app server that never answers initialize is stopped and the task ends", { timeout: 60000 }, async (t) => {
+  const repo = makeRepo(t, "catalog-initialize-hangs", { recordIdentities: true });
   const ctx = { ...repo, env: { ...repo.env, ...SHORT_CATALOG_TIMEOUT } };
   const started = Date.now();
   const result = companion(ctx, ["task", "x"], { timeout: 30000 });
   const elapsed = Date.now() - started;
-  const running = stopRecordedProcesses(ctx, "appServerPids");
+  const running = await stopRecordedProcesses(ctx, "appServerPids");
   assert.equal(result.error?.code ?? null, null, "the task did not end");
   assert.deepEqual(running, [], "an app server is still running");
   assert.equal(result.status, 0, result.stderr);
@@ -476,8 +476,8 @@ test("a catalog app server that never answers initialize is stopped and the task
   assert.equal(fakeState(ctx).lastThreadStart.model, "gpt-6.1-sol");
 });
 
-test("a codex debug models run that ignores SIGTERM is stopped after a short grace", { timeout: 60000 }, (t) => {
-  const ctx = makeRepo(t, "debug-models-hangs");
+test("a codex debug models run that ignores SIGTERM is stopped after a short grace", { timeout: 60000 }, async (t) => {
+  const ctx = makeRepo(t, "debug-models-hangs", { recordIdentities: true });
   // The read runs in its own process, so a read that blocks cannot block the test runner.
   const script = [
     `const { readDebugModels } = await import(${JSON.stringify(pathToFileURL(MODEL_CATALOG).href)});`,
@@ -492,7 +492,7 @@ test("a codex debug models run that ignores SIGTERM is stopped after a short gra
     timeout: 20000,
     windowsHide: true
   });
-  const running = stopRecordedProcesses(ctx, "debugModelsPids");
+  const running = await stopRecordedProcesses(ctx, "debugModelsPids");
   assert.equal(result.error?.code ?? null, null, "the debug models read did not end");
   assert.equal((fakeState(ctx).debugModelsPids ?? []).length, 1);
   assert.deepEqual(running, [], "codex debug models is still running");

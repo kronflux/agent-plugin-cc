@@ -6,7 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeCommittedRepo, makeTempDir, run, waitUntil } from "./helpers.mjs";
+import { initGitRepo, makeCommittedRepo, makeTempDir, run, stopOwnedProcess, stopOwnedProcesses, waitUntil } from "./helpers.mjs";
 import { markJobCancelled, resolveJobFile, resolveStateDir, writeJobFile } from "../plugins/agent/scripts/lib/state.mjs";
 import { readStoredJob } from "../plugins/agent/scripts/lib/job-control.mjs";
 import { cancelJob } from "../plugins/agent/scripts/codex-companion.mjs";
@@ -40,19 +40,23 @@ function readAppServerPids(binDir) {
   return JSON.parse(fs.readFileSync(statePath, "utf8")).appServerPids ?? [];
 }
 
-// Registers a cleanup that stops, by its own id, every listed process the test started and has
-// not yet seen exit. A process seen exiting is skipped, so a reused id is never signalled.
-function stopLeftoverProcesses(t, getPids, exited) {
+// The recorded `{ pid, startToken }` of every fake app server started with this bin folder by a
+// fake Codex installed with recordIdentities.
+function readAppServerIdentities(binDir) {
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  if (!fs.existsSync(statePath)) {
+    return [];
+  }
+  return (JSON.parse(fs.readFileSync(statePath, "utf8")).processIdentities ?? []).filter((entry) => entry.key === "appServerPids");
+}
+
+// Registers a cleanup that stops, through stopOwnedProcesses, every app server of the bin folder
+// `getBinDir()` names that recorded its identity and has not been seen exiting. Register it
+// before the bin folder, so the cleanup runs before the folder is removed.
+function stopLeftoverProcesses(t, getBinDir, exited) {
   t.after(() => {
-    for (const pid of getPids()) {
-      if (Number.isInteger(pid) && !exited.has(pid) && isProcessAlive(pid)) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {
-          // The process exited between the check and the signal.
-        }
-      }
-    }
+    const binDir = getBinDir();
+    return binDir ? stopOwnedProcesses(readAppServerIdentities(binDir).filter((entry) => !exited.has(entry.pid))) : [];
   });
 }
 
@@ -975,9 +979,9 @@ test("task can finish after subagent work even if the parent turn/completed even
 test("task on its own app server completes when Codex spawns subagents", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
-  installFakeCodex(binDir, "with-subagent");
+  installFakeCodex(binDir, "with-subagent", { recordIdentities: true });
   const exited = new Set();
-  stopLeftoverProcesses(t, () => readAppServerPids(binDir), exited);
+  stopLeftoverProcesses(t, () => binDir, exited);
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });
@@ -1636,17 +1640,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   });
   sleeper.unref();
 
-  t.after(() => {
-    try {
-      process.kill(-sleeper.pid, "SIGTERM");
-    } catch {
-      try {
-        process.kill(sleeper.pid, "SIGTERM");
-      } catch {
-        // Ignore missing process.
-      }
-    }
-  });
+  t.after(() => stopOwnedProcess(sleeper, { tree: true }));
 
   const logFile = path.join(jobsDir, "task-live.log");
   const jobFile = path.join(jobsDir, "task-live.json");
@@ -1924,10 +1918,12 @@ test("cancel with a job id can still target an active job from another Claude se
 test("cancel stops a running job's worker and its app-server", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
-  installFakeCodex(binDir, "interruptible-slow-task");
+  installFakeCodex(binDir, "interruptible-slow-task", { recordIdentities: true });
   const exited = new Set();
   let workerPid = null;
-  stopLeftoverProcesses(t, () => [workerPid, ...readAppServerPids(binDir)], exited);
+  // The legacy job record holds the worker's pid without a start token, so only the app server
+  // can be stopped by the cleanup; the worker ends with its turn.
+  stopLeftoverProcesses(t, () => binDir, exited);
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });
@@ -2001,17 +1997,7 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   sleeper.unref();
   fs.writeFileSync(runningJobFile, JSON.stringify({ id: "review-running" }, null, 2), "utf8");
 
-  t.after(() => {
-    try {
-      process.kill(-sleeper.pid, "SIGTERM");
-    } catch {
-      try {
-        process.kill(sleeper.pid, "SIGTERM");
-      } catch {
-        // Ignore missing process.
-      }
-    }
-  });
+  t.after(() => stopOwnedProcess(sleeper, { tree: true }));
 
   fs.writeFileSync(
     path.join(stateDir, "state.json"),
@@ -2289,9 +2275,9 @@ test("stop hook runs the actual task when auth status looks stale", () => {
 test("each command starts its own app server and stops it", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
-  installFakeCodex(binDir);
+  installFakeCodex(binDir, undefined, { recordIdentities: true });
   const exited = new Set();
-  stopLeftoverProcesses(t, () => readAppServerPids(binDir), exited);
+  stopLeftoverProcesses(t, () => binDir, exited);
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });
@@ -2316,12 +2302,13 @@ test("each command starts its own app server and stops it", async (t) => {
 });
 
 test("setup and status read the workspace named by --cwd", async (t) => {
+  const exited = new Set();
+  let binDir = null;
+  stopLeftoverProcesses(t, () => binDir, exited);
   const targetWorkspace = makeTempDir(t);
   const invocationWorkspace = makeTempDir(t);
-  const binDir = makeTempDir(t);
-  installFakeCodex(binDir);
-  const exited = new Set();
-  stopLeftoverProcesses(t, () => readAppServerPids(binDir), exited);
+  binDir = makeTempDir(t);
+  installFakeCodex(binDir, undefined, { recordIdentities: true });
   const env = buildEnv(binDir);
   writeJobFile(targetWorkspace, "task-in-target", {
     id: "task-in-target",
@@ -2356,11 +2343,12 @@ test("setup and status read the workspace named by --cwd", async (t) => {
 // Runs a foreground task with a reasoning effort, which makes the companion read the model list,
 // and stops the companion after 20 s so a paging loop fails the test instead of hanging it.
 function runTaskWithEffort(t, behavior, effort = "high") {
-  const repo = makeCommittedRepo(t);
-  const binDir = makeTempDir(t);
-  installFakeCodex(binDir, behavior);
   const exited = new Set();
-  stopLeftoverProcesses(t, () => readAppServerPids(binDir), exited);
+  let binDir = null;
+  stopLeftoverProcesses(t, () => binDir, exited);
+  const repo = makeCommittedRepo(t);
+  binDir = makeTempDir(t);
+  installFakeCodex(binDir, behavior, { recordIdentities: true });
   const result = spawnSync(process.execPath, [SCRIPT, "task", "--effort", effort, "check the cache"], {
     cwd: repo,
     env: buildEnv(binDir),
@@ -2452,11 +2440,12 @@ for (const [behavior, name] of [
   ["close-stdin-on-turn", "a task whose app server closes its input fails the job"]
 ]) {
   test(name, (t) => {
-    const repo = makeCommittedRepo(t);
-    const binDir = makeTempDir(t);
-    installFakeCodex(binDir, behavior);
     const exited = new Set();
-    stopLeftoverProcesses(t, () => readAppServerPids(binDir), exited);
+    let binDir = null;
+    stopLeftoverProcesses(t, () => binDir, exited);
+    const repo = makeCommittedRepo(t);
+    binDir = makeTempDir(t);
+    installFakeCodex(binDir, behavior, { recordIdentities: true });
 
     const result = spawnSync(process.execPath, [SCRIPT, "task", "check the cache"], {
       cwd: repo,

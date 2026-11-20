@@ -1,7 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { writeExecutable } from "./helpers.mjs";
+
+const PROCESS_LIB = pathToFileURL(path.join(import.meta.dirname, "..", "plugins", "agent", "scripts", "lib", "process.mjs")).href;
+
+// The behaviours whose processes outlive a quick test and are stopped by it.
+const LINGERING = new Set(["slow", "hang"]);
 
 // A stand-in for the Antigravity CLI (agy 1.2.10). In stream-json print mode it answers each
 // stdin line with the init, step_update, and result events agy emits, one turn at a time, and
@@ -21,7 +27,11 @@ import { writeExecutable } from "./helpers.mjs";
 //   SUCCESS turn. With --json-schema (a review) turn 1 fails at once.
 // - "result-before-done": holds turn 1 the same way, then writes the text delta "partial-" and
 //   the result without a DONE agent step; later turns answer normally.
-export function installFakeAgy(binDir, behavior = "ok") {
+//
+// With `recordIdentities` (the default for "slow" and "hang") each print-mode process is also
+// added as `{ pid, startToken }` to `identities` once readProcessIdentity has read it, so a test
+// can stop it with stopOwnedProcesses.
+export function installFakeAgy(binDir, behavior = "ok", { recordIdentities = LINGERING.has(behavior) } = {}) {
   const statePath = path.join(binDir, "agy-state.json");
   const scriptPath = path.join(binDir, "agy");
   const source = `#!/usr/bin/env node
@@ -30,6 +40,8 @@ const readline = require("node:readline");
 
 const STATE_PATH = ${JSON.stringify(statePath)};
 const BEHAVIOR = ${JSON.stringify(behavior)};
+const RECORD_IDENTITIES = ${JSON.stringify(recordIdentities)};
+const PROCESS_LIB = ${JSON.stringify(PROCESS_LIB)};
 const args = process.argv.slice(2);
 
 const LOCK_PATH = STATE_PATH + ".lock";
@@ -75,6 +87,23 @@ function updateState(change) {
   }
 }
 
+// Adds the identity of pid (this process, or a child it holds), once read, to identities.
+function recordIdentity(pid) {
+  if (!RECORD_IDENTITIES) {
+    return;
+  }
+  import(PROCESS_LIB)
+    .then((lib) => lib.readProcessIdentity(pid, { deadline: performance.now() + 30000 }))
+    .then((identity) => {
+      if (identity.state === "present") {
+        updateState((current) => {
+          current.identities = [...(current.identities || []), { pid, startToken: identity.startToken }];
+        });
+      }
+    })
+    .catch(() => {});
+}
+
 function argValue(name) {
   const index = args.indexOf(name);
   return index === -1 ? null : args[index + 1];
@@ -108,6 +137,7 @@ const { conversationId, runIndex } = updateState((state) => {
   state.pids = [...(state.pids || []), process.pid];
   return { conversationId: id, runIndex: state.runs.length - 1 };
 });
+recordIdentity(process.pid);
 
 if (BEHAVIOR === "exit-before-stdin") {
   process.exit(2);
