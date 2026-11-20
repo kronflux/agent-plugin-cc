@@ -13,6 +13,7 @@ import { runTrackedJob } from "../plugins/agent/scripts/lib/tracked-jobs.mjs";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "agent");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
+const NEUTRAL = path.join(PLUGIN_ROOT, "scripts", "agent-companion.mjs");
 const MONITOR = path.join(PLUGIN_ROOT, "scripts", "job-monitor.mjs");
 
 const monitors = [];
@@ -109,7 +110,7 @@ test("the monitor stays silent for a job whose result a command printed", async 
   const ctx = makeRepo();
   const { output } = startMonitor(ctx.repo, ctx.env, { graceMs });
   const jobId = launchBackgroundTask(ctx);
-  const waited = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "20000", "--poll-interval-ms", "100"], {
+  const waited = run("node", [NEUTRAL, "result", jobId, "--wait", "--timeout-ms", "20000", "--poll-interval-ms", "100"], {
     cwd: ctx.repo,
     env: ctx.env
   });

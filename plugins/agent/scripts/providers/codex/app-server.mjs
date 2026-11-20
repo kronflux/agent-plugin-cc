@@ -11,10 +11,10 @@ import fs from "node:fs";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
+import { pluginManifestPath } from "../../lib/host.mjs";
 import { resolveCommand, terminateProcessTree } from "../../lib/process.mjs";
 
-const PLUGIN_MANIFEST_URL = new URL("../../../.claude-plugin/plugin.json", import.meta.url);
-const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
+const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(pluginManifestPath(), "utf8"));
 
 const NON_INTERACTIVE_DENIAL_REASON = "Non-interactive Codex runner: no operator to approve.";
 const DECLINED_ELICITATION_MODES = new Set(["form", "openai/form", "openaiForm", "url"]);

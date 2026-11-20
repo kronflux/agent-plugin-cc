@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url";
 
+import { codexModelCatalog } from "./model-catalog.mjs";
 import { readTurnResultFromRollout } from "./rollout.mjs";
 import { getSessionRuntimeStatus } from "./runtime.mjs";
 
@@ -29,6 +30,7 @@ export const codexProvider = Object.freeze({
     review: "/agent:codex-review",
     adversarialReview: "/agent:codex-adversarial-review"
   }),
+  modelCatalog: codexModelCatalog,
 
   resumeCommand(threadId) {
     return `codex resume ${threadId}`;
@@ -59,5 +61,12 @@ export const codexProvider = Object.freeze({
 
   recoverTurnResult({ threadId, turnId }) {
     return readTurnResultFromRollout(threadId, turnId);
+  },
+
+  // Starts a new background turn on the thread of a finished job. The task command module is
+  // loaded here, when it is needed, because it imports this module.
+  async startFollowUpTurn(cwd, workspaceRoot, job, text) {
+    const { startCodexFollowUpTurn } = await import("./commands/task.mjs");
+    return startCodexFollowUpTurn(cwd, workspaceRoot, job, text);
   }
 });

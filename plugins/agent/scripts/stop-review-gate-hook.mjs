@@ -12,8 +12,7 @@ import { getCodexAvailability } from "./providers/codex/runtime.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig, listJobs, resolveStateDir } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
-import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
-import { readHookInputJson } from "./lib/fs.mjs";
+import { formatBlockDecision, getProjectDir, getSessionId, readHookInput, SESSION_ID_ENV } from "./lib/host.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
@@ -24,8 +23,8 @@ const DEFAULT_MAX_ROUNDS = 3;
 const DISABLE_HINT = "To turn the review gate off, run /agent:codex-setup --disable-review-gate.";
 const UNTRUSTED_TAG = "untrusted-claude-response";
 
-function emitDecision(payload) {
-  process.stdout.write(`${JSON.stringify(payload)}\n`);
+function emitBlockDecision(reason) {
+  process.stdout.write(`${formatBlockDecision(reason)}\n`);
 }
 
 function logNote(message) {
@@ -36,7 +35,7 @@ function logNote(message) {
 }
 
 function filterJobsForCurrentSession(jobs, input = {}) {
-  const sessionId = input.session_id || process.env[SESSION_ID_ENV] || null;
+  const sessionId = input.session_id || getSessionId() || null;
   if (!sessionId) {
     return jobs;
   }
@@ -208,8 +207,8 @@ function writeRounds(file, blocks) {
 }
 
 async function main() {
-  const input = await readHookInputJson();
-  const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const input = await readHookInput();
+  const cwd = input.cwd || getProjectDir() || process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
 
@@ -231,7 +230,7 @@ async function main() {
     return;
   }
 
-  const rounds = roundsFile(workspaceRoot, input.session_id || process.env[SESSION_ID_ENV]);
+  const rounds = roundsFile(workspaceRoot, input.session_id || getSessionId());
   const review = runStopReview(cwd, input);
   if (review.ok) {
     writeRounds(rounds, 0);
@@ -248,10 +247,7 @@ async function main() {
     return;
   }
   writeRounds(rounds, blocks);
-  emitDecision({
-    decision: "block",
-    reason: runningTaskNote ? `${runningTaskNote} ${review.reason}` : review.reason
-  });
+  emitBlockDecision(runningTaskNote ? `${runningTaskNote} ${review.reason}` : review.reason);
 }
 
 main().catch((error) => {

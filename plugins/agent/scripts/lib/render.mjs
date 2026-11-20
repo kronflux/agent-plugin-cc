@@ -1,4 +1,4 @@
-import { getProvider, providerForJob } from "./providers.mjs";
+import { DEFAULT_PROVIDER_ID, getProvider, providerForJob } from "./providers.mjs";
 
 // Results name the provider that produced them; callers pass its label.
 function labelFor(meta) {
@@ -120,7 +120,7 @@ function fencedText(text) {
   return [`${fence}text`, text, fence];
 }
 
-// An ephemeral thread is not saved by Codex, so no resume command is offered for it.
+// An ephemeral thread is not saved by its provider, so no resume command is offered for it.
 function formatResumeLine(job) {
   if (!job?.threadId || job.ephemeralThread === true) {
     return null;
@@ -365,7 +365,7 @@ export function renderStatusReport(report) {
 
   if (report.needsReview) {
     lines.push("The stop-time review gate is enabled.");
-    lines.push("Ending the session will trigger a fresh Codex adversarial review and block if it finds issues.");
+    lines.push(`Ending the session will trigger a fresh ${getProvider(DEFAULT_PROVIDER_ID).label} adversarial review and block if it finds issues.`);
   }
 
   return `${lines.join("\n").trimEnd()}\n`;

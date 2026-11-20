@@ -36,6 +36,42 @@ export function getAgyAvailability(cwd) {
   return binaryAvailable("agy", ["--version"], { cwd });
 }
 
+export function ensureAgyAvailable(cwd) {
+  const availability = getAgyAvailability(cwd);
+  if (!availability.available) {
+    throw new Error("The agy CLI is not installed or not on PATH. Install Antigravity, then rerun `/agent:agy-setup`.");
+  }
+}
+
+function normalizeEffort(effort, efforts, cwd) {
+  if (effort == null || !String(effort).trim()) {
+    return null;
+  }
+  const normalized = String(effort).trim().toLowerCase();
+  const supported = Array.isArray(efforts) ? efforts : readAgyEfforts(cwd);
+  if (!supported.includes(normalized)) {
+    throw new Error(`agy does not support reasoning effort "${effort}". Use one of: ${supported.join(", ")}.`);
+  }
+  return normalized;
+}
+
+// The model catalog of the Antigravity provider. A requested model is passed to agy as given;
+// without one, agy uses its own default. Efforts are checked against the list `agy --help` prints.
+export const agyModelCatalog = Object.freeze({
+  async resolveExplicit(value) {
+    const model = value == null || !String(value).trim() ? null : String(value).trim();
+    return { model, source: "explicit", defaultEffort: null, efforts: null };
+  },
+
+  async resolveDefault() {
+    return { model: null, source: "provider-default", defaultEffort: null, efforts: null, warning: null };
+  },
+
+  checkEffort(effort, efforts, { cwd } = {}) {
+    return normalizeEffort(effort, efforts, cwd);
+  }
+});
+
 /** Lists the models agy offers; agy has no login-status command, so this doubles as the login check. */
 export function readAgyModels(cwd) {
   const result = runCommand("agy", ["models"], { cwd, timeout: 60000 });

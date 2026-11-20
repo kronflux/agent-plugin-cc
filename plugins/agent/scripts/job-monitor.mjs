@@ -8,6 +8,7 @@
 
 import process from "node:process";
 
+import { getHostPid, setPluginDataDir } from "./lib/host.mjs";
 import { isProcessAlive } from "./lib/process.mjs";
 import { providerForJob } from "./lib/providers.mjs";
 import { isJobResultDelivered, listJobs } from "./lib/state.mjs";
@@ -51,10 +52,10 @@ function main() {
   // Claude Code substitutes ${CLAUDE_PLUGIN_DATA} into the monitor command but does not export it,
   // while the session's commands get it from the SessionStart hook and keep their jobs there.
   if (process.argv[3]) {
-    process.env.CLAUDE_PLUGIN_DATA = process.argv[3];
+    setPluginDataDir(process.argv[3]);
   }
   const workspaceRoot = resolveWorkspaceRoot(process.argv[2] || process.cwd());
-  const ownerPid = /^\d+$/.test(process.env.CLAUDE_PID ?? "") ? process.env.CLAUDE_PID : null;
+  const ownerPid = getHostPid();
   const startedAt = Date.now();
   // Per job: whether it was seen active, when it was first seen finished, and whether it was announced.
   const tracked = new Map();

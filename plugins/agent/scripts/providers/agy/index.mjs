@@ -1,5 +1,8 @@
 import { fileURLToPath } from "node:url";
 
+import { startTurnWithProviderCompanion } from "../../lib/task-launch.mjs";
+import { agyModelCatalog } from "./runtime.mjs";
+
 // Antigravity (agy) runs one CLI process per job. It has no protocol to interrupt a turn, so
 // cancel stops the job's processes; a message sent during a turn is written to the same process
 // and runs as a turn of its own.
@@ -27,6 +30,7 @@ export const agyProvider = Object.freeze({
     review: "/agent:agy-review",
     adversarialReview: "/agent:agy-review"
   }),
+  modelCatalog: agyModelCatalog,
 
   resumeCommand(conversationId) {
     return `agy --conversation ${conversationId}`;
@@ -60,5 +64,11 @@ export const agyProvider = Object.freeze({
   // agy keeps conversations in a private store that is not read here.
   recoverTurnResult() {
     return null;
+  },
+
+  // A follow-up turn on a finished job's conversation is started by the agy companion as a new
+  // background task.
+  startFollowUpTurn(cwd, workspaceRoot, job, text) {
+    return startTurnWithProviderCompanion(cwd, agyProvider, job, text);
   }
 });

@@ -4,25 +4,12 @@ import os from "node:os";
 import path from "node:path";
 
 import { ensureAbsolutePath } from "../../lib/fs.mjs";
-
-export const TRANSCRIPT_PATH_ENV = "CODEX_COMPANION_TRANSCRIPT_PATH";
-const STAGING_DIR_PREFIX = ".agent-plugin-transfer-";
+import { getTranscriptPath, homeProfileProjectsDir, listHostTranscriptRoots } from "../../lib/host.mjs";
 
 // Codex imports Claude sessions only from <home>/.claude/projects and does not read
 // CLAUDE_CONFIG_DIR. Claude Code writes transcripts to $CLAUDE_CONFIG_DIR/projects when that
 // variable is set, so those sources are copied under <home>/.claude/projects for the import.
-function homeProjectsDir() {
-  return path.join(os.homedir(), ".claude", "projects");
-}
-
-function claudeProjectsDirs() {
-  const dirs = [homeProjectsDir()];
-  const configDir = process.env.CLAUDE_CONFIG_DIR;
-  if (configDir) {
-    dirs.push(path.join(path.resolve(configDir), "projects"));
-  }
-  return dirs;
-}
+const STAGING_DIR_PREFIX = ".agent-plugin-transfer-";
 
 function realpathOrNull(target) {
   try {
@@ -48,7 +35,7 @@ function resolveUserPath(cwd, value) {
 }
 
 export function resolveClaudeSessionPath(cwd, options = {}) {
-  const requestedPath = options.source || process.env[TRANSCRIPT_PATH_ENV];
+  const requestedPath = options.source || getTranscriptPath();
   if (!requestedPath) {
     throw new Error("Could not identify the current Claude transcript. Retry with --source <path-to-claude-jsonl>.");
   }
@@ -62,7 +49,7 @@ export function resolveClaudeSessionPath(cwd, options = {}) {
   if (!source) {
     throw new Error(`Claude session file not found: ${sourcePath}`);
   }
-  const dirs = claudeProjectsDirs();
+  const dirs = listHostTranscriptRoots();
   if (!dirs.some((dir) => {
     const projects = realpathOrNull(dir);
     return projects !== null && isInside(projects, source);
@@ -78,7 +65,7 @@ export function resolveClaudeSessionPath(cwd, options = {}) {
  * which cleanup removes together with any parent directory the copy had to create.
  */
 export function stageClaudeSessionForImport(sourcePath) {
-  const projects = homeProjectsDir();
+  const projects = homeProfileProjectsDir();
   const projectsReal = realpathOrNull(projects);
   if (projectsReal !== null && isInside(projectsReal, sourcePath)) {
     return { path: sourcePath, staged: false, cleanup() {} };

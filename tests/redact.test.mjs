@@ -21,6 +21,7 @@ import {
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
+const NEUTRAL = path.join(ROOT, "plugins", "agent", "scripts", "agent-companion.mjs");
 
 function filesUnder(dir) {
   return fs.readdirSync(dir, { recursive: true }).map((name) => path.join(dir, String(name)));
@@ -66,7 +67,7 @@ test("a stored job summary and status show the redacted form", (t) => {
   writeJobFile(repo, "task-probe", { id: "task-probe", kind: "task", jobClass: "task", status: "queued", summary });
 
   const stored = fs.readFileSync(resolveJobFile(repo, "task-probe"), "utf8");
-  const status = run("node", [SCRIPT, "status", "task-probe", "--json"], { cwd: repo, check: true }).stdout;
+  const status = run("node", [NEUTRAL, "status", "task-probe", "--json"], { cwd: repo, check: true }).stdout;
   for (const output of [stored, status]) {
     for (const probe of CREDENTIAL_PROBES) {
       assert.equal(output.includes(probe.value), false, output);
@@ -133,7 +134,7 @@ test("a background task leaves its prompt nowhere in the job records", async () 
   });
   assert.equal(launched.status, 0, launched.stderr);
   const { jobId } = JSON.parse(launched.stdout);
-  const waited = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "15000", "--json"], {
+  const waited = run("node", [NEUTRAL, "status", jobId, "--wait", "--timeout-ms", "15000", "--json"], {
     cwd: repo,
     env: buildEnv(binDir),
     check: true

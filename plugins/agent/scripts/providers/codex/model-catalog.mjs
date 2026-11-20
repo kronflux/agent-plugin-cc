@@ -4,6 +4,52 @@
 
 export const KNOWN_REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
+const VALID_REASONING_EFFORTS = new Set(KNOWN_REASONING_EFFORTS);
+const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
+
+// Returns the model to request for a --model value: an alias becomes its model id, and an empty
+// value is no model.
+export function normalizeRequestedModel(model) {
+  if (model == null) {
+    return null;
+  }
+  const normalized = String(model).trim();
+  if (!normalized) {
+    return null;
+  }
+  return MODEL_ALIASES.get(normalized.toLowerCase()) ?? normalized;
+}
+
+function normalizeReasoningEffort(effort) {
+  if (effort == null) {
+    return null;
+  }
+  const normalized = String(effort).trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (!VALID_REASONING_EFFORTS.has(normalized)) {
+    throw new Error(`Unsupported reasoning effort "${effort}". Use one of: ${KNOWN_REASONING_EFFORTS.join(", ")}.`);
+  }
+  return normalized;
+}
+
+// The model catalog of the Codex provider. A requested model is passed to Codex as given, after
+// the alias map; without one, Codex uses its own default model and effort.
+export const codexModelCatalog = Object.freeze({
+  async resolveExplicit(value) {
+    return { model: normalizeRequestedModel(value), source: "explicit", defaultEffort: null, efforts: null };
+  },
+
+  async resolveDefault() {
+    return { model: null, source: "provider-default", defaultEffort: null, efforts: null, warning: null };
+  },
+
+  checkEffort(effort) {
+    return normalizeReasoningEffort(effort);
+  }
+});
+
 // The most model list pages read; a server that keeps naming new pages is not followed further.
 const MAX_MODEL_LIST_PAGES = 50;
 

@@ -53,7 +53,7 @@ test("transfer delegates the current Claude session directly to native import", 
 
   const result = run("node", [SCRIPT, "transfer", "--json"], {
     cwd: repo,
-    env: { ...env, CODEX_COMPANION_TRANSCRIPT_PATH: sourcePath }
+    env: { ...env, AGENT_PLUGIN_TRANSCRIPT_PATH: sourcePath }
   });
 
   assert.equal(result.status, 0, result.stderr);

@@ -16,6 +16,7 @@ import { isProcessAlive } from "../plugins/agent/scripts/lib/process.mjs";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "agent");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
+const NEUTRAL = path.join(PLUGIN_ROOT, "scripts", "agent-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
 
@@ -441,7 +442,7 @@ for (const value of ["0", "abc"]) {
       pid: null
     });
 
-    const result = spawnSync(process.execPath, [SCRIPT, "status", "task-waiting", "--wait", "--timeout-ms", value], {
+    const result = spawnSync(process.execPath, [NEUTRAL, "status", "task-waiting", "--wait", "--timeout-ms", value], {
       cwd: repo,
       encoding: "utf8",
       timeout: 10000,
@@ -502,7 +503,7 @@ test("a Codex job cancelled after its worker recorded its pid starts no turn", {
   const workerArgs = ["--import", pathToFileURL(preload).href, SCRIPT, "task-worker", "--cwd", repo, "--job-id", id];
   const worker = spawn(process.execPath, workerArgs, {
     cwd: repo,
-    env: { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: sessionId },
+    env: { ...buildEnv(binDir), AGENT_PLUGIN_SESSION_ID: sessionId },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true
   });
@@ -639,7 +640,7 @@ test("task-resume-candidate returns the latest rescue thread from the current se
     cwd: workspace,
     env: {
       ...process.env,
-      CODEX_COMPANION_SESSION_ID: "sess-current"
+      AGENT_PLUGIN_SESSION_ID: "sess-current"
     }
   });
 
@@ -663,11 +664,11 @@ test("task --resume-last does not resume a task from another Claude session", ()
 
   const otherEnv = {
     ...buildEnv(binDir),
-    CODEX_COMPANION_SESSION_ID: "sess-other"
+    AGENT_PLUGIN_SESSION_ID: "sess-other"
   };
   const currentEnv = {
     ...buildEnv(binDir),
-    CODEX_COMPANION_SESSION_ID: "sess-current"
+    AGENT_PLUGIN_SESSION_ID: "sess-current"
   };
 
   const firstRun = run("node", [SCRIPT, "task", "initial task"], {
@@ -733,9 +734,9 @@ test("task --resume-last ignores running tasks from other Claude sessions", () =
 
   const env = {
     ...buildEnv(binDir),
-    CODEX_COMPANION_SESSION_ID: "sess-current"
+    AGENT_PLUGIN_SESSION_ID: "sess-current"
   };
-  const status = run("node", [SCRIPT, "status", "--json"], {
+  const status = run("node", [NEUTRAL, "status", "--json"], {
     cwd: repo,
     env
   });
@@ -775,7 +776,7 @@ test("session start hook exports the Claude session id, transcript path, and plu
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
     fs.readFileSync(envFile, "utf8"),
-    `export CODEX_COMPANION_SESSION_ID='sess-current'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='${transcriptPath}'\nexport CLAUDE_PLUGIN_DATA='${pluginDataDir}'\n`
+    `export AGENT_PLUGIN_SESSION_ID='sess-current'\nexport AGENT_PLUGIN_TRANSCRIPT_PATH='${transcriptPath}'\nexport CLAUDE_PLUGIN_DATA='${pluginDataDir}'\n`
   );
 });
 
@@ -1015,7 +1016,7 @@ test("task --background enqueues a detached worker and exposes per-job status", 
 
   const waitedStatus = run(
     "node",
-    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    [NEUTRAL, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
     {
       cwd: repo,
       env: buildEnv(binDir)
@@ -1028,7 +1029,7 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(waitedPayload.job.status, "completed");
 
   const resultPayload = await waitFor(() => {
-    const result = run("node", [SCRIPT, "result", launchPayload.jobId, "--json"], {
+    const result = run("node", [NEUTRAL, "result", launchPayload.jobId, "--json"], {
       cwd: repo,
       env: buildEnv(binDir)
     });
@@ -1125,7 +1126,7 @@ test("review accepts --background while still running as a tracked review job", 
   assert.equal(launchPayload.review, "Review");
   assert.match(launchPayload.codex.stdout, /No material issues found/);
 
-  const status = run("node", [SCRIPT, "status"], {
+  const status = run("node", [NEUTRAL, "status"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -1211,7 +1212,7 @@ test("status shows phases, hints, and the latest finished job", () => {
     "utf8"
   );
 
-  const result = run("node", [SCRIPT, "status"], {
+  const result = run("node", [NEUTRAL, "status"], {
     cwd: workspace
   });
 
@@ -1290,11 +1291,11 @@ test("status without a job id only shows jobs from the current Claude session", 
     "utf8"
   );
 
-  const result = run("node", [SCRIPT, "status"], {
+  const result = run("node", [NEUTRAL, "status"], {
     cwd: workspace,
     env: {
       ...process.env,
-      CODEX_COMPANION_SESSION_ID: "sess-current"
+      AGENT_PLUGIN_SESSION_ID: "sess-current"
     }
   });
 
@@ -1355,7 +1356,7 @@ test("status preserves adversarial review kind labels", () => {
     "utf8"
   );
 
-  const result = run("node", [SCRIPT, "status"], {
+  const result = run("node", [NEUTRAL, "status"], {
     cwd: workspace
   });
 
@@ -1415,7 +1416,7 @@ test("status --wait times out cleanly when a job is still active", () => {
     "utf8"
   );
 
-  const result = run("node", [SCRIPT, "status", "task-live", "--wait", "--timeout-ms", "25", "--json"], {
+  const result = run("node", [NEUTRAL, "status", "task-live", "--wait", "--timeout-ms", "25", "--json"], {
     cwd: workspace
   });
 
@@ -1478,7 +1479,7 @@ test("result returns the stored output for the latest finished job by default", 
     "utf8"
   );
 
-  const result = run("node", [SCRIPT, "result"], {
+  const result = run("node", [NEUTRAL, "result"], {
     cwd: workspace
   });
 
@@ -1572,11 +1573,11 @@ test("result without a job id prefers the latest finished job from the current C
     "utf8"
   );
 
-  const result = run("node", [SCRIPT, "result"], {
+  const result = run("node", [NEUTRAL, "result"], {
     cwd: workspace,
     env: {
       ...process.env,
-      CODEX_COMPANION_SESSION_ID: "sess-current"
+      AGENT_PLUGIN_SESSION_ID: "sess-current"
     }
   });
 
@@ -1602,7 +1603,7 @@ test("result for a finished write-capable task returns the raw Codex final respo
   });
   assert.equal(taskRun.status, 0, taskRun.stderr);
 
-  const result = run("node", [SCRIPT, "result"], {
+  const result = run("node", [NEUTRAL, "result"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -1684,7 +1685,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
     "utf8"
   );
 
-  const cancelResult = run("node", [SCRIPT, "cancel", "task-live", "--json"], {
+  const cancelResult = run("node", [NEUTRAL, "cancel", "task-live", "--json"], {
     cwd: workspace
   });
 
@@ -1736,7 +1737,7 @@ test("cancel keeps the output the worker recorded as it was stopped", async (t) 
     }
   });
 
-  const result = run("node", [SCRIPT, "result", id], { cwd: repo });
+  const result = run("node", [NEUTRAL, "result", id], { cwd: repo });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /partial answer/);
   assert.equal(readStoredJob(repo, id).status, "cancelled");
@@ -1845,16 +1846,16 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
 
   const env = {
     ...process.env,
-    CODEX_COMPANION_SESSION_ID: "sess-current"
+    AGENT_PLUGIN_SESSION_ID: "sess-current"
   };
-  const status = run("node", [SCRIPT, "status", "--json"], {
+  const status = run("node", [NEUTRAL, "status", "--json"], {
     cwd: workspace,
     env
   });
   assert.equal(status.status, 0, status.stderr);
   assert.deepEqual(JSON.parse(status.stdout).running, []);
 
-  const cancel = run("node", [SCRIPT, "cancel", "--json"], {
+  const cancel = run("node", [NEUTRAL, "cancel", "--json"], {
     cwd: workspace,
     env
   });
@@ -1900,9 +1901,9 @@ test("cancel with a job id can still target an active job from another Claude se
 
   const env = {
     ...process.env,
-    CODEX_COMPANION_SESSION_ID: "sess-current"
+    AGENT_PLUGIN_SESSION_ID: "sess-current"
   };
-  const cancel = run("node", [SCRIPT, "cancel", "task-other", "--json"], {
+  const cancel = run("node", [NEUTRAL, "cancel", "task-other", "--json"], {
     cwd: workspace,
     env
   });
@@ -1948,7 +1949,7 @@ test("cancel stops a running job's worker and its app-server", async (t) => {
   assert.equal(isProcessAlive(workerPid), true, "the worker exited before cancel");
   assert.equal(isProcessAlive(appServerPid), true, "the app server exited before cancel");
 
-  const cancelResult = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  const cancelResult = run("node", [NEUTRAL, "cancel", jobId, "--json"], { cwd: repo, env });
 
   assert.equal(cancelResult.status, 0, cancelResult.stderr);
   const cancelPayload = JSON.parse(cancelResult.stdout);
@@ -2050,7 +2051,7 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     cwd: repo,
     env: {
       ...process.env,
-      CODEX_COMPANION_SESSION_ID: "sess-current"
+      AGENT_PLUGIN_SESSION_ID: "sess-current"
     },
     input: JSON.stringify({
       hook_event_name: "SessionEnd",
@@ -2128,11 +2129,11 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   assert.match(fakeState.lastTurnStart.prompt, /Only review the work from the previous Claude turn/i);
   assert.match(fakeState.lastTurnStart.prompt, /I completed the refactor and updated the retry logic\./);
 
-  const status = run("node", [SCRIPT, "status"], {
+  const status = run("node", [NEUTRAL, "status"], {
     cwd: repo,
     env: {
       ...buildEnv(binDir),
-      CODEX_COMPANION_SESSION_ID: "sess-stop-review"
+      AGENT_PLUGIN_SESSION_ID: "sess-stop-review"
     }
   });
   assert.equal(status.status, 0, status.stderr);
@@ -2184,7 +2185,7 @@ test("stop hook logs running tasks to stderr without blocking when the review ga
     cwd: repo,
     env: {
       ...process.env,
-      CODEX_COMPANION_SESSION_ID: "sess-current"
+      AGENT_PLUGIN_SESSION_ID: "sess-current"
     },
     input: JSON.stringify({ cwd: repo })
   });
@@ -2297,7 +2298,7 @@ test("each command starts its own app server and stops it", async (t) => {
     [["status"], 0]
   ]) {
     const before = readAppServerPids(binDir);
-    const result = run("node", [SCRIPT, ...args], { cwd: repo, env });
+    const result = run("node", [args[0] === "status" ? NEUTRAL : SCRIPT, ...args], { cwd: repo, env });
     assert.equal(result.status, 0, result.stderr);
     const after = readAppServerPids(binDir);
     assert.equal(after.length, before.length + started, `app servers started by ${args[0]}`);
@@ -2324,10 +2325,10 @@ test("setup and status read the workspace named by --cwd", async (t) => {
     completedAt: new Date().toISOString()
   });
 
-  const status = run("node", [SCRIPT, "status", "--all", "--cwd", targetWorkspace, "--json"], { cwd: invocationWorkspace, env });
+  const status = run("node", [NEUTRAL, "status", "--all", "--cwd", targetWorkspace, "--json"], { cwd: invocationWorkspace, env });
   assert.equal(status.status, 0, status.stderr);
   assert.match(status.stdout, /task-in-target/);
-  const localStatus = run("node", [SCRIPT, "status", "--all", "--json"], { cwd: invocationWorkspace, env });
+  const localStatus = run("node", [NEUTRAL, "status", "--all", "--json"], { cwd: invocationWorkspace, env });
   assert.equal(localStatus.status, 0, localStatus.stderr);
   assert.doesNotMatch(localStatus.stdout, /task-in-target/);
 
@@ -2427,10 +2428,10 @@ test("status prints no resume command for an ephemeral review thread", (t) => {
   assert.ok(job?.threadId, "the review recorded no thread");
   assert.equal(job.ephemeralThread, true);
 
-  const status = run("node", [SCRIPT, "status", job.id], { cwd: repo, env });
+  const status = run("node", [NEUTRAL, "status", job.id], { cwd: repo, env });
   assert.equal(status.status, 0, status.stderr);
   assert.doesNotMatch(status.stdout, /codex resume/);
-  const result = run("node", [SCRIPT, "result", job.id], { cwd: repo, env });
+  const result = run("node", [NEUTRAL, "result", job.id], { cwd: repo, env });
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stdout, /codex resume/);
 });

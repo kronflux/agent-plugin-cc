@@ -36,7 +36,7 @@ test("repeated SessionStart runs add each export once and keep other hooks' line
     runSessionStart(envFile, "sess-1", cwd);
   }
 
-  assert.deepEqual(exportsOf(envFile, "CODEX_COMPANION_SESSION_ID"), ["export CODEX_COMPANION_SESSION_ID='sess-1'"]);
+  assert.deepEqual(exportsOf(envFile, "AGENT_PLUGIN_SESSION_ID"), ["export AGENT_PLUGIN_SESSION_ID='sess-1'"]);
   assert.equal(exportsOf(envFile, "CLAUDE_PLUGIN_DATA").length, 1);
   assert.deepEqual(exportsOf(envFile, "OTHER"), ["export OTHER=1"]);
 });
@@ -49,10 +49,10 @@ test("a changed value is appended so the latest export wins", () => {
     runSessionStart(envFile, sessionId, cwd);
   }
 
-  assert.deepEqual(exportsOf(envFile, "CODEX_COMPANION_SESSION_ID"), [
-    "export CODEX_COMPANION_SESSION_ID='sess-a'",
-    "export CODEX_COMPANION_SESSION_ID='sess-b'",
-    "export CODEX_COMPANION_SESSION_ID='sess-a'"
+  assert.deepEqual(exportsOf(envFile, "AGENT_PLUGIN_SESSION_ID"), [
+    "export AGENT_PLUGIN_SESSION_ID='sess-a'",
+    "export AGENT_PLUGIN_SESSION_ID='sess-b'",
+    "export AGENT_PLUGIN_SESSION_ID='sess-a'"
   ]);
 });
 
@@ -72,4 +72,17 @@ test("a piped stdin with no writer reads as empty after the first-byte timeout",
   const text = await readStdinIfPiped({ stdin: new PassThrough(), firstByteTimeoutMs: 100 });
   assert.equal(text, "");
   assert.ok(Date.now() - startedAt < 2000);
+});
+
+test("session variables fall back to the names older sessions export", async () => {
+  const { getSessionId, getTranscriptPath } = await import("../plugins/agent/scripts/lib/host.mjs");
+  const legacy = { CODEX_COMPANION_SESSION_ID: "old-sess", CODEX_COMPANION_TRANSCRIPT_PATH: "/old/t.jsonl" };
+  assert.equal(getSessionId(legacy), "old-sess");
+  assert.equal(getTranscriptPath(legacy), "/old/t.jsonl");
+  assert.equal(getSessionId({ ...legacy, AGENT_PLUGIN_SESSION_ID: "" }), "old-sess");
+  const both = { ...legacy, AGENT_PLUGIN_SESSION_ID: "new-sess", AGENT_PLUGIN_TRANSCRIPT_PATH: "/new/t.jsonl" };
+  assert.equal(getSessionId(both), "new-sess");
+  assert.equal(getTranscriptPath(both), "/new/t.jsonl");
+  assert.equal(getSessionId({}), null);
+  assert.equal(getTranscriptPath({}), null);
 });

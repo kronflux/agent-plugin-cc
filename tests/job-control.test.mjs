@@ -21,6 +21,7 @@ import { listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
+const NEUTRAL = path.join(ROOT, "plugins", "agent", "scripts", "agent-companion.mjs");
 
 // The PID of a process that has already exited.
 function exitedPid() {
@@ -47,7 +48,7 @@ test("status reports a job with an exited worker as failed", () => {
   const workspace = makeTempDir();
   upsertJob(workspace, { id: "task-dead-cli", status: "running", pid: exitedPid(), title: "Codex Task" });
 
-  const result = run("node", [SCRIPT, "status", "task-dead-cli", "--json", "--cwd", workspace], { cwd: workspace });
+  const result = run("node", [NEUTRAL, "status", "task-dead-cli", "--json", "--cwd", workspace], { cwd: workspace });
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout).job.status, "failed");

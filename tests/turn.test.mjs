@@ -12,6 +12,7 @@ import { writeJobFile } from "../plugins/agent/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
+const NEUTRAL = path.join(ROOT, "plugins", "agent", "scripts", "agent-companion.mjs");
 
 function makeRepo(behavior) {
   const repo = makeTempDir();
@@ -86,7 +87,7 @@ test("result prints a lost answer from the Codex transcript", () => {
     turnId: "turn-lost"
   });
 
-  const result = run("node", [SCRIPT, "result", "task-lost"], { cwd: repo, env: { ...env, CODEX_HOME: codexHome } });
+  const result = run("node", [NEUTRAL, "result", "task-lost"], { cwd: repo, env: { ...env, CODEX_HOME: codexHome } });
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /^Recovered from the Codex transcript\.\n/);

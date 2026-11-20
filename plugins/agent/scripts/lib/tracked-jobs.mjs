@@ -2,9 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
+import { getHostPid, getSessionId, SESSION_ID_ENV } from "./host.mjs";
 import { isJobCancelled, readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
-export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 // Text that the command line of a job's process contains. A background worker has its job id
 // in its arguments; a foreground run is identified by the companion script name.
 
@@ -66,10 +66,10 @@ export function createJobLogFile(workspaceRoot, jobId, title) {
 
 export function createJobRecord(base, options = {}) {
   const env = options.env ?? process.env;
-  const sessionId = env[options.sessionIdEnv ?? SESSION_ID_ENV];
-  // CLAUDE_PID names the Claude Code process the job was started from; the job monitor of that
-  // process announces the job.
-  const claudePid = /^\d+$/.test(env.CLAUDE_PID ?? "") ? env.CLAUDE_PID : null;
+  const sessionId = getSessionId(env, options.sessionIdEnv ?? SESSION_ID_ENV);
+  // The host process id names the Claude Code process the job was started from; the job monitor
+  // of that process announces the job.
+  const claudePid = getHostPid(env);
   return {
     ...base,
     createdAt: nowIso(),

@@ -3,7 +3,8 @@ import fs from "node:fs";
 import { getProvider, providerForJob } from "./providers.mjs";
 import { isProcessAlive, readProcessCommandLines, terminateProcessTree } from "./process.mjs";
 import { getConfig, listJobs, readJobFile, resolveJobFile, upsertJob } from "./state.mjs";
-import { nowIso, SESSION_ID_ENV } from "./tracked-jobs.mjs";
+import { getSessionId } from "./host.mjs";
+import { nowIso } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
@@ -134,7 +135,7 @@ export function sortJobsNewestFirst(jobs) {
 }
 
 function getCurrentSessionId(options = {}) {
-  return options.env?.[SESSION_ID_ENV] ?? process.env[SESSION_ID_ENV] ?? null;
+  return getSessionId(options.env) ?? getSessionId(process.env);
 }
 
 function filterJobsForCurrentSession(jobs, options = {}) {

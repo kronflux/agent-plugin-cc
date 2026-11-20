@@ -5,6 +5,6 @@ disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
 
-!`node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" send "$ARGUMENTS"`
+!`node "${CLAUDE_PLUGIN_ROOT}/scripts/agent-companion.mjs" send "$ARGUMENTS"`
 
 Present the command output to the user exactly as returned.

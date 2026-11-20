@@ -14,6 +14,7 @@ import { listJobs } from "../plugins/agent/scripts/lib/state.mjs";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const AGY = path.join(ROOT, "plugins", "agent", "scripts", "agy-companion.mjs");
 const COMPANION = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
+const NEUTRAL = path.join(ROOT, "plugins", "agent", "scripts", "agent-companion.mjs");
 
 // Stops, by id, each fake agy process of this test that is still alive; every id in the state
 // file belongs to a process the test's own fake agy started.
@@ -62,7 +63,7 @@ test("a background agy task completes and result prints its response", async (t)
   const jobId = startBackground(ctx, ["say", "hello"]);
 
   assert.ok(await waitUntil(() => job(ctx.repo, jobId)?.status === "completed", { timeoutMs: 20000 }), JSON.stringify(job(ctx.repo, jobId)));
-  const result = run("node", [COMPANION, "result", jobId], { cwd: ctx.repo, env: ctx.env });
+  const result = run("node", [NEUTRAL, "result", jobId], { cwd: ctx.repo, env: ctx.env });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /^reply: say hello$/m);
   assert.match(result.stdout, /Antigravity session ID: conv-1\nResume in Antigravity: agy --conversation conv-1/);
@@ -88,7 +89,7 @@ test("send to a running agy job writes one more input line to the same process",
   const jobId = startBackground(ctx, ["first"]);
   assert.ok(await waitUntil(() => job(ctx.repo, jobId)?.threadId, { timeoutMs: 20000 }), "the conversation did not start");
 
-  const sent = run("node", [COMPANION, "send", jobId, "second", "message"], { cwd: ctx.repo, env: ctx.env });
+  const sent = run("node", [NEUTRAL, "send", jobId, "second", "message"], { cwd: ctx.repo, env: ctx.env });
 
   assert.equal(sent.status, 0, sent.stderr);
   // The reply names the provider at the start of the output.
@@ -99,7 +100,7 @@ test("send to a running agy job writes one more input line to the same process",
   const runs = readFakeAgyState(ctx.binDir).runs;
   assert.equal(runs.length, 1);
   assert.deepEqual(runs[0].inputs, ["first", "second message"]);
-  const result = run("node", [COMPANION, "result", jobId], { cwd: ctx.repo, env: ctx.env });
+  const result = run("node", [NEUTRAL, "result", jobId], { cwd: ctx.repo, env: ctx.env });
   assert.match(result.stdout, /^reply: first\n\nreply: second message$/m);
 });
 
@@ -116,7 +117,7 @@ test("send to a finished agy job resumes its conversation in a new process", asy
   assert.equal(first.status, 0, first.stderr);
   const { jobId } = JSON.parse(first.stdout);
 
-  const sent = run("node", [COMPANION, "send", "--json", jobId, "follow", "up"], { cwd: ctx.repo, env: ctx.env });
+  const sent = run("node", [NEUTRAL, "send", "--json", jobId, "follow", "up"], { cwd: ctx.repo, env: ctx.env });
 
   assert.equal(sent.status, 0, sent.stderr);
   const payload = JSON.parse(sent.stdout);
@@ -135,7 +136,7 @@ test("cancel stops a running agy job and its agy process", async (t) => {
   const agyPid = await waitUntil(() => readFakeAgyState(ctx.binDir).runs[0]?.pid, { timeoutMs: 20000 });
   assert.ok(agyPid, "agy did not start");
 
-  const cancelled = run("node", [COMPANION, "cancel", jobId, "--json"], { cwd: ctx.repo, env: ctx.env });
+  const cancelled = run("node", [NEUTRAL, "cancel", jobId, "--json"], { cwd: ctx.repo, env: ctx.env });
 
   assert.equal(cancelled.status, 0, cancelled.stderr);
   assert.equal(job(ctx.repo, jobId).status, "cancelled");
@@ -183,7 +184,7 @@ test("status shows an agy job's conversation and resume command", async (t) => {
   const ctx = makeRepo(undefined, t);
   const jobId = startBackground(ctx, ["hi"]);
   assert.ok(await waitUntil(() => job(ctx.repo, jobId)?.status === "completed", { timeoutMs: 20000 }));
-  const status = run("node", [COMPANION, "status", jobId], { cwd: ctx.repo, env: ctx.env });
+  const status = run("node", [NEUTRAL, "status", jobId], { cwd: ctx.repo, env: ctx.env });
   assert.equal(status.status, 0, status.stderr);
   assert.match(status.stdout, /Antigravity session ID: conv-1/);
   assert.match(status.stdout, /Resume in Antigravity: agy --conversation conv-1/);
@@ -217,7 +218,7 @@ test("a result written just before agy exits is kept", async (t) => {
   const ended = await waitUntil(() => jobEnded(ctx.repo, jobId), { timeoutMs: 20000, describe: "the result-then-exit job ending" });
 
   assert.equal(ended.status, "completed", JSON.stringify(ended));
-  const result = run("node", [COMPANION, "result", jobId], { cwd: ctx.repo, env: ctx.env });
+  const result = run("node", [NEUTRAL, "result", jobId], { cwd: ctx.repo, env: ctx.env });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /early-exit-answer-7f3/);
 });
@@ -230,7 +231,7 @@ test("a failed prompt turn fails the job even when a later turn succeeds", async
     describe: "the fail-first-turn job running with a conversation"
   });
 
-  const sent = run("node", [COMPANION, "send", jobId, "second"], { cwd: ctx.repo, env: ctx.env });
+  const sent = run("node", [NEUTRAL, "send", jobId, "second"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(sent.status, 0, sent.stderr);
 
   const ended = await waitUntil(() => jobEnded(ctx.repo, jobId), { timeoutMs: 20000, describe: "the fail-first-turn job ending" });
@@ -247,7 +248,7 @@ test("text of an unfinished response does not prefix the next turn", async (t) =
     describe: "the result-before-done job running with a conversation"
   });
 
-  const sent = run("node", [COMPANION, "send", jobId, "second"], { cwd: ctx.repo, env: ctx.env });
+  const sent = run("node", [NEUTRAL, "send", jobId, "second"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(sent.status, 0, sent.stderr);
 
   const ended = await waitUntil(() => jobEnded(ctx.repo, jobId), { timeoutMs: 20000, describe: "the result-before-done job ending" });
@@ -277,7 +278,7 @@ test("a clean agy exit leaves no delayed kill", async (t) => {
 
 test("a second resume of a conversation is refused while the first is queued", async (t) => {
   const ctx = makeRepo("slow", t);
-  const env = { ...ctx.env, CODEX_COMPANION_SESSION_ID: "session-resume-twice" };
+  const env = { ...ctx.env, AGENT_PLUGIN_SESSION_ID: "session-resume-twice" };
   const first = run("node", [AGY, "task", "--json", "start"], { cwd: ctx.repo, env, check: true });
   assert.equal(JSON.parse(first.stdout).threadId, "conv-1");
 

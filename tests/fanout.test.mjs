@@ -11,6 +11,7 @@ import { launchManifestTasks } from "../plugins/agent/scripts/codex-companion.mj
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
+const NEUTRAL = path.join(ROOT, "plugins", "agent", "scripts", "agent-companion.mjs");
 
 function makeRepo(behavior) {
   const repo = makeTempDir();
@@ -102,7 +103,7 @@ test("task --worktree leaves the checkout untouched and Codex edits the worktree
     const branches = run("git", ["branch", "--list", `agent/${payload.jobId}`], { cwd: ctx.repo }).stdout;
     assert.match(branches, new RegExp(`agent/${payload.jobId}`));
 
-    const text = run("node", [SCRIPT, "result", payload.jobId], { cwd: ctx.repo, env: ctx.env });
+    const text = run("node", [NEUTRAL, "result", payload.jobId], { cwd: ctx.repo, env: ctx.env });
     assert.match(text.stdout, /Worktree: .* \(branch agent\/task-[^)]+\)\. Codex worked there, not in your checkout\./);
   } finally {
     removeWorktrees(ctx.repo);
@@ -218,7 +219,7 @@ test("a worktree resume that finds a running task leaves nothing behind", (t) =>
 
   const result = run("node", [SCRIPT, "task", "--worktree", "--resume-last", "x"], {
     cwd: repo,
-    env: { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: sessionId }
+    env: { ...buildEnv(binDir), AGENT_PLUGIN_SESSION_ID: sessionId }
   });
 
   assert.equal(result.status, 1, result.stderr);
@@ -322,7 +323,7 @@ test("send to a finished worktree job runs in its worktree", async (t) => {
   const edited = path.join(worktreePath, "codex-edit.txt");
   fs.rmSync(edited);
 
-  const sent = run("node", [SCRIPT, "send", "--json", jobId, "edit again"], { cwd: repo, env });
+  const sent = run("node", [NEUTRAL, "send", "--json", jobId, "edit again"], { cwd: repo, env });
   assert.equal(sent.status, 0, sent.stderr);
   const { newJobId } = JSON.parse(sent.stdout);
   await waitUntil(

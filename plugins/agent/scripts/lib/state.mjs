@@ -4,10 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
+import { getPluginDataDir, PLUGIN_DATA_ENV } from "./host.mjs";
 import { redactSecrets } from "./redact.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
-const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 // The temp directory is shared by all users on POSIX systems, so the fallback root is per user.
 const FALLBACK_STATE_ROOT_DIR = path.join(
   os.tmpdir(),
@@ -73,7 +73,7 @@ function computeStateDirName(cwd) {
 }
 
 export function resolveStateDir(cwd) {
-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
+  const pluginDataDir = getPluginDataDir();
   const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
   return path.join(stateRoot, stateDirName(cwd));
 }
@@ -103,7 +103,7 @@ function fallbackRootReadable({ platform = process.platform, lstat = fs.lstatSyn
 }
 
 /**
- * Returns the state folders that reads look in. A process started without CLAUDE_PLUGIN_DATA
+ * Returns the state folders that reads look in. A process started without a plugin data folder
  * writes under the temp-directory root, so reads also look there. The configured root comes
  * first and wins for a duplicate job id. `deps` replaces the platform and file checks in tests.
  */
@@ -126,14 +126,14 @@ export function assertPrivateStateRoot(dir, { lstat = fs.lstatSync, getuid = pro
   const stat = lstat(dir);
   const ownedByCaller = typeof getuid !== "function" || stat.uid === getuid();
   if (stat.isSymbolicLink() || !stat.isDirectory() || !ownedByCaller) {
-    throw new Error(`The plugin state folder ${dir} is not a private folder owned by you; set CLAUDE_PLUGIN_DATA.`);
+    throw new Error(`The plugin state folder ${dir} is not a private folder owned by you; set ${PLUGIN_DATA_ENV}.`);
   }
 }
 
 function stateRootOf(dir) {
   const roots = [FALLBACK_STATE_ROOT_DIR];
-  if (process.env[PLUGIN_DATA_ENV]) {
-    roots.unshift(path.join(process.env[PLUGIN_DATA_ENV], "state"));
+  if (getPluginDataDir()) {
+    roots.unshift(path.join(getPluginDataDir(), "state"));
   }
   return roots.find((root) => dir === root || dir.startsWith(`${root}${path.sep}`)) ?? null;
 }

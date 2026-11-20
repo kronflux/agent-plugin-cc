@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `/agent:status`, `/agent:result`, `/agent:send`, and `/agent:cancel` run `scripts/agent-companion.mjs`. `codex-companion.mjs` no longer accepts `status`, `result`, `send`, `cancel`, or `adversarial-review`. `/agent:send` to a finished Antigravity job says "on its Antigravity thread".
+- The SessionStart hook exports `AGENT_PLUGIN_SESSION_ID` and `AGENT_PLUGIN_TRANSCRIPT_PATH` instead of `CODEX_COMPANION_SESSION_ID` and `CODEX_COMPANION_TRANSCRIPT_PATH`. A session started before the upgrade has the old names in its environment file until the hook runs again.
 - The plugin needs Node.js 22.13 or later.
 - Each Codex command now starts its own app server and stops it when done. The shared per-repository broker is removed, along with its session record and session-end teardown. `cancel` stops the job's worker, which ends its app server, and no longer sends a turn interrupt. `status` and `setup` report the session runtime as direct startup. Shared app servers started by an earlier version stop on their own idle timeout.
 - Cancel keeps output a worker recorded before it stopped. Failed worktree launches remove their worktree and branch. Follow-up turns on a worktree job run in that worktree. `--timeout-ms` must be a positive number.

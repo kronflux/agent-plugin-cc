@@ -11,6 +11,7 @@ import { startTurnWithProviderCompanion } from "../plugins/agent/scripts/codex-c
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
+const NEUTRAL = path.join(ROOT, "plugins", "agent", "scripts", "agent-companion.mjs");
 
 function makeRepo(behavior) {
   const repo = makeTempDir();
@@ -58,7 +59,7 @@ test("send steers the running turn and reports it only after Codex confirms the 
   const ctx = makeRepo("interruptible-slow-task");
   const { jobId, turnId } = await startRunningTask(ctx);
 
-  const result = run("node", [SCRIPT, "send", jobId, "stop", "and", "summarize"], { cwd: ctx.repo, env: ctx.env });
+  const result = run("node", [NEUTRAL, "send", jobId, "stop", "and", "summarize"], { cwd: ctx.repo, env: ctx.env });
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, new RegExp(`Codex received the message in the running turn of ${jobId}`));
@@ -75,7 +76,7 @@ test("send keeps the message as typed when it arrives as one argument string", a
   const { jobId } = await startRunningTask(ctx);
 
   // process.execPath runs Node without a shell, which would strip the quotes on Windows.
-  const result = run(process.execPath, [SCRIPT, "send", `--timeout-ms 20000 ${jobId} don't touch "the" tests --now`], {
+  const result = run(process.execPath, [NEUTRAL, "send", `--timeout-ms 20000 ${jobId} don't touch "the" tests --now`], {
     cwd: ctx.repo,
     env: ctx.env
   });
@@ -88,7 +89,7 @@ test("send reports an accepted message that Codex has not confirmed yet", async 
   const ctx = makeRepo("steer-no-item");
   const { jobId } = await startRunningTask(ctx);
 
-  const result = run("node", [SCRIPT, "send", "--timeout-ms", "1500", jobId, "check", "this"], { cwd: ctx.repo, env: ctx.env });
+  const result = run("node", [NEUTRAL, "send", "--timeout-ms", "1500", jobId, "check", "this"], { cwd: ctx.repo, env: ctx.env });
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /accepted the message .* had not confirmed it after 2 s/);
@@ -98,7 +99,7 @@ test("a user message with another client id does not confirm a queued message", 
   const ctx = makeRepo("steer-foreign-client-id");
   const { jobId } = await startRunningTask(ctx);
 
-  const result = run("node", [SCRIPT, "send", "--timeout-ms", "1500", jobId, "check", "this"], { cwd: ctx.repo, env: ctx.env });
+  const result = run("node", [NEUTRAL, "send", "--timeout-ms", "1500", jobId, "check", "this"], { cwd: ctx.repo, env: ctx.env });
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /accepted the message .* had not confirmed it after 2 s/);
@@ -108,7 +109,7 @@ test("send retries a rejected steer once and then fails with Codex's error", asy
   const ctx = makeRepo("steer-rejected");
   const { jobId } = await startRunningTask(ctx);
 
-  const result = run("node", [SCRIPT, "send", jobId, "change", "course"], { cwd: ctx.repo, env: ctx.env });
+  const result = run("node", [NEUTRAL, "send", jobId, "change", "course"], { cwd: ctx.repo, env: ctx.env });
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /Codex rejected the message for .*: expected active turn id .* does not match the active turn/);
@@ -119,7 +120,7 @@ test("send continues the thread with a new turn when Codex says the turn has end
   const ctx = makeRepo("steer-turn-ended");
   const { jobId } = await startRunningTask(ctx);
 
-  const result = run("node", [SCRIPT, "send", "--json", jobId, "one", "more", "thing"], { cwd: ctx.repo, env: ctx.env });
+  const result = run("node", [NEUTRAL, "send", "--json", jobId, "one", "more", "thing"], { cwd: ctx.repo, env: ctx.env });
 
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
@@ -134,7 +135,7 @@ test("send to a finished job starts a new turn on its thread", async () => {
   assert.equal(first.status, 0, first.stderr);
   const { jobId, threadId } = JSON.parse(first.stdout);
 
-  const result = run("node", [SCRIPT, "send", "--json", jobId, "follow", "up"], { cwd: ctx.repo, env: ctx.env });
+  const result = run("node", [NEUTRAL, "send", "--json", jobId, "follow", "up"], { cwd: ctx.repo, env: ctx.env });
 
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
@@ -150,17 +151,17 @@ test("send to a finished job starts a new turn on its thread", async () => {
 
 test("send refuses jobs that are not tasks and unknown job ids", () => {
   const ctx = makeRepo();
-  const unknown = run("node", [SCRIPT, "send", "task-missing", "hello"], { cwd: ctx.repo, env: ctx.env });
+  const unknown = run("node", [NEUTRAL, "send", "task-missing", "hello"], { cwd: ctx.repo, env: ctx.env });
   assert.notEqual(unknown.status, 0);
   assert.match(unknown.stderr, /No job task-missing was found/);
 
   fs.writeFileSync(path.join(ctx.repo, "README.md"), "changed\n");
   const review = run("node", [SCRIPT, "review", "--json"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(review.status, 0, review.stderr);
-  const status = JSON.parse(run("node", [SCRIPT, "status", "--json"], { cwd: ctx.repo, env: ctx.env }).stdout);
+  const status = JSON.parse(run("node", [NEUTRAL, "status", "--json"], { cwd: ctx.repo, env: ctx.env }).stdout);
   const reviewJob = [...(status.running ?? []), ...(status.recent ?? []), status.latestFinished].find((job) => job?.jobClass === "review");
   assert.ok(reviewJob, JSON.stringify(status));
-  const refused = run("node", [SCRIPT, "send", reviewJob.id, "hello"], { cwd: ctx.repo, env: ctx.env });
+  const refused = run("node", [NEUTRAL, "send", reviewJob.id, "hello"], { cwd: ctx.repo, env: ctx.env });
   assert.notEqual(refused.status, 0);
   assert.match(refused.stderr, /is a review job\. Messages can be sent only to task jobs/);
 });
@@ -169,11 +170,11 @@ test("result --wait exits 75 while the job runs and prints the result once it fi
   const ctx = makeRepo("interruptible-slow-task");
   const { jobId } = await startRunningTask(ctx);
 
-  const early = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "500"], { cwd: ctx.repo, env: ctx.env });
+  const early = run("node", [NEUTRAL, "result", jobId, "--wait", "--timeout-ms", "500"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(early.status, 75, early.stderr);
   assert.match(early.stdout, new RegExp(`Job ${escapeRegExp(jobId)} is still running after 1 s\\. Run the same command again`));
 
-  const done = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "20000"], { cwd: ctx.repo, env: ctx.env });
+  const done = run("node", [NEUTRAL, "result", jobId, "--wait", "--timeout-ms", "20000"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(done.status, 0, done.stderr);
   assert.match(done.stdout, /Handled the requested task/);
 });
@@ -186,7 +187,7 @@ test("the rescue agent's task call keeps option-like text after -- as the prompt
   });
   assert.equal(launched.status, 0, launched.stderr);
   const { jobId } = JSON.parse(launched.stdout);
-  const done = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "20000"], { cwd: ctx.repo, env: ctx.env });
+  const done = run("node", [NEUTRAL, "result", jobId, "--wait", "--timeout-ms", "20000"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(done.status, 0, done.stderr);
   assert.equal(fakeState(ctx.binDir).lastTurnStart.prompt, "fix --model handling");
 });
@@ -195,7 +196,7 @@ test("send starts a new turn with a message the turn ended without applying", as
   const ctx = makeRepo("steer-no-item");
   const { jobId, turnId } = await startRunningTask(ctx);
 
-  const result = run("node", [SCRIPT, "send", "--json", jobId, "apply", "this", "later"], { cwd: ctx.repo, env: ctx.env });
+  const result = run("node", [NEUTRAL, "send", "--json", jobId, "apply", "this", "later"], { cwd: ctx.repo, env: ctx.env });
 
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
@@ -236,7 +237,7 @@ test("cancel names a job that has already finished", () => {
   assert.equal(done.status, 0, done.stderr);
   const { jobId } = JSON.parse(done.stdout);
 
-  const cancelled = run("node", [SCRIPT, "cancel", jobId], { cwd: ctx.repo, env: ctx.env });
+  const cancelled = run("node", [NEUTRAL, "cancel", jobId], { cwd: ctx.repo, env: ctx.env });
 
   assert.notEqual(cancelled.status, 0);
   assert.match(cancelled.stderr, new RegExp(`Job ${escapeRegExp(jobId)} has already completed, so there is nothing to cancel\\.`));
@@ -246,7 +247,7 @@ for (const value of ["0", "abc"]) {
   test(`send --timeout-ms ${value} is rejected`, () => {
     const ctx = makeRepo();
 
-    const result = run("node", [SCRIPT, "send", "--timeout-ms", value, "task-missing", "hello"], { cwd: ctx.repo, env: ctx.env });
+    const result = run("node", [NEUTRAL, "send", "--timeout-ms", value, "task-missing", "hello"], { cwd: ctx.repo, env: ctx.env });
 
     assert.equal(result.status, 1, result.stderr);
     assert.match(result.stderr, /--timeout-ms must be a positive number of milliseconds\./);
