@@ -319,14 +319,18 @@ test("a second resume of a conversation is refused while the first is queued", a
   await waitUntil(() => jobEnded(ctx.repo, jobId), { timeoutMs: 20000, describe: "the first resume ending" });
 });
 
-test("agy review accepts --background and runs in the foreground", (t) => {
+test("agy review --background runs as a tracked background review job", async (t) => {
   const ctx = makeRepo(undefined, t);
   fs.writeFileSync(path.join(ctx.repo, "README.md"), "changed\n");
 
   const result = run("node", [AGY, "review", "--background"], { cwd: ctx.repo, env: ctx.env });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /No material issues found by the fake agy\./);
+  const jobId = result.stdout.match(/started in the background as (review-\S+)\./)?.[1];
+  assert.ok(jobId, result.stdout);
+  const ended = await waitUntil(() => jobEnded(ctx.repo, jobId), { timeoutMs: 20000, describe: "the background review ending" });
+  assert.equal(ended.status, "completed", JSON.stringify(ended));
+  assert.match(ended.rendered, /No material issues found by the fake agy\./);
 });
 
 test("a failed agy review keeps its failure message in the summary", (t) => {
@@ -362,6 +366,16 @@ test("agy uses its saved default and names it in the job output", (t) => {
   const unnamed = run("node", [AGY, "task", "hi"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(unnamed.status, 0, unnamed.stderr);
   assert.match(unnamed.stdout, /^Model: chosen by Antigravity$/m);
+});
+
+test("result of a background agy task names the saved model it ran on", (t) => {
+  const ctx = makeRepo(undefined, t);
+  const jobId = startBackground(ctx, ["investigate", "the", "build"]);
+  const result = run("node", [NEUTRAL, "result", jobId, "--wait", "--timeout-ms", "20000"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^reply: investigate the build$/m);
+  assert.match(result.stdout, /^Model: Fake Model \(High\) \(from the Antigravity settings\)$/m);
+  assert.equal(result.stdout.match(/^Model: /gm).length, 1, result.stdout);
 });
 
 test("agy rejects a --model its model list does not contain", (t) => {

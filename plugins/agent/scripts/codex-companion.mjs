@@ -13,6 +13,7 @@ import * as reviewCommand from "./providers/codex/commands/review.mjs";
 import * as taskCommand from "./providers/codex/commands/task.mjs";
 import * as transferCommand from "./providers/codex/commands/transfer.mjs";
 import * as usageCommand from "./providers/codex/commands/usage.mjs";
+import { executeReviewRun } from "./providers/codex/commands/review.mjs";
 import { executeTaskRun } from "./providers/codex/commands/task.mjs";
 import { takeJobRequest, writeJobFile } from "./lib/state.mjs";
 import { readStoredJob } from "./lib/job-control.mjs";
@@ -103,7 +104,8 @@ async function handleTaskWorker(argv) {
       logFile
     },
     () =>
-      executeTaskRun({
+      // A queued review request runs as a review; every other request runs as a task.
+      (request.requestKind === "review" ? executeReviewRun : executeTaskRun)({
         ...request,
         onProgress: progress
       }),

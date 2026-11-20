@@ -202,3 +202,66 @@ test("fenceFor handles text with very many backtick runs", () => {
   assert.equal(fenceFor("` x ".repeat(200000)), "```");
   assert.equal(fenceFor(`${"` x ".repeat(200000)}`.concat("`````")), "``````");
 });
+
+test("a finding without a file renders without a location", () => {
+  const parsed = {
+    verdict: "needs-attention",
+    summary: "One concern.",
+    target: "project",
+    findings: [
+      {
+        severity: "medium",
+        title: "No usage instructions",
+        body: "Nothing explains how to run the project.",
+        file: null,
+        line_start: null,
+        line_end: null,
+        confidence: 0.6,
+        recommendation: "Add a README."
+      },
+      {
+        severity: "low",
+        title: "Trailing spaces",
+        body: "Line 3 ends in spaces.",
+        file: "app.js",
+        line_start: 3,
+        line_end: 3,
+        confidence: 0.9,
+        recommendation: ""
+      }
+    ],
+    next_steps: []
+  };
+  const output = renderReviewResult({ parsed, rawOutput: JSON.stringify(parsed), parseError: null }, { reviewLabel: "Review", targetLabel: "project /tmp/site" });
+  assert.match(output, /^- \[medium\] No usage instructions$/m);
+  assert.match(output, /^- \[low\] Trailing spaces \(app\.js:3\)$/m);
+  assert.doesNotMatch(output, /unknown/);
+  assert.match(output, /^# Codex Review \(project\)$/m);
+});
+
+test("a stored finding without target renders as a changes review", () => {
+  const parsed = {
+    verdict: "needs-attention",
+    summary: "One issue.",
+    findings: [{ severity: "high", title: "Guard", body: "Missing guard.", file: "src/app.js", line_start: 4, line_end: 6, confidence: 0.8, recommendation: "" }],
+    next_steps: []
+  };
+  const output = renderReviewResult({ parsed, rawOutput: JSON.stringify(parsed), parseError: null }, { reviewLabel: "Review", targetLabel: "working tree diff" });
+  assert.match(output, /^# Codex Review \(changes\)$/m);
+  assert.match(output, /^- \[high\] Guard \(src\/app\.js:4-6\)$/m);
+  const fromJob = renderReviewResult({ parsed, rawOutput: "", parseError: null }, { reviewLabel: "Review", targetLabel: "project /tmp/site", targetKind: "project" });
+  assert.match(fromJob, /^# Codex Review \(project\)$/m);
+});
+
+test("the review heading names the target the job resolved, not the one the result claims", () => {
+  const output = renderReviewResult(
+    {
+      parsed: { verdict: "approve", summary: "Fine.", target: "changes", findings: [], next_steps: [] },
+      rawOutput: "{}",
+      parseError: null
+    },
+    { reviewLabel: "Review", targetLabel: "project /work", targetKind: "project", providerLabel: "Codex" }
+  );
+  assert.match(output, /^# Codex Review \(project\)$/m);
+  assert.doesNotMatch(output, /\(changes\)/);
+});

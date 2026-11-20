@@ -311,6 +311,26 @@ test("adversarial review renders structured findings over app-server turn/start"
   assert.match(result.stdout, /Missing empty-state guard/);
 });
 
+test("review --stance critical renders structured findings over app-server turn/start", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0];\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0].id;\n");
+
+  const result = run("node", [SCRIPT, "review", "--stance", "critical"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /Missing empty-state guard/);
+});
+
 test("adversarial review accepts the same base-branch targeting as review", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -323,6 +343,27 @@ test("adversarial review accepts the same base-branch targeting as review", () =
   fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0].id;\n");
 
   const result = run("node", [SCRIPT, "adversarial-review", "--base", "main"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Branch review against main|against main/i);
+  assert.match(result.stdout, /Missing empty-state guard/);
+});
+
+test("review --stance critical accepts the same base-branch targeting as review", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0];\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0].id;\n");
+
+  const result = run("node", [SCRIPT, "review", "--stance", "critical", "--base", "main"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -348,6 +389,33 @@ test("adversarial review asks Codex to inspect larger diffs itself", () => {
   fs.writeFileSync(path.join(repo, "src", "c.js"), 'export const value = "PROMPT_SELF_COLLECT_C";\n');
 
   const result = run("node", [SCRIPT, "adversarial-review"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.match(state.lastTurnStart.prompt, /lightweight summary/i);
+  assert.match(state.lastTurnStart.prompt, /read-only git commands/i);
+  assert.doesNotMatch(state.lastTurnStart.prompt, /PROMPT_SELF_COLLECT_[ABC]/);
+});
+
+test("review --stance critical asks Codex to inspect larger diffs itself", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  for (const name of ["a.js", "b.js", "c.js"]) {
+    fs.writeFileSync(path.join(repo, "src", name), `export const value = "${name}-v1";\n`);
+  }
+  run("git", ["add", "src/a.js", "src/b.js", "src/c.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "a.js"), 'export const value = "PROMPT_SELF_COLLECT_A";\n');
+  fs.writeFileSync(path.join(repo, "src", "b.js"), 'export const value = "PROMPT_SELF_COLLECT_B";\n');
+  fs.writeFileSync(path.join(repo, "src", "c.js"), 'export const value = "PROMPT_SELF_COLLECT_C";\n');
+
+  const result = run("node", [SCRIPT, "review", "--stance", "critical"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -1044,7 +1112,7 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
 });
 
-test("review rejects focus text because it is native-review only", () => {
+test("review with focus text runs a schema-bound peer review", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -1059,9 +1127,11 @@ test("review rejects focus text because it is native-review only", () => {
     env: buildEnv(binDir)
   });
 
-  assert.equal(result.status > 0, true);
-  assert.match(result.stderr, /does not support custom focus text/i);
-  assert.match(result.stderr, /\/agent:codex-adversarial-review focus on auth/i);
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.ok(state.lastTurnStart.outputSchema?.properties?.verdict, "the turn carried no review schema");
+  assert.match(state.lastTurnStart.prompt, /focus on auth/);
+  assert.equal(state.lastReviewStart, undefined);
 });
 
 test("review rejects staged-only scope because it is native-review only", () => {
@@ -1106,7 +1176,28 @@ test("adversarial review rejects staged-only scope to match review target select
   assert.match(result.stderr, /Use one of: auto, working-tree, branch, or pass --base <ref>/i);
 });
 
-test("review accepts --background while still running as a tracked review job", () => {
+test("review --stance critical rejects staged-only scope to match review target selection", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "review", "--stance", "critical", "--scope", "staged"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status > 0, true);
+  assert.match(result.stderr, /Unsupported review scope "staged"/i);
+  assert.match(result.stderr, /Use one of: auto, working-tree, branch, or pass --base <ref>/i);
+});
+
+test("review --background runs as a tracked background review job", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -1123,8 +1214,13 @@ test("review accepts --background while still running as a tracked review job", 
 
   assert.equal(launched.status, 0, launched.stderr);
   const launchPayload = JSON.parse(launched.stdout);
-  assert.equal(launchPayload.review, "Review");
-  assert.match(launchPayload.codex.stdout, /No material issues found/);
+  assert.equal(launchPayload.status, "queued");
+  assert.equal(launchPayload.title, "Codex Review");
+  assert.ok(
+    await waitUntil(() => readStoredJob(repo, launchPayload.jobId)?.status === "completed", { timeoutMs: 30000 }),
+    JSON.stringify(readStoredJob(repo, launchPayload.jobId))
+  );
+  assert.match(readStoredJob(repo, launchPayload.jobId).result.codex.stdout, /No material issues found/);
 
   const status = run("node", [NEUTRAL, "status"], {
     cwd: repo,

@@ -6,7 +6,8 @@ import { writeExecutable } from "./helpers.mjs";
 // A stand-in for the Antigravity CLI (agy 1.2.10). In stream-json print mode it answers each
 // stdin line with the init, step_update, and result events agy emits, one turn at a time, and
 // records every run in agy-state.json next to the script; `pids` lists the process id of every
-// print-mode process.
+// print-mode process. With --json-schema it returns a structured review: no findings for a
+// changes review, and one finding without a location for a project review.
 //
 // Behaviours other than "ok":
 // - "slow" and "hang": each turn takes 3 s or 10 min.
@@ -193,7 +194,16 @@ function runNext() {
     emit({ event: "step_update", step_update: { conversation_id: conversationId, step_index: step++, state: "DONE", step_type: "agent_response", text_delta: "\\n" } });
     const result = { conversation_id: conversationId, status: "SUCCESS", response: (BEHAVIOR === "two-messages" ? "Working on it.\\n" : "") + response + "\\n", duration_seconds: 0.1, num_turns: turns };
     if (args.includes("--json-schema")) {
-      result.structured_output = { verdict: "approve", summary: "No material issues found by the fake agy.", findings: [], next_steps: [] };
+      // A project review prompt gets one finding without a location.
+      result.structured_output = String(content).includes("This is a project review")
+        ? {
+            verdict: "needs-attention",
+            summary: "One project-wide concern surfaced by the fake agy.",
+            target: "project",
+            findings: [{ severity: "medium", title: "No usage instructions", body: "No file explains how to run the project.", file: null, line_start: null, line_end: null, confidence: 0.6, recommendation: "Add a README." }],
+            next_steps: []
+          }
+        : { verdict: "approve", summary: "No material issues found by the fake agy.", target: "changes", findings: [], next_steps: [] };
     }
     emit({ event: "result", result });
     busy = false;

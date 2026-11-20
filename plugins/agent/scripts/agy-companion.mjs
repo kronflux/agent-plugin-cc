@@ -7,6 +7,7 @@ import { readStoredJob } from "./lib/job-control.mjs";
 import { takeJobRequest, writeJobFile } from "./lib/state.mjs";
 import { nowIso, runTrackedJob } from "./lib/tracked-jobs.mjs";
 import * as reviewCommand from "./providers/agy/commands/review.mjs";
+import { executeAgyReview } from "./providers/agy/commands/review.mjs";
 import * as setupCommand from "./providers/agy/commands/setup.mjs";
 import * as taskCommand from "./providers/agy/commands/task.mjs";
 import { executeAgyTask } from "./providers/agy/commands/task.mjs";
@@ -43,7 +44,9 @@ async function handleTaskWorker(argv) {
     throw new Error(errorMessage);
   }
   const { logFile, progress } = createTrackedProgress({ ...storedJob, workspaceRoot }, { logFile: storedJob.logFile ?? null });
-  await runTrackedJob({ ...storedJob, workspaceRoot, logFile }, () => executeAgyTask({ ...request, onProgress: progress }), { logFile });
+  // A queued review request runs as a review; every other request runs as a task.
+  const execute = request.requestKind === "review" ? executeAgyReview : executeAgyTask;
+  await runTrackedJob({ ...storedJob, workspaceRoot, logFile }, () => execute({ ...request, onProgress: progress }), { logFile });
 }
 
 async function runSubcommand(subcommand, argv) {

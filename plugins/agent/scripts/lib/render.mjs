@@ -18,6 +18,11 @@ function severityRank(severity) {
   }
 }
 
+// The location of a finding, " (file:lines)", or nothing for a finding without a file.
+function formatLocation(finding) {
+  return finding.file ? ` (${finding.file}${formatLineRange(finding)})` : "";
+}
+
 function formatLineRange(finding) {
   if (!finding.line_start) {
     return "";
@@ -59,17 +64,33 @@ function normalizeReviewFinding(finding, index) {
     severity: typeof source.severity === "string" && source.severity.trim() ? source.severity.trim().toLowerCase() : "low",
     title: typeof source.title === "string" && source.title.trim() ? source.title.trim() : `Finding ${index + 1}`,
     body: typeof source.body === "string" && source.body.trim() ? source.body.trim() : "No details provided.",
-    file: typeof source.file === "string" && source.file.trim() ? source.file.trim() : "unknown",
+    file: typeof source.file === "string" && source.file.trim() ? source.file.trim() : null,
     line_start: lineStart,
     line_end: lineEnd,
     recommendation: typeof source.recommendation === "string" ? source.recommendation.trim() : ""
   };
 }
 
-function normalizeReviewResultData(data) {
+const REVIEW_TARGET_KINDS = new Set(["changes", "project"]);
+
+// The kind of target a review covered: the one the job resolved and recorded, else the one the
+// result names, else "changes" for a record that names none.
+function reviewTargetKind(data, meta) {
+  if (REVIEW_TARGET_KINDS.has(meta?.targetKind)) {
+    return meta.targetKind;
+  }
+  return typeof data?.target === "string" && REVIEW_TARGET_KINDS.has(data.target) ? data.target : "changes";
+}
+
+function reviewHeading(meta, data = null) {
+  return `# ${labelFor(meta)} ${meta.reviewLabel} (${reviewTargetKind(data, meta)})`;
+}
+
+function normalizeReviewResultData(data, meta) {
   return {
     verdict: data.verdict.trim(),
     summary: data.summary.trim(),
+    target: reviewTargetKind(data, meta),
     findings: data.findings.map((finding, index) => normalizeReviewFinding(finding, index)),
     next_steps: data.next_steps
       .filter((step) => typeof step === "string" && step.trim())
@@ -198,10 +219,14 @@ function appendReasoningSection(lines, reasoningSummary) {
   }
 }
 
+/**
+ * Renders a structured review result. `meta.targetKind` is the target kind the job recorded,
+ * which wins over the one the result names. A finding without a file is shown without a location.
+ */
 export function renderReviewResult(parsedResult, meta) {
   if (!parsedResult.parsed) {
     const lines = [
-      `# ${labelFor(meta)} ${meta.reviewLabel}`,
+      reviewHeading(meta),
       "",
       `${labelFor(meta)} did not return valid structured JSON.`,
       "",
@@ -220,7 +245,7 @@ export function renderReviewResult(parsedResult, meta) {
   const validationError = validateReviewResultShape(parsedResult.parsed);
   if (validationError) {
     const lines = [
-      `# ${labelFor(meta)} ${meta.reviewLabel}`,
+      reviewHeading(meta, parsedResult.parsed),
       "",
       `Target: ${meta.targetLabel}`,
       `${labelFor(meta)} returned JSON with an unexpected review shape.`,
@@ -237,10 +262,10 @@ export function renderReviewResult(parsedResult, meta) {
     return `${lines.join("\n").trimEnd()}\n`;
   }
 
-  const data = normalizeReviewResultData(parsedResult.parsed);
+  const data = normalizeReviewResultData(parsedResult.parsed, meta);
   const findings = [...data.findings].sort((left, right) => severityRank(left.severity) - severityRank(right.severity));
   const lines = [
-    `# ${labelFor(meta)} ${meta.reviewLabel}`,
+    reviewHeading(meta, data),
     "",
     `Target: ${meta.targetLabel}`,
     `Verdict: ${data.verdict}`,
@@ -254,8 +279,7 @@ export function renderReviewResult(parsedResult, meta) {
   } else {
     lines.push("Findings:");
     for (const finding of findings) {
-      const lineSuffix = formatLineRange(finding);
-      lines.push(`- [${finding.severity}] ${finding.title} (${finding.file}${lineSuffix})`);
+      lines.push(`- [${finding.severity}] ${finding.title}${formatLocation(finding)}`);
       lines.push(`  ${finding.body}`);
       if (finding.recommendation) {
         lines.push(`  Recommendation: ${finding.recommendation}`);
@@ -397,6 +421,17 @@ export function renderStoredOutputBlock(text, sessionLines = []) {
   return sessionLines.length === 0 ? output : `${output}\n${sessionLines.join("\n")}\n`;
 }
 
+// Stored output followed by the job's note lines (`result.notes`, such as the model the job ran on
+// or a model warning) that the output does not already contain.
+function withStoredNotes(text, storedJob) {
+  const notes = Array.isArray(storedJob?.result?.notes) ? storedJob.result.notes : [];
+  const missing = notes.filter((line) => typeof line === "string" && line.trim() && !text.includes(line));
+  if (missing.length === 0) {
+    return text;
+  }
+  return `${text.endsWith("\n") ? text : `${text}\n`}${missing.join("\n")}\n`;
+}
+
 function renderStoredJobBody(job, storedJob) {
   const provider = providerForJob(job);
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
@@ -406,7 +441,7 @@ function renderStoredJobBody(job, storedJob) {
     ? [`${provider.label} session ID: ${threadId}`, ...(resumeLine ? [resumeLine] : [])]
     : [];
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
-    return renderStoredOutputBlock(storedJob.rendered, sessionLines);
+    return renderStoredOutputBlock(withStoredNotes(storedJob.rendered, storedJob), sessionLines);
   }
 
   const rawOutput =
@@ -414,11 +449,11 @@ function renderStoredJobBody(job, storedJob) {
     provider.storedOutputText(storedJob) ||
     "";
   if (rawOutput) {
-    return renderStoredOutputBlock(rawOutput, sessionLines);
+    return renderStoredOutputBlock(withStoredNotes(rawOutput, storedJob), sessionLines);
   }
 
   if (storedJob?.rendered) {
-    return renderStoredOutputBlock(storedJob.rendered, sessionLines);
+    return renderStoredOutputBlock(withStoredNotes(storedJob.rendered, storedJob), sessionLines);
   }
 
   const lines = [

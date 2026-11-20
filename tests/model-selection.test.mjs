@@ -70,7 +70,7 @@ function makeRepo(t, behavior = "catalog-default") {
 }
 
 function companion(ctx, args, options = {}) {
-  return spawnSync(process.execPath, [SCRIPT, ...args], {
+  return spawnSync(process.execPath, [options.script ?? SCRIPT, ...args], {
     cwd: ctx.repo,
     env: ctx.env,
     encoding: "utf8",
@@ -236,6 +236,19 @@ test("a thread that reports another model prints one warning naming both", (t) =
   assert.equal(result.status, 0, result.stderr);
   const lines = warningLines(result.stderr, "Codex reported model");
   assert.deepEqual(lines, ["Codex reported model m-reported (effort high) for this thread; the plugin sent m-default (effort low)."]);
+});
+
+test("the reported-model warning of a background task reaches the job log and result", (t) => {
+  const ctx = makeRepo(t, "reports-other-model");
+  const launched = companion(ctx, ["task", "--background", "--json", "--", "x"]);
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId, logFile } = JSON.parse(launched.stdout);
+  const neutral = path.join(ROOT, "plugins", "agent", "scripts", "agent-companion.mjs");
+  const result = companion(ctx, ["result", jobId, "--wait", "--timeout-ms", "30000"], { script: neutral });
+  assert.equal(result.status, 0, result.stderr);
+  const warning = "Codex reported model m-reported (effort high) for this thread; the plugin sent m-default (effort low).";
+  assert.ok(result.stdout.includes(warning), result.stdout);
+  assert.ok(fs.readFileSync(logFile, "utf8").includes(warning), "the job log has no warning");
 });
 
 test("a partial report keeps the resolved effort", (t) => {

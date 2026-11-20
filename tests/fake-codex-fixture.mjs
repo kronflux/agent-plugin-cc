@@ -368,12 +368,36 @@ function nativeReviewText(target) {
   return "Reviewed uncommitted changes.\\nNo material issues found.";
 }
 
+// A project review prompt gets one finding without a location.
 function structuredReviewPayload(prompt) {
-  if (prompt.includes("adversarial software review")) {
+  const target = prompt.includes("This is a project review") ? "project" : "changes";
+  if (target === "project" && BEHAVIOR !== "invalid-json") {
+    return JSON.stringify({
+      verdict: "needs-attention",
+      summary: "One project-wide concern surfaced.",
+      target,
+      findings: [
+        {
+          severity: "medium",
+          title: "No usage instructions",
+          body: "No file explains how to run the project.",
+          file: null,
+          line_start: null,
+          line_end: null,
+          confidence: 0.6,
+          recommendation: "Add a README that explains how to run the project."
+        }
+      ],
+      next_steps: []
+    });
+  }
+
+  if (prompt.includes("critical software review")) {
     if (BEHAVIOR === "adversarial-clean") {
       return JSON.stringify({
         verdict: "approve",
         summary: "No material issues found.",
+        target,
         findings: [],
         next_steps: []
       });
@@ -382,6 +406,7 @@ function structuredReviewPayload(prompt) {
     return JSON.stringify({
       verdict: "needs-attention",
       summary: "One adversarial concern surfaced.",
+      target,
       findings: [
         {
           severity: "high",
@@ -405,6 +430,7 @@ function structuredReviewPayload(prompt) {
   return JSON.stringify({
     verdict: "approve",
     summary: "No material issues found.",
+    target,
     findings: [],
     next_steps: []
   });
@@ -781,6 +807,8 @@ function handleMessage(message) {
       }
 
       case "review/start": {
+        state.lastReviewStart = message.params;
+        saveState(state);
         const thread = ensureThread(state, message.params.threadId);
         let reviewThread = thread;
         if (message.params.delivery === "detached") {

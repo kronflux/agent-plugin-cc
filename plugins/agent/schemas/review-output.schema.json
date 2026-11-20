@@ -1,10 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-plugin:schema:review-output:2",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "verdict",
     "summary",
+    "target",
     "findings",
     "next_steps"
   ],
@@ -19,6 +21,13 @@
     "summary": {
       "type": "string",
       "minLength": 1
+    },
+    "target": {
+      "type": "string",
+      "enum": [
+        "changes",
+        "project"
+      ]
     },
     "findings": {
       "type": "array",
@@ -54,15 +63,24 @@
             "minLength": 1
           },
           "file": {
-            "type": "string",
+            "type": [
+              "string",
+              "null"
+            ],
             "minLength": 1
           },
           "line_start": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "minimum": 1
           },
           "line_end": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "minimum": 1
           },
           "confidence": {

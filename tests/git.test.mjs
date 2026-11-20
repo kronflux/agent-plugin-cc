@@ -7,8 +7,9 @@ import {
   collectReviewContext,
   createWorktree,
   getCurrentBranch,
+  listChangedPaths,
   removeWorktree,
-  resolveReviewTarget
+  resolveChangesTarget
 } from "../plugins/agent/scripts/lib/git.mjs";
 import { makeCommittedRepo, makeTempDir, run } from "./helpers.mjs";
 
@@ -51,7 +52,7 @@ test("resolveReviewTarget prefers working tree when repo is dirty", (t) => {
   const cwd = makeRepoWithApp(t);
   fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v2');\n");
 
-  const target = resolveReviewTarget(cwd, {});
+  const target = resolveChangesTarget(cwd, {});
 
   assert.equal(target.mode, "working-tree");
 });
@@ -60,7 +61,7 @@ test("resolveReviewTarget falls back to branch diff when repo is clean", (t) => 
   const cwd = makeRepoWithApp(t);
   makeFeatureBranch(cwd);
 
-  const target = resolveReviewTarget(cwd, {});
+  const target = resolveChangesTarget(cwd, {});
   const context = collectReviewContext(cwd, target);
 
   assert.equal(target.mode, "branch");
@@ -85,7 +86,7 @@ test("default branch names with special characters are passed to git literally",
   const cmdRepo = makeRepoWithDefaultBranch(t, cmdBranch, {
     "branch-helper.cmd": "@echo branch-helper>branch-helper-output\r\n"
   });
-  const cmdTarget = resolveReviewTarget(cmdRepo, {});
+  const cmdTarget = resolveChangesTarget(cmdRepo, {});
   const cmdContext = collectReviewContext(cmdRepo, cmdTarget);
   assert.equal(cmdTarget.mode, "branch");
   assert.equal(cmdTarget.baseRef, cmdBranch);
@@ -96,7 +97,7 @@ test("default branch names with special characters are passed to git literally",
   const shBranch = "main;touch${IFS}pwned";
   run("git", ["check-ref-format", "--branch", shBranch], { check: true, shell: false });
   const shRepo = makeRepoWithDefaultBranch(t, shBranch);
-  const shTarget = resolveReviewTarget(shRepo, {});
+  const shTarget = resolveChangesTarget(shRepo, {});
   const shContext = collectReviewContext(shRepo, shTarget);
   assert.equal(shTarget.mode, "branch");
   assert.equal(shTarget.baseRef, shBranch);
@@ -108,7 +109,7 @@ test("resolveReviewTarget honors explicit base overrides", (t) => {
   const cwd = makeRepoWithApp(t);
   makeFeatureBranch(cwd);
 
-  const target = resolveReviewTarget(cwd, { base: "main" });
+  const target = resolveChangesTarget(cwd, { base: "main" });
 
   assert.equal(target.mode, "branch");
   assert.equal(target.baseRef, "main");
@@ -119,7 +120,7 @@ test("resolveReviewTarget requires an explicit base when no default branch can b
   git(cwd, ["branch", "-m", "feature-only"]);
 
   assert.throws(
-    () => resolveReviewTarget(cwd, {}),
+    () => resolveChangesTarget(cwd, {}),
     /Unable to detect the repository default branch\. Pass --base <ref> or use --scope working-tree\./
   );
 });
@@ -130,11 +131,77 @@ test("the default branch is origin/<name> when no local branch exists", (t) => {
   git(cwd, ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
   git(cwd, ["branch", "-m", "feature-only"]);
 
-  const target = resolveReviewTarget(cwd, { scope: "branch" });
+  const target = resolveChangesTarget(cwd, { scope: "branch" });
 
   assert.equal(target.baseRef, "origin/main");
   const context = collectReviewContext(cwd, target);
   assert.equal(context.comparison.reviewRange, "origin/main...HEAD");
+});
+
+test("an explicit base that names no commit is rejected", (t) => {
+  const cwd = makeRepoWithApp(t);
+  makeFeatureBranch(cwd);
+
+  assert.throws(() => resolveChangesTarget(cwd, { base: "no-such-ref" }), {
+    message: "--base no-such-ref does not name a commit in this repository."
+  });
+  assert.throws(() => resolveChangesTarget(cwd, { base: "-p" }), {
+    message: "--base must name a branch or commit, not an option: -p"
+  });
+});
+
+test("an explicit base with an unsupported or a working-tree scope is rejected", (t) => {
+  const cwd = makeRepoWithApp(t);
+  makeFeatureBranch(cwd);
+
+  assert.throws(() => resolveChangesTarget(cwd, { base: "HEAD", scope: "staged" }), {
+    message: 'Unsupported review scope "staged". Use one of: auto, working-tree, branch, or pass --base <ref>.'
+  });
+  assert.throws(() => resolveChangesTarget(cwd, { base: "main", scope: "working-tree" }), {
+    message: "--base compares the branch with a commit and cannot be combined with --scope working-tree."
+  });
+  assert.equal(resolveChangesTarget(cwd, { base: "main", scope: "branch" }).baseRef, "main");
+});
+
+test("the auto scope run from a subfolder sees an untracked file at the repository root", (t) => {
+  const cwd = makeCommittedRepo(t, { files: { "app.js": "v1\n", "sub/inner.js": "inner\n" } });
+  fs.writeFileSync(path.join(cwd, "root-note.txt"), "new\n");
+
+  const target = resolveChangesTarget(path.join(cwd, "sub"), {});
+
+  assert.equal(target.mode, "working-tree");
+});
+
+test("changed paths with non-ASCII names are listed unquoted", (t) => {
+  const cwd = makeCommittedRepo(t, { files: { "café.js": "v1\n", "naïve/ü.txt": "v1\n" } });
+  fs.writeFileSync(path.join(cwd, "café.js"), "v2\n");
+  git(cwd, ["add", "café.js"]);
+  fs.writeFileSync(path.join(cwd, "naïve", "ü.txt"), "v2\n");
+
+  assert.deepEqual(listChangedPaths(cwd, resolveChangesTarget(cwd, {})), ["café.js", "naïve/ü.txt"]);
+
+  git(cwd, ["checkout", "-b", "feature/unicode"]);
+  commitAll(cwd, "feature");
+  const branch = resolveChangesTarget(cwd, { base: "main" });
+  assert.deepEqual(listChangedPaths(cwd, branch), ["café.js", "naïve/ü.txt"]);
+});
+
+test("a changed file name with a newline is one quoted entry in the summary", (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows does not allow a newline in a file name");
+    return;
+  }
+  const odd = "a\nb.txt";
+  const cwd = makeCommittedRepo(t, { files: { [odd]: "v1\n", "plain.txt": "v1\n" } });
+  fs.writeFileSync(path.join(cwd, odd), "v2\n");
+  fs.writeFileSync(path.join(cwd, "plain.txt"), "v2\n");
+  const context = collectReviewContext(cwd, resolveChangesTarget(cwd, {}), { includeDiff: false });
+  assert.ok(context.content.split("\n").includes(JSON.stringify(odd)), context.content);
+  assert.ok(context.content.split("\n").includes("plain.txt"), context.content);
+  git(cwd, ["checkout", "-b", "feature/newline"]);
+  commitAll(cwd, "feature");
+  const branch = collectReviewContext(cwd, resolveChangesTarget(cwd, { base: "main" }), { includeDiff: false });
+  assert.ok(branch.content.split("\n").includes(JSON.stringify(odd)), branch.content);
 });
 
 test("a base that starts with a dash is rejected", (t) => {
@@ -152,7 +219,7 @@ test("collectReviewContext keeps inline diffs for tiny adversarial reviews", (t)
   const cwd = makeRepoWithApp(t);
   fs.writeFileSync(path.join(cwd, "app.js"), "console.log('INLINE_MARKER');\n");
 
-  const target = resolveReviewTarget(cwd, {});
+  const target = resolveChangesTarget(cwd, {});
   const context = collectReviewContext(cwd, target);
 
   assert.equal(context.inputMode, "inline-diff");
@@ -167,7 +234,7 @@ test("collectReviewContext skips untracked directories in working tree review", 
   fs.mkdirSync(nestedRepoDir, { recursive: true });
   git(nestedRepoDir, ["init", "-b", "main"]);
 
-  const target = resolveReviewTarget(cwd, { scope: "working-tree" });
+  const target = resolveChangesTarget(cwd, { scope: "working-tree" });
   const context = collectReviewContext(cwd, target);
 
   assert.match(context.content, /### \.claude\/worktrees\/agent-test\/\n\(skipped: directory\)/);
@@ -179,7 +246,7 @@ test("collectReviewContext skips broken untracked symlinks instead of crashing",
     return;
   }
 
-  const target = resolveReviewTarget(cwd, {});
+  const target = resolveChangesTarget(cwd, {});
   const context = collectReviewContext(cwd, target);
 
   assert.equal(target.mode, "working-tree");
@@ -195,7 +262,7 @@ test("collectReviewContext names an untracked symlink to an outside file as skip
     return;
   }
 
-  const context = collectReviewContext(cwd, resolveReviewTarget(cwd, { scope: "working-tree" }));
+  const context = collectReviewContext(cwd, resolveChangesTarget(cwd, { scope: "working-tree" }));
 
   assert.match(context.content, /### leak\.txt\n\(skipped: symlink\)/);
   assert.doesNotMatch(context.content, /OUTSIDE_SECRET_MARKER/);
@@ -205,7 +272,7 @@ test("untracked names with non-ASCII letters are read", (t) => {
   const cwd = makeRepoWithApp(t);
   fs.writeFileSync(path.join(cwd, "café.txt"), "NON_ASCII_BODY_MARKER\n");
 
-  const context = collectReviewContext(cwd, resolveReviewTarget(cwd, { scope: "working-tree" }));
+  const context = collectReviewContext(cwd, resolveChangesTarget(cwd, { scope: "working-tree" }));
 
   assert.match(context.content, /### café\.txt\n```\nNON_ASCII_BODY_MARKER\n```/);
 });
@@ -217,7 +284,7 @@ test("only 20 untracked files are inlined", (t) => {
     fs.writeFileSync(path.join(cwd, name), `UNTRACKED_BODY_${index}\n`);
   }
 
-  const context = collectReviewContext(cwd, resolveReviewTarget(cwd, { scope: "working-tree" }));
+  const context = collectReviewContext(cwd, resolveChangesTarget(cwd, { scope: "working-tree" }));
 
   const bodies = context.content.match(/UNTRACKED_BODY_\d+/g) ?? [];
   assert.equal(bodies.length, 20);
@@ -232,7 +299,7 @@ test("untracked bodies count toward the inline budget", (t) => {
   const cwd = makeRepoWithApp(t);
   fs.writeFileSync(path.join(cwd, "big-untracked.txt"), `UNTRACKED_BUDGET_MARKER ${"y".repeat(2000)}\n`);
 
-  const context = collectReviewContext(cwd, resolveReviewTarget(cwd, { scope: "working-tree" }), {
+  const context = collectReviewContext(cwd, resolveChangesTarget(cwd, { scope: "working-tree" }), {
     maxInlineDiffBytes: 256
   });
 
@@ -252,7 +319,7 @@ test("collectReviewContext falls back to lightweight context for larger adversar
   fs.writeFileSync(path.join(cwd, "b.js"), 'export const value = "SELF_COLLECT_MARKER_B";\n');
   fs.writeFileSync(path.join(cwd, "c.js"), 'export const value = "SELF_COLLECT_MARKER_C";\n');
 
-  const target = resolveReviewTarget(cwd, {});
+  const target = resolveChangesTarget(cwd, {});
   const context = collectReviewContext(cwd, target);
 
   assert.equal(context.inputMode, "self-collect");
@@ -267,7 +334,7 @@ test("collectReviewContext falls back to lightweight context for oversized singl
   const cwd = makeRepoWithApp(t, "export const value = 'v1';\n");
   fs.writeFileSync(path.join(cwd, "app.js"), `export const value = '${"x".repeat(512)}';\n`);
 
-  const target = resolveReviewTarget(cwd, {});
+  const target = resolveChangesTarget(cwd, {});
   const context = collectReviewContext(cwd, target, { maxInlineDiffBytes: 128 });
 
   assert.equal(context.fileCount, 1);
@@ -285,7 +352,7 @@ test("collectReviewContext keeps untracked file content in lightweight working t
   fs.writeFileSync(path.join(cwd, "b.js"), 'export const value = "TRACKED_MARKER_B";\n');
   fs.writeFileSync(path.join(cwd, "new-risk.js"), 'export const value = "UNTRACKED_RISK_MARKER";\n');
 
-  const target = resolveReviewTarget(cwd, {});
+  const target = resolveChangesTarget(cwd, {});
   const context = collectReviewContext(cwd, target);
 
   assert.equal(context.inputMode, "self-collect");
@@ -475,7 +542,7 @@ test("an untracked file that holds a code fence stays inside its block", (t) => 
   const cwd = makeRepoWithApp(t);
   fs.writeFileSync(path.join(cwd, "notes.md"), "before\n```\nUNTRACKED_FENCE_MARKER\n```\nafter\n");
 
-  const context = collectReviewContext(cwd, resolveReviewTarget(cwd, {}));
+  const context = collectReviewContext(cwd, resolveChangesTarget(cwd, {}));
 
   assert.match(context.content, /### notes\.md\n````\nbefore\n```\nUNTRACKED_FENCE_MARKER\n```\nafter\n````/);
 });
@@ -493,7 +560,7 @@ test("an untracked file replaced between the check and the open is skipped", (t)
     path.resolve(String(target)) === swapped ? lstatSync(outside, ...rest) : lstatSync(target, ...rest);
   let context;
   try {
-    context = collectReviewContext(cwd, resolveReviewTarget(cwd, {}));
+    context = collectReviewContext(cwd, resolveChangesTarget(cwd, {}));
   } finally {
     fs.lstatSync = lstatSync;
   }
@@ -526,7 +593,7 @@ test("an untracked file reached through an ancestor link to an outside folder is
   };
   let context;
   try {
-    context = collectReviewContext(cwd, resolveReviewTarget(cwd, { scope: "working-tree" }));
+    context = collectReviewContext(cwd, resolveChangesTarget(cwd, { scope: "working-tree" }));
   } finally {
     fs.lstatSync = lstatSync;
     if (swapped) {

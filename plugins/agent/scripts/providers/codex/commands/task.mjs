@@ -17,6 +17,7 @@ import { getSessionId } from "../../../lib/host.mjs";
 import { readStoredJob, reconcileJobLiveness, sortJobsNewestFirst } from "../../../lib/job-control.mjs";
 import { newestJobOnThread, resolveModelSelection, storedSelection } from "../../../lib/model-selection.mjs";
 import { interpolateTemplate, loadPromptTemplate } from "../../../lib/prompts.mjs";
+import { providerForJob } from "../../../lib/providers.mjs";
 import { renderTaskResult } from "../../../lib/render.mjs";
 import { getConfig, listJobs, takeJobMessages, upsertJob, writeJobMessageOutcome } from "../../../lib/state.mjs";
 import {
@@ -206,6 +207,8 @@ async function runTaskRequest(request) {
     ...(worktreePath ? { worktreePath, worktreeBranch } : {}),
     threadId: result.threadId,
     rawOutput,
+    // A model warning printed while the job ran; result prints it after the stored output.
+    ...(result.warnings?.length > 0 ? { notes: result.warnings } : {}),
     ...(result.status !== 0 && failureMessage ? { failureMessage } : {}),
     touchedFiles: result.touchedFiles,
     reasoningSummary: result.reasoningSummary
@@ -311,9 +314,12 @@ export function requireTaskRequest(prompt, resumeLast) {
   }
 }
 
-// Builds a task prompt from the newest finished review in this repository, preferring reviews
-// run from the current Claude session.
-export function buildReviewHandoffPrompt(workspaceRoot, userRequest) {
+/**
+ * Builds a task from the newest finished review in this repository, of either provider, preferring
+ * reviews run from the current Claude session. Returns `{ prompt, summary }`: the prompt and the
+ * task summary both name the provider and the job id of that review.
+ */
+export function buildReviewHandoff(workspaceRoot, userRequest) {
   const reviews = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot))).filter(
     (job) => job.jobClass === "review" && job.status === "completed"
   );
@@ -323,12 +329,18 @@ export function buildReviewHandoffPrompt(workspaceRoot, userRequest) {
     if (!output) {
       continue;
     }
-    return interpolateTemplate(loadPromptTemplate(ROOT_DIR, "review-handoff"), {
+    const reviewerLabel = providerForJob(job).label;
+    const request = userRequest?.trim() ?? "";
+    const prompt = interpolateTemplate(loadPromptTemplate(ROOT_DIR, "review-handoff"), {
+      REVIEWER_LABEL: reviewerLabel,
+      REVIEW_JOB_ID: job.id,
       TARGET_LABEL: stored?.result?.target?.label ?? "the reviewed changes",
       REVIEW_OUTPUT: output,
-      USER_REQUEST: userRequest?.trim() ? `Instructions from the user:
-${userRequest.trim()}` : ""
+      USER_REQUEST: request ? `Instructions from the user:
+${request}` : ""
     });
+    const summary = shorten(`Address the findings of the ${reviewerLabel} review ${job.id}${request ? `: ${request}` : ""}`);
+    return { prompt, summary };
   }
   throw new Error(
     "No finished Codex review with output was found for this repository. Run /agent:codex-review or /agent:codex-adversarial-review first."
@@ -477,7 +489,8 @@ export async function handleTask(argv) {
     return resolved;
   };
   const requestText = await readTaskPrompt(cwd, options, positionals);
-  const prompt = options["from-last-review"] ? buildReviewHandoffPrompt(workspaceRoot, requestText) : requestText;
+  const handoff = options["from-last-review"] ? buildReviewHandoff(workspaceRoot, requestText) : null;
+  const prompt = handoff ? handoff.prompt : requestText;
   const outputSchema = options["output-schema"] ? readOutputSchema(path.resolve(cwd, options["output-schema"])) : null;
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
@@ -487,10 +500,12 @@ export async function handleTask(argv) {
     throw new Error("Choose only one of --resume/--resume-last, --resume-thread, and --fresh.");
   }
   const write = Boolean(options.write);
-  const taskMetadata = buildTaskRunMetadata({
+  const runMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast: resumeLast || Boolean(resumeThreadId)
   });
+  // A hand-off's summary names the review it continues instead of the prompt's markup.
+  const taskMetadata = handoff ? { ...runMetadata, summary: handoff.summary } : runMetadata;
 
   if (options.background) {
     ensureCodexAvailable(cwd);

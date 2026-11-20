@@ -18,7 +18,7 @@ Execution mode:
 - `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
 - `--worktree` runs Codex in a new git worktree on its own branch instead of in this checkout. Preserve it for the forwarded `task` call, but do not treat it as part of the natural-language task text.
-- `--from-last-review` sends the findings of the newest finished Codex review to Codex. Preserve it for the forwarded `task` call, but do not treat it as part of the natural-language task text. A request with this flag needs no other text.
+- `--from-last-review` sends the findings of the newest finished review, from `/agent:codex-review` or `/agent:agy-review`, to Codex. The task names that review's agent and job id, for example "the findings of the Antigravity review <job-id>". Preserve it for the forwarded `task` call, but do not treat it as part of the natural-language task text. A request with this flag needs no other text.
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.
 - If the request includes `--fresh`, do not ask whether to continue. The user already chose.
 - Otherwise, before starting Codex, check for a resumable rescue thread from this Claude session by running:

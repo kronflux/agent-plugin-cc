@@ -42,10 +42,10 @@ import path from "node:path";
 import { readJsonFile } from "../../lib/fs.mjs";
 import { CodexAppServerClient } from "./app-server.mjs";
 import { binaryAvailable } from "../../lib/process.mjs";
-import { validateModelSelection } from "./model-catalog.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
+const REVIEW_THREAD_PREFIX = "Codex Companion Review";
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
@@ -100,19 +100,23 @@ function reportedSelection(response) {
   };
 }
 
-// Prints one warning when the thread reports a model or effort other than the one sent, then
-// hands the reported values to `onThreadReady`. A value the plugin did not send is not compared.
-function announceThreadSelection(response, sent, onThreadReady) {
+// Prints one warning when the thread reports a model or effort other than the one sent, also to
+// the job log through `onProgress`, then hands the reported values to `onThreadReady`. A value
+// the plugin did not send is not compared. Returns the warning, or null when there is none.
+function announceThreadSelection(response, sent, onThreadReady, onProgress = null) {
   const reported = reportedSelection(response);
   const modelDiffers = Boolean(sent.model && reported.model && reported.model !== sent.model);
   const effortDiffers = Boolean(sent.effort && reported.effort && reported.effort !== sent.effort);
+  let warning = null;
   if (modelDiffers || effortDiffers) {
     const describe = (model, effort) => `${model ?? "default"} (effort ${effort ?? "default"})`;
-    process.stderr.write(
-      `Codex reported model ${describe(reported.model ?? sent.model, reported.effort ?? sent.effort)} for this thread; the plugin sent ${describe(sent.model, sent.effort)}.\n`
-    );
+    warning = `Codex reported model ${describe(reported.model ?? sent.model, reported.effort ?? sent.effort)} for this thread; the plugin sent ${describe(sent.model, sent.effort)}.`;
+    process.stderr.write(`${warning}\n`);
+    // The line is already on stderr, so the progress event only writes it to the log.
+    emitLogEvent(onProgress, { message: warning, stderrMessage: "" });
   }
   onThreadReady?.(reported);
+  return warning;
 }
 
 /** @returns {UserInput[]} */
@@ -1203,10 +1207,6 @@ export async function runAppServerReview(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
-    // A selection the caller resolved against the catalog is not checked again.
-    if (options.modelResolved !== true) {
-      await validateModelSelection(client, { model: options.model, effort: options.effort });
-    }
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     // review/start takes no effort parameter, so the effort is set on the review's thread.
     const thread = await startThread(client, cwd, {
@@ -1216,7 +1216,12 @@ export async function runAppServerReview(cwd, options = {}) {
       ephemeral: true,
       threadName: options.threadName
     });
-    announceThreadSelection(thread, { model: options.model ?? null, effort: options.effort ?? null }, options.onThreadReady);
+    const warning = announceThreadSelection(
+      thread,
+      { model: options.model ?? null, effort: options.effort ?? null },
+      options.onThreadReady,
+      options.onProgress
+    );
     const sourceThreadId = thread.thread.id;
     emitProgress(options.onProgress, `Thread ready (${sourceThreadId}).`, "starting", {
       threadId: sourceThreadId
@@ -1254,7 +1259,8 @@ export async function runAppServerReview(cwd, options = {}) {
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
       error: turnState.error,
-      stderr: cleanCodexStderr(client.stderr)
+      stderr: cleanCodexStderr(client.stderr),
+      warnings: warning ? [warning] : []
     };
   });
 }
@@ -1319,10 +1325,6 @@ export async function runAppServerTurn(cwd, options = {}) {
   // The app server is the repository's; the thread can run in another directory, such as a worktree.
   const threadCwd = options.threadCwd ?? cwd;
   return withAppServer(cwd, async (client) => {
-    // A selection the caller resolved against the catalog is not checked again.
-    if (options.modelResolved !== true) {
-      await validateModelSelection(client, { model: options.model, effort: options.effort });
-    }
     const sent = { model: options.model ?? null, effort: options.effort ?? null };
     // turn/start sends the same model and effort, and a value it sends overrides the thread's,
     // so the turn runs on a sent value and, where none was sent, on the one the thread reports.
@@ -1335,6 +1337,7 @@ export async function runAppServerTurn(cwd, options = {}) {
           })
       : null;
     let threadId;
+    let warning;
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
@@ -1344,7 +1347,7 @@ export async function runAppServerTurn(cwd, options = {}) {
         sandbox: options.sandbox,
         ephemeral: false
       });
-      announceThreadSelection(response, sent, onThreadReady);
+      warning = announceThreadSelection(response, sent, onThreadReady, options.onProgress);
       threadId = response.thread.id;
     } else {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
@@ -1355,7 +1358,7 @@ export async function runAppServerTurn(cwd, options = {}) {
         ephemeral: options.persistThread ? false : true,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
       });
-      announceThreadSelection(response, sent, onThreadReady);
+      warning = announceThreadSelection(response, sent, onThreadReady, options.onProgress);
       threadId = response.thread.id;
     }
 
@@ -1388,7 +1391,8 @@ export async function runAppServerTurn(cwd, options = {}) {
       stderr: cleanCodexStderr(client.stderr),
       fileChanges: turnState.fileChanges,
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
-      commandExecutions: turnState.commandExecutions
+      commandExecutions: turnState.commandExecutions,
+      warnings: warning ? [warning] : []
     };
   });
 }
@@ -1417,6 +1421,12 @@ export async function findLatestTaskThread(cwd) {
 
 export function buildPersistentTaskThreadName(prompt) {
   return buildTaskThreadName(prompt);
+}
+
+/** The name of a schema-bound review thread, which Codex keeps so the review can be continued. */
+export function buildReviewThreadName(description) {
+  const excerpt = shorten(description, 56);
+  return excerpt ? `${REVIEW_THREAD_PREFIX}: ${excerpt}` : REVIEW_THREAD_PREFIX;
 }
 
 export function parseStructuredOutput(rawOutput, fallback = {}) {

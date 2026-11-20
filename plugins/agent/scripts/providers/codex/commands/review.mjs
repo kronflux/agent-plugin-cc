@@ -1,34 +1,38 @@
 import path from "node:path";
+import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { parseCommandInput, resolveCommandCwd, resolveCommandWorkspace, runForegroundCommand } from "../../../lib/companion-cli.mjs";
-import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "../../../lib/git.mjs";
+import { normalizeArgv, resolveCommandCwd, resolveCommandWorkspace, runForegroundCommand } from "../../../lib/companion-cli.mjs";
+import { collectReviewContext } from "../../../lib/git.mjs";
 import { resolveModelSelection } from "../../../lib/model-selection.mjs";
-import { interpolateTemplate, loadPromptTemplate } from "../../../lib/prompts.mjs";
 import { renderNativeReviewResult, renderReviewResult } from "../../../lib/render.mjs";
+import {
+  buildReviewPrompt,
+  enqueueBackgroundReview,
+  parseReviewArguments,
+  resolveReviewStance,
+  resolveReviewTarget
+} from "../../../lib/review-target.mjs";
+import { getConfig, upsertJob } from "../../../lib/state.mjs";
 import { createProviderJob, firstMeaningfulLine } from "../../../lib/task-launch.mjs";
+import { resolveWorkspaceRoot } from "../../../lib/workspace.mjs";
 import { codexProvider } from "../index.mjs";
 import { KNOWN_REASONING_EFFORTS } from "../model-catalog.mjs";
-import { ensureCodexAvailable, parseStructuredOutput, readOutputSchema, runAppServerReview, runAppServerTurn } from "../runtime.mjs";
+import {
+  buildReviewThreadName,
+  ensureCodexAvailable,
+  parseStructuredOutput,
+  readOutputSchema,
+  runAppServerReview,
+  runAppServerTurn
+} from "../runtime.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("../../../..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const EFFORT_USAGE = `<${KNOWN_REASONING_EFFORTS.join("|")}>`;
 
-export const usage = `review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark>] [--effort ${EFFORT_USAGE}]`;
-export const adversarialUsage = `adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark>] [--effort ${EFFORT_USAGE}] [focus text]`;
-
-export function buildAdversarialReviewPrompt(context, focusText) {
-  const template = loadPromptTemplate(ROOT_DIR, "adversarial-review");
-  return interpolateTemplate(template, {
-    AGENT_NAME: codexProvider.label,
-    REVIEW_KIND: "Adversarial Review",
-    TARGET_LABEL: context.target.label,
-    USER_FOCUS: focusText || "No extra focus provided.",
-    REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
-    REVIEW_INPUT: context.content
-  });
-}
+export const usage = `review [--target auto|changes|project] [--path <path>]... [--stance peer|critical] [--base <ref>] [--scope auto|working-tree|branch] [--wait|--background] [--model <id|family|default|configured>] [--effort ${EFFORT_USAGE}] [--] [instructions]`;
+export const adversarialUsage = `adversarial-review [--target auto|changes|project] [--path <path>]... [--base <ref>] [--scope auto|working-tree|branch] [--wait] [--model <id|family|default|configured>] [--effort ${EFFORT_USAGE}] [--] [instructions]`;
 
 export function buildNativeReviewTarget(target) {
   if (target.mode === "working-tree") {
@@ -42,44 +46,68 @@ export function buildNativeReviewTarget(target) {
   return null;
 }
 
-export function validateNativeReviewRequest(target, focusText) {
-  if (focusText.trim()) {
-    throw new Error(
-      `\`/agent:codex-review\` now maps directly to the built-in reviewer and does not support custom focus text. Retry with \`/agent:codex-adversarial-review ${focusText.trim()}\` for focused review instructions.`
-    );
-  }
-
-  const nativeTarget = buildNativeReviewTarget(target);
-  if (!nativeTarget) {
-    throw new Error("This `/agent:codex-review` target is not supported by the built-in reviewer. Retry with `/agent:codex-adversarial-review` for custom targeting.");
-  }
-
-  return nativeTarget;
+/**
+ * Codex's built-in reviewer runs only a peer review of git changes with no instructions and no
+ * paths; every other review is a turn bound to the review output schema.
+ */
+export function usesNativeReview(target, stance, instructions) {
+  return (
+    target.kind === "changes" &&
+    stance === "peer" &&
+    !String(instructions ?? "").trim() &&
+    target.paths.length === 0 &&
+    buildNativeReviewTarget(target.changes) !== null
+  );
 }
 
+function reviewLabelFor(stance) {
+  return stance === "critical" ? "Critical Review" : "Review";
+}
+
+// The job record keeps the model and effort Codex reports for the review's thread.
+function recordReportedSelection(workspaceRoot, jobId) {
+  if (!jobId) {
+    return null;
+  }
+  return (reported) =>
+    upsertJob(workspaceRoot, {
+      id: jobId,
+      ...(reported.model ? { model: reported.model } : {}),
+      ...(reported.effort ? { effort: reported.effort } : {})
+    });
+}
+
+/**
+ * Runs one Codex review. `request.reviewTarget` is a `resolveReviewTarget` result; `stance`,
+ * `instructions` and `native` say how it runs. A native review uses Codex's built-in reviewer
+ * on an ephemeral thread; a schema-bound review runs a read-only turn on a persistent thread.
+ */
 export async function executeReviewRun(request) {
   ensureCodexAvailable(request.cwd);
-  ensureGitRepository(request.cwd);
+  const target =
+    request.reviewTarget ??
+    resolveReviewTarget(request.cwd, { target: request.target, paths: request.paths, base: request.base, scope: request.scope });
+  const stance = resolveReviewStance(request.stance);
+  const instructions = String(request.instructions ?? "").trim();
+  const native = request.native ?? usesNativeReview(target, stance, instructions);
+  const reviewLabel = reviewLabelFor(stance);
+  const jobTitle = `Codex ${reviewLabel}`;
+  const onThreadReady = recordReportedSelection(resolveWorkspaceRoot(request.cwd), request.jobId);
 
-  const target = resolveReviewTarget(request.cwd, {
-    base: request.base,
-    scope: request.scope
-  });
-  const focusText = request.focusText?.trim() ?? "";
-  const reviewName = request.reviewName ?? "Review";
-  if (reviewName === "Review") {
-    const reviewTarget = validateNativeReviewRequest(target, focusText);
+  if (native) {
     const result = await runAppServerReview(request.cwd, {
-      target: reviewTarget,
+      target: buildNativeReviewTarget(target.changes),
       model: request.model,
       effort: request.effort,
+      onThreadReady,
       onProgress: request.onProgress
     });
     const payload = {
-      review: reviewName,
-      target,
+      review: reviewLabel,
+      target: { ...target.changes, ...target },
       threadId: result.threadId,
       sourceThreadId: result.sourceThreadId,
+      ...(result.warnings?.length > 0 ? { notes: result.warnings } : {}),
       codex: {
         status: result.status,
         stderr: result.stderr,
@@ -93,7 +121,7 @@ export async function executeReviewRun(request) {
         stdout: result.reviewText,
         stderr: result.stderr
       },
-      { reviewLabel: reviewName, targetLabel: target.label, reasoningSummary: result.reasoningSummary }
+      { reviewLabel, targetLabel: target.label, reasoningSummary: result.reasoningSummary }
     );
 
     return {
@@ -102,36 +130,48 @@ export async function executeReviewRun(request) {
       turnId: result.turnId,
       payload,
       rendered,
-      summary: firstMeaningfulLine(result.reviewText, `${reviewName} completed.`),
-      jobTitle: `Codex ${reviewName}`,
+      summary: firstMeaningfulLine(result.reviewText, `${reviewLabel} completed.`),
+      jobTitle,
       jobClass: "review",
       targetLabel: target.label
     };
   }
 
-  const context = collectReviewContext(request.cwd, target);
-  const prompt = buildAdversarialReviewPrompt(context, focusText);
-  const result = await runAppServerTurn(context.repoRoot, {
+  const context = target.kind === "changes" ? collectReviewContext(request.cwd, target.changes, { paths: target.paths }) : null;
+  const prompt = buildReviewPrompt({
+    rootDir: ROOT_DIR,
+    providerLabel: codexProvider.label,
+    target,
+    stance,
+    instructions,
+    context
+  });
+  const result = await runAppServerTurn(context?.repoRoot ?? target.root, {
     prompt,
     model: request.model,
     effort: request.effort,
+    onThreadReady,
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
-    onProgress: request.onProgress
+    onProgress: request.onProgress,
+    persistThread: true,
+    threadName: buildReviewThreadName(`${reviewLabel} of ${target.label}`)
   });
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
     failureMessage: result.error?.message ?? result.stderr
   });
   const payload = {
-    review: reviewName,
-    target,
+    review: reviewLabel,
+    target: { ...target.changes, ...target },
     threadId: result.threadId,
-    context: {
-      repoRoot: context.repoRoot,
-      branch: context.branch,
-      summary: context.summary
-    },
+    context: context
+      ? {
+          repoRoot: context.repoRoot,
+          branch: context.branch,
+          summary: context.summary
+        }
+      : { root: target.root, paths: target.paths },
     codex: {
       status: result.status,
       stderr: result.stderr,
@@ -141,31 +181,26 @@ export async function executeReviewRun(request) {
     result: parsed.parsed,
     rawOutput: parsed.rawOutput,
     parseError: parsed.parseError,
-    reasoningSummary: result.reasoningSummary
+    reasoningSummary: result.reasoningSummary,
+    ...(result.warnings?.length > 0 ? { notes: result.warnings } : {})
   };
 
+  // A turn that ends without valid JSON is a failed review, so it is never handed off as findings.
   return {
-    exitStatus: result.status,
+    exitStatus: result.status !== 0 ? result.status : parsed.parsed ? 0 : 1,
     threadId: result.threadId,
     turnId: result.turnId,
     payload,
     rendered: renderReviewResult(parsed, {
-      reviewLabel: reviewName,
-      targetLabel: context.target.label,
+      reviewLabel,
+      targetLabel: target.label,
+      targetKind: target.kind,
       reasoningSummary: result.reasoningSummary
     }),
-    summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
-    jobTitle: `Codex ${reviewName}`,
+    summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewLabel} finished.`),
+    jobTitle,
     jobClass: "review",
-    targetLabel: context.target.label
-  };
-}
-
-export function buildReviewJobMetadata(reviewName, target) {
-  return {
-    kind: reviewName === "Adversarial Review" ? "adversarial-review" : "review",
-    title: reviewName === "Review" ? "Codex Review" : `Codex ${reviewName}`,
-    summary: `${reviewName} ${target.label}`
+    targetLabel: target.label
   };
 }
 
@@ -176,64 +211,73 @@ export function getJobKindLabel(kind, jobClass) {
   return jobClass === "review" ? "review" : "rescue";
 }
 
-export async function handleReviewCommand(argv, config) {
-  const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "effort", "cwd"],
-    booleanOptions: ["json", "background", "wait"],
-    aliasMap: {
-      m: "model"
-    }
-  });
+function printWarnings(selection) {
+  for (const warning of selection.warnings ?? []) {
+    process.stderr.write(`${warning}\n`);
+  }
+}
 
+/**
+ * Runs the review command in the foreground, or with --background as a job of the background
+ * worker. The target, the stance and the model are resolved before the job is created, so a bad
+ * value exits with no job record. The job record names the target, the paths,
+ * the stance, whether the built-in reviewer runs, and the model and effort with their sources.
+ */
+export async function handleReviewCommand(argv) {
+  const { options, paths, stance, instructions, background } = parseReviewArguments(argv, { aliasMap: { m: "model" } });
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const focusText = positionals.join(" ").trim();
-  const target = resolveReviewTarget(cwd, {
-    base: options.base,
-    scope: options.scope
+  const target = resolveReviewTarget(cwd, { target: options.target, paths, base: options.base, scope: options.scope });
+  const native = usesNativeReview(target, stance, instructions);
+  const reviewLabel = reviewLabelFor(stance);
+  ensureCodexAvailable(cwd);
+  const selection = await resolveModelSelection(codexProvider, {
+    model: options.model,
+    effort: options.effort,
+    setting: getConfig(workspaceRoot).models?.[codexProvider.id] ?? null,
+    cwd
   });
+  printWarnings(selection);
 
-  config.validateRequest?.(target, focusText);
-  const metadata = buildReviewJobMetadata(config.reviewName, target);
-  // Reviews run in single-use threads that Codex does not keep, so no resume command applies.
+  // A native review runs on a single-use thread that Codex does not keep, so no resume command
+  // applies to it; a schema-bound review's thread can be continued.
   const job = createProviderJob(codexProvider, {
     prefix: "review",
-    kind: metadata.kind,
-    kindLabel: getJobKindLabel(metadata.kind, "review"),
-    title: metadata.title,
+    kind: "review",
+    kindLabel: getJobKindLabel("review", "review"),
+    title: `Codex ${reviewLabel}`,
     workspaceRoot,
     jobClass: "review",
-    summary: metadata.summary,
-    ephemeralThread: true
+    summary: `${reviewLabel} ${target.label}`,
+    ephemeralThread: native,
+    review: { target: target.kind, paths: target.paths, stance, native },
+    model: selection.model,
+    effort: selection.effort,
+    modelSource: selection.modelSource,
+    effortSource: selection.effortSource
   });
-  await runForegroundCommand(
-    job,
-    async (progress) => {
-      const selection = await resolveModelSelection(codexProvider, { model: options.model, effort: options.effort, cwd });
-      return executeReviewRun({
-        cwd,
-        base: options.base,
-        scope: options.scope,
-        model: selection.model,
-        effort: selection.effort,
-        focusText,
-        reviewName: config.reviewName,
-        onProgress: progress
-      });
-    },
-    { json: options.json }
-  );
+  const request = {
+    cwd,
+    reviewTarget: target,
+    stance,
+    instructions,
+    native,
+    model: selection.model,
+    effort: selection.effort,
+    jobId: job.id
+  };
+  if (background) {
+    enqueueBackgroundReview(cwd, job, request, { workerScript: codexProvider.companionScript, json: options.json });
+    return;
+  }
+  await runForegroundCommand(job, (progress) => executeReviewRun({ ...request, onProgress: progress }), { json: options.json });
 }
 
 export async function run(argv) {
-  return handleReviewCommand(argv, {
-    reviewName: "Review",
-    validateRequest: validateNativeReviewRequest
-  });
+  return handleReviewCommand(argv);
 }
 
+// The adversarial-review subcommand runs the review command with the critical stance.
 export async function runAdversarial(argv) {
-  return handleReviewCommand(argv, {
-    reviewName: "Adversarial Review"
-  });
+  return handleReviewCommand(["--stance", "critical", ...normalizeArgv(argv)]);
 }

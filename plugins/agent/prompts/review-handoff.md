@@ -1,5 +1,5 @@
 <task>
-Address the findings of the Codex review below. The review covered {{TARGET_LABEL}}.
+Address the findings of the {{REVIEWER_LABEL}} review {{REVIEW_JOB_ID}} below. The review covered {{TARGET_LABEL}}.
 {{USER_REQUEST}}
 </task>
 

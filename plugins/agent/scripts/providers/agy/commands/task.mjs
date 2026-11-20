@@ -45,22 +45,27 @@ export function resolveLatestConversation(workspaceRoot) {
 }
 
 // The lines of a job's output that name the model agy used when the plugin named none.
-function modelNotes(model, providerModel, savedModelChange) {
+export function modelNoteLines(model, providerModel, savedModelChange) {
   if (model) {
-    return "";
+    return [];
   }
   const lines = [providerModel ? `Model: ${providerModel} (from the Antigravity settings)` : "Model: chosen by Antigravity"];
   if (savedModelChange) {
     lines.push(savedModelChange);
   }
-  return `${lines.join("\n")}\n`;
+  return lines;
+}
+
+/** Note lines as the text that follows a job's output, one per line; empty for no lines. */
+export function notesText(lines) {
+  return lines.length > 0 ? `${lines.join("\n")}\n` : "";
 }
 
 // Without a model agy runs on the model saved in its settings, which it reads when it starts. The
 // settings are therefore read when the job runs, not when it was queued, and the job record and
 // output name that model. A resumed conversation whose saved model changed since it started
 // gets one line that names both.
-function readRunModel(workspaceRoot, request) {
+export function readRunModel(workspaceRoot, request) {
   if (request.model) {
     return { providerModel: null, savedModelChange: null };
   }
@@ -100,6 +105,8 @@ export async function executeAgyTask(request) {
   });
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
   const failureMessage = result.error?.message ?? result.stderr ?? "";
+  // The payload keeps the model lines, so result prints them after the stored output.
+  const notes = modelNoteLines(request.model, providerModel, savedModelChange);
   return {
     exitStatus: result.status,
     threadId: result.conversationId,
@@ -109,9 +116,10 @@ export async function executeAgyTask(request) {
       jobId: request.jobId ?? null,
       threadId: result.conversationId,
       rawOutput,
+      ...(notes.length > 0 ? { notes } : {}),
       ...(result.status !== 0 && failureMessage ? { failureMessage } : {})
     },
-    rendered: `${renderTaskResult({ rawOutput, failureMessage }, { title, jobId: request.jobId ?? null, write: Boolean(request.write), providerLabel: agyProvider.label })}${modelNotes(request.model, providerModel, savedModelChange)}`,
+    rendered: `${renderTaskResult({ rawOutput, failureMessage }, { title, jobId: request.jobId ?? null, write: Boolean(request.write), providerLabel: agyProvider.label })}${notesText(notes)}`,
     summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${title} finished.`)),
     jobTitle: title,
     jobClass: "task",

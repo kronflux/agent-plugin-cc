@@ -17,13 +17,13 @@ All commands come from the `agent` plugin. Commands for one agent carry its name
 
 ## What You Get
 
-- `/agent:codex-review` for a normal read-only Codex review
-- `/agent:codex-adversarial-review` for a steerable challenge review
-- `/agent:codex-rescue` and `/agent:codex-transfer` to delegate work to Codex and hand off sessions
+- `/agent:codex-review` and `/agent:agy-review` to review your changes or your project, as a peer or as a critical reviewer
+- `/agent:codex-rescue` and `/agent:agy-rescue` to hand a task to Codex or Antigravity
+- `/agent:codex-transfer` to hand off a Claude Code session to Codex
 - `/agent:status`, `/agent:result`, `/agent:send`, and `/agent:cancel` to manage the background jobs of both agents
 - `/agent:codex-usage` to see how much of your Codex usage limits is left
 - `/agent:codex-fanout` to start several Codex tasks at once from a manifest
-- `/agent:agy-rescue`, `/agent:agy-review`, and `/agent:agy-setup` to do the same with Antigravity (`agy`)
+- `/agent:codex-setup` and `/agent:agy-setup` to check each agent and choose its delegation model and effort
 
 ## Requirements
 
@@ -31,7 +31,7 @@ All commands come from the `agent` plugin. Commands for one agent carry its name
   - Usage will contribute to your Codex usage limits. [Learn more](https://developers.openai.com/codex/pricing).
 - **For Antigravity: the Antigravity CLI (`agy`)**, signed in with your Google account. Usage
   counts against your Antigravity limits. You need only the agents you plan to use.
-- **Git**, for reviews and worktree tasks.
+- **Git**, for reviews of changes and worktree tasks. A project review also works outside a git repository.
 - **Node.js 22.13 or later**, findable as `node` on the PATH that Claude Code gives its hooks.
   When Claude Code is started from a desktop launcher or an IDE, that PATH can lack a Node
   installed through nvm, fnm, asdf, mise, or Homebrew. Add Node's directory in your Claude Code
@@ -111,52 +111,50 @@ One simple first run is:
 
 ### `/agent:codex-review`
 
-Runs a normal Codex review on your current work. It gives you the same quality of code review as running `/review` inside Codex directly.
+Runs a read-only Codex review. It reviews your changes or your project, and takes the stance of a peer or of a critical reviewer.
 
 > [!NOTE]
-> Code review especially for multi-file changes might take a while. It's generally recommended to run it in the background.
+> A review of a multi-file change or of a whole project can take a while. The command estimates the size and asks whether to wait or to run it in the background.
 
-Use it when you want:
+**Targets.** `--target` picks what is reviewed:
 
-- a review of your current uncommitted changes
-- a review of your branch compared to a base branch like `main`
+- `changes` reviews your uncommitted changes, or your branch compared to a base branch like `main`. Use `--base <ref>` for the branch comparison and `--scope working-tree` or `--scope branch` to pick one. `--base` and `--scope` apply only to this target. An unknown `--base` ref, a ref with no shared history, and `--base` together with `--scope working-tree` exit with code 1 before a job exists.
+- `project` reviews the current files of the folder instead of a diff. The delegate reads the files itself; the plugin does not paste them into the prompt. The prompt names the review root and the paths, and asks for defects, invalid syntax, structure, consistency, formatting, behavior that would confuse an end user, unhandled edge cases, and recommendations.
+- `auto` is the default. In a git repository it reviews the changes when the working tree has changes or the branch is ahead of its base. Otherwise it reviews the project. Outside a git repository it always reviews the project, and `--target changes` there exits with "No git repository here. Use --target project to review the current files."
 
-Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/agent:codex-adversarial-review`](#agentcodex-adversarial-review) when you want to challenge a specific decision or risk area.
+`--path <path>` narrows either target to a file or folder and can be repeated. The path must lie inside the review root, which is the repository root for `changes` and the current folder for `project`. In a changes review the paths limit the status, the diffs, and the list of changed files. If no change lies under the given paths, the command suggests `--target project`.
+
+**Stances.** `--stance` picks how the reviewer works:
+
+- `peer` is the default. It asks for an independent second opinion: what is sound, what is wrong, and what is missing, with evidence for every finding.
+- `critical` questions the chosen implementation and design: assumptions, tradeoffs, failure modes, and whether a different approach would have been safer or simpler.
+
+Text after the flags is passed to the review as instructions, for example a risk area to examine. A changes review with the `peer` stance, no instructions, and no `--path` uses Codex's built-in reviewer on an ephemeral thread; every other combination runs a review prompt that returns structured findings on a thread you can continue.
+
+**Background.** `--background` starts the review as a tracked background job and prints its job ID, and `--wait` runs it in the foreground, which is the default. Use [`/agent:status <job-id>`](#agentstatus) to check on it, [`/agent:result <job-id>`](#agentresult) for the output, and [`/agent:cancel`](#agentcancel) to stop it.
 
 Examples:
 
 ```bash
 /agent:codex-review
 /agent:codex-review --base main
-/agent:codex-review --background
+/agent:codex-review --target project --path src
+/agent:codex-review --stance critical --base main challenge whether this was the right caching and retry design
+/agent:codex-review --background --stance critical look for race conditions and question the chosen approach
 ```
 
-This command is read-only and will not perform any changes. When run in the background you can use [`/agent:status`](#agentstatus) to check on the progress and [`/agent:cancel`](#agentcancel) to cancel the ongoing task.
+This command is read-only and does not fix code. To have Codex fix what a review found, run `/agent:codex-rescue --from-last-review`.
 
-### `/agent:codex-adversarial-review`
+It also takes `--model` and `--effort`, which follow the [model policy](#models-and-effort).
 
-Runs a **steerable** review that questions the chosen implementation and design.
+### `/agent:agy-review`
 
-It can be used to pressure-test assumptions, tradeoffs, failure modes, and whether a different approach would have been safer or simpler.
-
-It uses the same review target selection as `/agent:codex-review`, including `--base <ref>` for branch review.
-It also supports `--wait` and `--background`. Unlike `/agent:codex-review`, it can take extra focus text after the flags.
-
-Use it when you want:
-
-- a review before shipping that challenges the direction, not just the code details
-- review focused on design choices, tradeoffs, hidden assumptions, and alternative approaches
-- pressure-testing around specific risk areas like auth, data loss, rollback, race conditions, or reliability
-
-Examples:
+Runs the same review with Antigravity. It takes the same flags as `/agent:codex-review`: `--target`, `--path`, `--stance`, `--base`, `--scope`, `--background`, `--wait`, `--model`, `--effort`, and instructions. Its default stance is `peer`, and it returns structured findings.
 
 ```bash
-/agent:codex-adversarial-review
-/agent:codex-adversarial-review --base main challenge whether this was the right caching and retry design
-/agent:codex-adversarial-review --background look for race conditions and question the chosen approach
+/agent:agy-review
+/agent:agy-review --stance critical --background
 ```
-
-This command is read-only. It does not fix code. To have Codex fix what a review found, run `/agent:codex-rescue --from-last-review`.
 
 ### `/agent:codex-rescue`
 
@@ -174,7 +172,7 @@ The subagent starts Codex as a background job, waits until the job finishes, and
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, `--fresh`, `--worktree`, and `--from-last-review`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo. `--from-last-review` sends the findings of the newest finished `/agent:codex-review` or `/agent:codex-adversarial-review` run, preferring runs from the current Claude session; any text you add is sent with them.
+It supports `--background`, `--wait`, `--resume`, `--fresh`, `--worktree`, and `--from-last-review`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest Codex thread for this repo. `--from-last-review` sends the output of the newest finished review job that has output, from `/agent:codex-review` or `/agent:agy-review`. The task names the agent and the job ID of that review, for example "the findings of the Antigravity review review-...", and `/agent:status` shows that name while the task runs. When the task completes, `/agent:status` shows the summary of the task's own result. A review that failed, including one that returned no valid structured findings, is never used. When the plugin knows the current Claude session, only reviews from that session count. Any text you add is sent with the findings.
 
 Examples:
 
@@ -202,11 +200,22 @@ Ask Codex to redesign the database connection to be more resilient.
 
 **Notes:**
 
-- if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
+- the model and effort follow the [model policy](#models-and-effort): with no `--model` or `--effort`, the plugin uses your repository's delegation setting, and otherwise the default of the Codex model catalog
 - `--effort` takes `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`; an effort the selected model does not support is rejected before Codex starts, with the efforts it does support
-- `--model` takes a catalog id, a family word, `default` or `configured`; `default` is the model Codex marks as its default, and `configured` sends no model, so Codex chooses it and a model set in the Codex configuration applies
-- write-capable rescue runs use the `workspace-write` sandbox; `/agent:codex-setup --write-sandbox danger-full-access` turns the sandbox off for this repository, and `--write-sandbox workspace-write` turns it back on
-- follow-up rescue requests can continue the latest Codex task in the repo
+- `--model` takes a catalog id, a family word, `default` or `configured`; `configured` sends no model, so Codex chooses it and a model set in your Codex configuration applies; an effort from `--effort` or the delegation setting is still sent
+- write-capable runs use the `workspace-write` sandbox; `/agent:codex-setup --write-sandbox danger-full-access` turns the sandbox off for this repository, and `--write-sandbox workspace-write` turns it back on
+- follow-up requests can continue the latest Codex task in the repo, and they keep that task's model and effort
+
+### `/agent:agy-rescue`
+
+Hands a task to Antigravity through the `agent:agy-rescue` subagent. It works like `/agent:codex-rescue`: the subagent starts the job in the background, waits for it, and returns the result.
+
+It supports `--background`, `--wait`, `--resume`, `--fresh`, `--model`, and `--effort` (the efforts the installed agy lists in `agy --help`, such as `low`, `medium`, and `high`).
+
+```bash
+/agent:agy-rescue investigate why the build is failing in CI
+/agent:agy-rescue --resume apply the top fix from the last run
+```
 
 ### `/agent:codex-transfer`
 
@@ -249,7 +258,7 @@ background task nobody waited for, or a new turn started by `/agent:send`. Claud
 line such as `Codex job task-abc123 completed: ... Run /agent:result task-abc123 for the output.`
 
 The monitor announces nothing else: no starts, progress, or cancellations. Each notice starts a
-Claude turn. The rescue subagent and foreground runs print their own results, so they produce no
+Claude turn. The delegate subagents and foreground runs print their own results, so they produce no
 notice. Monitors do not run in non-interactive `claude -p` sessions.
 
 ### `/agent:result`
@@ -279,9 +288,9 @@ Starts one background Codex task per entry of a JSON manifest and prints the job
 
 Each entry needs a `label` and a `prompt`; `model`, `effort`, `write`, and `worktree` are
 optional. `--write`, `--worktree`, `--model`, and `--effort` on the command apply to entries
-that do not set them. Every entry is checked before any task starts. Give write tasks
-`worktree: true` so parallel edits do not collide. Use a path relative to the repository, or
-quote a path that contains spaces.
+that do not set them. Every entry is checked before any task starts, including its model and
+effort. Give write tasks `worktree: true` so parallel edits do not collide. Use a path relative
+to the repository, or quote a path that contains spaces.
 
 ```bash
 /agent:codex-fanout tasks.json
@@ -294,7 +303,7 @@ Sends a message to a task job of either agent.
 
 - If a Codex job is running, the message joins its current turn. Codex reads it at its next step, the way a message typed into a running Codex session does. The command reports success only after Codex confirms it received the message.
 - If an Antigravity job is running, the message runs as the next turn once the current turn finishes. The command reports success when that turn starts.
-- If the job has finished, the message starts a new turn on the same thread or conversation as a new background job.
+- If the job has finished, the message starts a new turn on the same thread or conversation as a new background job. The new turn keeps the model and effort of the job it continues.
 
 Examples:
 
@@ -328,6 +337,15 @@ Shows the usage limits of the Codex account you are signed in with: each limit w
 Checks whether Codex is installed and authenticated, and shows the version string of the Codex app server.
 If Codex is missing and npm is available, it can offer to install Codex for you.
 
+The report also names the delegation model and effort that a Codex task would use now and where each comes from (`delegation model:` and `delegation effort:`).
+
+`--model <id|family|default|configured>` and `--effort <level>` store a delegation default for this repository, after checking that Codex accepts it. The [model policy](#models-and-effort) describes how the stored default combines with the flags of a command. `--write-sandbox workspace-write|danger-full-access` sets the write sandbox.
+
+```bash
+/agent:codex-setup --model <id> --effort high
+/agent:codex-setup --model default
+```
+
 You can also use `/agent:codex-setup` to manage the optional review gate.
 
 #### Enabling review gate
@@ -345,18 +363,69 @@ After three blocks in a row in one Claude session, the next stop is allowed. Set
 > [!WARNING]
 > The review gate can create a long-running Claude/Codex loop and may drain usage limits quickly. Only enable it when you plan to actively monitor the session.
 
+### `/agent:agy-setup`
+
+Checks that `agy` is installed and signed in. agy has no sign-in status command, so the check
+lists the available models with `agy models`. Like `/agent:codex-setup`, it reports the
+delegation model and effort and accepts `--model <id>`, `--effort <level>`, and
+`--write-sandbox workspace-write|danger-full-access`.
+
+```bash
+/agent:agy-setup
+/agent:agy-setup --model <id>
+```
+
+## Models and effort
+
+The plugin chooses the model and the effort of a Codex job in this order. The first rule that applies wins, and the job record keeps the choice and its source.
+
+1. `--model` and `--effort` on the command.
+2. The delegation setting of the repository, stored by `/agent:codex-setup --model <value>` or `--effort <value>`.
+3. The default of the Codex model catalog: the visible model that `model/list` marks as its default, with that model's default effort. If `model/list` marks none or cannot be read within 10 seconds, the plugin uses the newest visible model of the Sol family in `codex debug models`, with that model's default effort.
+4. If neither gives a model, because `codex debug models` cannot be read or lists no visible Sol model, the plugin sends no model, prints "Codex chose the model; a model set in the Codex configuration applies.", and Codex chooses.
+
+`--model` takes:
+
+- a catalog id, used as given
+- a family word, which resolves to the best-ranked visible model of that family in the catalog
+- `default`, which uses the catalog default and ignores the stored setting
+- `configured`, which sends no model, so Codex chooses it and a model set in your Codex configuration applies. The plugin still sends an effort given with `--effort` or stored in the delegation setting, and that effort replaces the one in your Codex configuration.
+
+An unknown model or an effort the model does not support exits with code 1 before any job, worktree or thread exists, and the message lists the visible models or the supported efforts. If neither `model/list` nor `codex debug models` can be read, a model you name is sent as given, with one line that says it was not checked, and an effort is checked only against the efforts the plugin knows.
+
+Follow-ups keep the model and effort of the job they continue: `/agent:send` on a finished job, `--resume` and `--resume-thread` on a task. A follow-up that names a new model keeps the earlier effort only when the new model accepts it; otherwise one line says the effort was not used.
+
+Reviews, fleet entries and `/agent:codex-setup` follow the same rules.
+
+Setting rules for `/agent:codex-setup`: `--model default` clears the stored setting, `--effort` alone keeps the stored model, and `--model` alone clears the stored effort. A model no catalog can check is stored with a warning.
+
+An Antigravity job uses `--model` from the command, then, on a continued conversation, the model choice of the job it continues, then the delegation setting stored by `/agent:agy-setup --model <id>`, and otherwise names no model, so agy runs on the model saved in the Antigravity settings. When the plugin names no model, the output of a delegated job shows, after Antigravity's result and before any resume information, `Model: <name> (from the Antigravity settings)`, or `Model: chosen by Antigravity` when no model is saved. `--model <id>` is checked against `agy models` before the job starts; if that list cannot be read, the model is sent as given, with one line that says it was not checked. A model id that already ends in an effort, together with a different `--effort`, is refused. When you continue a conversation after the saved model changed, the output says so.
+
+## Configuration
+
+The plugin keeps one `config.json` per repository in its state folder (under `CLAUDE_PLUGIN_DATA`). The setup commands write it; you do not need to edit it by hand.
+
+```json
+{
+  "stopReviewGate": false,
+  "models": {
+    "codex": { "model": "<id>", "effort": "high" },
+    "agy": { "model": "<id>", "effort": null }
+  }
+}
+```
+
+- `stopReviewGate` is the review gate of `/agent:codex-setup`.
+- `models` holds the delegation setting of each agent, described under [Models and effort](#models-and-effort). A `null` value means the agent default applies.
+
+The hook that starts each Claude Code session exports `AGENT_PLUGIN_SESSION_ID` and `AGENT_PLUGIN_TRANSCRIPT_PATH` for the commands of that session.
+
 ## Antigravity
 
 The plugin also drives the Antigravity CLI (`agy`). Its jobs appear in `/agent:status`, and
-`/agent:result`, `/agent:send`, and `/agent:cancel` work on them as on Codex jobs.
-
-- `/agent:agy-setup` checks that `agy` is installed and signed in. agy has no sign-in status
-  command, so the check lists the available models with `agy models`.
-- `/agent:agy-rescue` hands a task to Antigravity through the `agent:agy-rescue` subagent. It
-  supports `--background`, `--wait`, `--resume`, `--fresh`, `--model`, and `--effort` (the
-  efforts the installed agy lists in `agy --help`, such as `low`, `medium`, and `high`).
-- `/agent:agy-review` runs a review of your changes and returns structured findings. It takes
-  the same target options as `/agent:codex-review` and optional focus text.
+`/agent:result`, `/agent:send`, and `/agent:cancel` work on them as on Codex jobs. The commands
+are [`/agent:agy-setup`](#agentagy-setup), [`/agent:agy-rescue`](#agentagy-rescue), and
+[`/agent:agy-review`](#agentagy-review).
 
 Each job runs its own `agy` process. Read-only runs use agy's plan mode with terminal
 restrictions (`--mode plan --sandbox`); write runs keep the terminal restrictions
@@ -388,10 +457,16 @@ interrupt a turn, so `/agent:cancel` stops the job's processes. An agy process i
 /agent:agy-review
 ```
 
+### Challenge A Design
+
+```bash
+/agent:codex-review --stance critical --base main
+```
+
 ### Start Something Long-Running
 
 ```bash
-/agent:codex-adversarial-review --background
+/agent:codex-review --background --stance critical
 /agent:codex-rescue --background investigate the flaky test
 ```
 
@@ -408,7 +483,9 @@ The Codex plugin wraps the [Codex app server](https://developers.openai.com/code
 
 ### Common Configurations
 
-If you want to change the default reasoning effort or the default model that gets used by the plugin, you can define that inside your user-level or project-level `config.toml`. For example to always use `gpt-5.4-mini` on `high` for a specific project you can add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
+The plugin picks the model and effort of a job as described under [Models and effort](#models-and-effort). Your Codex `config.toml` model applies when you pass `--model configured`, and when the plugin finds no default model (rule 4 under [Models and effort](#models-and-effort)). Its reasoning effort applies only when the plugin sends no effort: an `--effort` on the command or an effort in the delegation setting replaces it. To make the `config.toml` model the default for a repository, run `/agent:codex-setup --model configured`.
+
+For example, to use a model and effort for every `--model configured` job of a project that names no effort, add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
 
 ```toml
 model = "<model id>"
@@ -454,7 +531,7 @@ That means:
 
 ### Will it use the same Codex config I already have?
 
-Yes. If you already use Codex, the plugin picks up the same [configuration](#common-configurations).
+Partly. The plugin starts the same Codex install with the same [configuration](#common-configurations), so your sign-in, sandbox and provider settings apply. The model and effort of a job come from the [model policy](#models-and-effort), and your `config.toml` model applies when you pass `--model configured`.
 
 ### Can I keep using my current API key or base URL setup?
 

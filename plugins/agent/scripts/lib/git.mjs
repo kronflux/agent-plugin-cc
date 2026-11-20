@@ -19,6 +19,12 @@ function gitChecked(cwd, args, options = {}) {
   return runCommandChecked("git", args, { cwd, ...options, shell: false });
 }
 
+// A file name as one line of a summary: a name with a control character is written as a JSON string.
+function formatFileName(name) {
+  const hasControl = [...name].some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127);
+  return hasControl ? JSON.stringify(name) : name;
+}
+
 function listUniqueFiles(...groups) {
   return [...new Set(groups.flat().filter(Boolean))].sort();
 }
@@ -257,10 +263,31 @@ export function getCurrentBranch(cwd) {
   return gitChecked(cwd, ["branch", "--show-current"]).stdout.trim() || "HEAD";
 }
 
-export function getWorkingTreeState(cwd) {
-  const staged = gitChecked(cwd, ["diff", "--cached", "--name-only"]).stdout.trim().split("\n").filter(Boolean);
-  const unstaged = gitChecked(cwd, ["diff", "--name-only"]).stdout.trim().split("\n").filter(Boolean);
-  const untracked = gitChecked(cwd, ["ls-files", "--others", "--exclude-standard", "-z"]).stdout.split("\0").filter(Boolean);
+// The pathspec arguments that limit a git command to `paths`, relative to the repository root and
+// taken literally; none when no path is given or one of them is the root itself.
+function pathspec(paths) {
+  if (!Array.isArray(paths) || paths.length === 0 || paths.includes(".")) {
+    return [];
+  }
+  return ["--", ...paths.map((entry) => `:(literal)${entry}`)];
+}
+
+// The NUL-separated path list git prints with -z, whose names git leaves unquoted.
+function splitNulList(output) {
+  return output.split("\0").filter(Boolean);
+}
+
+/**
+ * The staged, unstaged and untracked files of the working tree, limited to `paths` when given.
+ * Paths are relative to the repository root and cover the whole repository, whatever folder of
+ * it `cwd` is.
+ */
+export function getWorkingTreeState(cwd, paths = []) {
+  const spec = pathspec(paths);
+  const repoRoot = getRepoRoot(cwd);
+  const staged = splitNulList(gitChecked(repoRoot, ["diff", "--cached", "--name-only", "-z", ...spec]).stdout);
+  const unstaged = splitNulList(gitChecked(repoRoot, ["diff", "--name-only", "-z", ...spec]).stdout);
+  const untracked = splitNulList(gitChecked(repoRoot, ["ls-files", "--others", "--exclude-standard", "-z", ...spec]).stdout);
 
   return {
     staged,
@@ -270,15 +297,76 @@ export function getWorkingTreeState(cwd) {
   };
 }
 
-export function resolveReviewTarget(cwd, options = {}) {
+/** True when `cwd` is inside a git working tree; false otherwise, also when git is missing. */
+export function isGitRepository(cwd) {
+  const result = git(cwd, ["rev-parse", "--is-inside-work-tree"]);
+  return !result.error && result.status === 0 && result.stdout.trim() === "true";
+}
+
+/** The number of commits on HEAD that `baseRef` does not contain. */
+export function countCommitsAhead(cwd, baseRef) {
+  if (String(baseRef).startsWith("-")) {
+    throw new Error(`--base must name a branch or commit, not an option: ${baseRef}`);
+  }
+  return Number.parseInt(gitChecked(cwd, ["rev-list", "--count", `${baseRef}..HEAD`]).stdout.trim(), 10) || 0;
+}
+
+/**
+ * The paths, relative to the repository root and with forward slashes, that the changes target
+ * `target` (a `resolveChangesTarget` result) covers: staged, unstaged and untracked files for the
+ * working tree, and the files changed since the merge base for a branch. Deleted files are listed,
+ * and a renamed file is listed under its old and its new path.
+ */
+export function listChangedPaths(cwd, target) {
+  const repoRoot = getRepoRoot(cwd);
+  const names = (args) => splitNulList(gitChecked(repoRoot, ["diff", "--name-only", "--no-renames", "-z", ...args]).stdout);
+  if (target.mode === "working-tree") {
+    const untracked = splitNulList(gitChecked(repoRoot, ["ls-files", "--others", "--exclude-standard", "-z"]).stdout);
+    return listUniqueFiles(names(["--cached"]), names([]), untracked);
+  }
+  return listUniqueFiles(names([buildBranchComparison(repoRoot, target.baseRef).commitRange]));
+}
+
+// Throws unless `baseRef` names a commit that shares history with HEAD.
+function assertUsableBase(repoRoot, baseRef) {
+  if (String(baseRef).startsWith("-")) {
+    throw new Error(`--base must name a branch or commit, not an option: ${baseRef}`);
+  }
+  if (git(repoRoot, ["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`]).status !== 0) {
+    throw new Error(`--base ${baseRef} does not name a commit in this repository.`);
+  }
+  if (git(repoRoot, ["merge-base", "HEAD", baseRef]).status !== 0) {
+    throw new Error(`--base ${baseRef} shares no history with HEAD.`);
+  }
+}
+
+/**
+ * Chooses the git comparison a changes review covers: an explicit `base` compares the branch
+ * with it, `scope` picks the working tree or the branch, and `auto` takes the working tree when
+ * the repository has changes and otherwise the branch against the detected default branch. The
+ * scope must be a known one, an explicit base must name a commit that shares history with HEAD,
+ * and a base cannot be combined with the working-tree scope.
+ * Returns `{ mode, label, baseRef, explicit }`.
+ */
+export function resolveChangesTarget(cwd, options = {}) {
   ensureGitRepository(cwd);
 
   const requestedScope = options.scope ?? "auto";
   const baseRef = options.base ?? null;
-  const state = getWorkingTreeState(cwd);
+  const repoRoot = getRepoRoot(cwd);
   const supportedScopes = new Set(["auto", "working-tree", "branch"]);
 
+  if (!supportedScopes.has(requestedScope)) {
+    throw new Error(
+      `Unsupported review scope "${requestedScope}". Use one of: auto, working-tree, branch, or pass --base <ref>.`
+    );
+  }
+
   if (baseRef) {
+    if (requestedScope === "working-tree") {
+      throw new Error("--base compares the branch with a commit and cannot be combined with --scope working-tree.");
+    }
+    assertUsableBase(repoRoot, baseRef);
     return {
       mode: "branch",
       label: `branch diff against ${baseRef}`,
@@ -295,12 +383,6 @@ export function resolveReviewTarget(cwd, options = {}) {
     };
   }
 
-  if (!supportedScopes.has(requestedScope)) {
-    throw new Error(
-      `Unsupported review scope "${requestedScope}". Use one of: auto, working-tree, branch, or pass --base <ref>.`
-    );
-  }
-
   if (requestedScope === "branch") {
     const detectedBase = detectDefaultBranch(cwd);
     return {
@@ -311,7 +393,7 @@ export function resolveReviewTarget(cwd, options = {}) {
     };
   }
 
-  if (state.isDirty) {
+  if (getWorkingTreeState(repoRoot).isDirty) {
     return {
       mode: "working-tree",
       label: "working tree diff",
@@ -463,7 +545,8 @@ function formatUntrackedSections(untracked, entries, budgetBytes) {
 
 function collectWorkingTreeContext(cwd, state, options = {}) {
   const includeDiff = options.includeDiff !== false;
-  const status = gitChecked(cwd, ["status", "--short", "--untracked-files=all"]).stdout.trim();
+  const spec = options.spec ?? [];
+  const status = gitChecked(cwd, ["status", "--short", "--untracked-files=all", ...spec]).stdout.trim();
   const changedFiles = listUniqueFiles(state.staged, state.unstaged, state.untracked);
   const untrackedEntries = options.untrackedEntries ?? formatUntrackedEntries(cwd, state.untracked);
   const maxInlineDiffBytes = options.maxInlineDiffBytes ?? DEFAULT_INLINE_DIFF_MAX_BYTES;
@@ -471,8 +554,8 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
 
   let parts;
   if (includeDiff) {
-    const stagedDiff = gitChecked(cwd, ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
-    const unstagedDiff = gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
+    const stagedDiff = gitChecked(cwd, ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff", ...spec]).stdout;
+    const unstagedDiff = gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff", ...spec]).stdout;
     parts = [
       formatSection("Git Status", status),
       formatSection("Staged Diff", stagedDiff),
@@ -480,13 +563,13 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
       ...formatUntrackedSections(state.untracked, untrackedEntries, maxInlineDiffBytes - trackedDiffBytes)
     ];
   } else {
-    const stagedStat = gitChecked(cwd, ["diff", "--shortstat", "--cached"]).stdout.trim();
-    const unstagedStat = gitChecked(cwd, ["diff", "--shortstat"]).stdout.trim();
+    const stagedStat = gitChecked(cwd, ["diff", "--shortstat", "--cached", ...spec]).stdout.trim();
+    const unstagedStat = gitChecked(cwd, ["diff", "--shortstat", ...spec]).stdout.trim();
     parts = [
       formatSection("Git Status", status),
       formatSection("Staged Diff Stat", stagedStat),
       formatSection("Unstaged Diff Stat", unstagedStat),
-      formatSection("Changed Files", changedFiles.join("\n")),
+      formatSection("Changed Files", changedFiles.map(formatFileName).join("\n")),
       ...formatUntrackedSections(state.untracked, untrackedEntries, maxInlineDiffBytes)
     ];
   }
@@ -499,17 +582,18 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
   };
 }
 
-function listBranchChangedFiles(cwd, comparison) {
-  return gitChecked(cwd, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean);
+function listBranchChangedFiles(cwd, comparison, spec = []) {
+  return splitNulList(gitChecked(cwd, ["diff", "--name-only", "-z", comparison.commitRange, ...spec]).stdout);
 }
 
 function collectBranchContext(cwd, baseRef, options = {}) {
   const includeDiff = options.includeDiff !== false;
+  const spec = options.spec ?? [];
   const comparison = options.comparison ?? buildBranchComparison(cwd, baseRef);
   const currentBranch = getCurrentBranch(cwd);
-  const changedFiles = options.changedFiles ?? listBranchChangedFiles(cwd, comparison);
-  const logOutput = gitChecked(cwd, ["log", "--oneline", "--decorate", comparison.commitRange]).stdout.trim();
-  const diffStat = gitChecked(cwd, ["diff", "--stat", comparison.commitRange]).stdout.trim();
+  const changedFiles = options.changedFiles ?? listBranchChangedFiles(cwd, comparison, spec);
+  const logOutput = gitChecked(cwd, ["log", "--oneline", "--decorate", comparison.commitRange, ...spec]).stdout.trim();
+  const diffStat = gitChecked(cwd, ["diff", "--stat", comparison.commitRange, ...spec]).stdout.trim();
 
   return {
     mode: "branch",
@@ -520,13 +604,13 @@ function collectBranchContext(cwd, baseRef, options = {}) {
           formatSection("Diff Stat", diffStat),
           formatSection(
             "Branch Diff",
-            gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff", comparison.commitRange]).stdout
+            gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff", comparison.commitRange, ...spec]).stdout
           )
         ].join("\n")
       : [
           formatSection("Commit Log", logOutput),
           formatSection("Diff Stat", diffStat),
-          formatSection("Changed Files", changedFiles.join("\n"))
+          formatSection("Changed Files", changedFiles.map(formatFileName).join("\n"))
         ].join("\n"),
     changedFiles,
     comparison
@@ -541,8 +625,14 @@ function buildAdversarialCollectionGuidance(options = {}) {
   return "The repository context below is a lightweight summary. Inspect the target diff yourself with read-only git commands before finalizing findings.";
 }
 
+/**
+ * Collects the git context of the changes target `target`. `options.paths`, relative to the
+ * repository root, limit every part of it alike: the status, the diffs, the stats, the changed
+ * files and the untracked files.
+ */
 export function collectReviewContext(cwd, target, options = {}) {
   const repoRoot = getRepoRoot(cwd);
+  const spec = pathspec(options.paths);
   const currentBranch = getCurrentBranch(repoRoot);
   const maxInlineFiles = normalizeMaxInlineFiles(options.maxInlineFiles);
   const maxInlineDiffBytes = normalizeMaxInlineDiffBytes(options.maxInlineDiffBytes);
@@ -551,12 +641,12 @@ export function collectReviewContext(cwd, target, options = {}) {
   let diffBytes;
 
   if (target.mode === "working-tree") {
-    const state = getWorkingTreeState(repoRoot);
+    const state = getWorkingTreeState(repoRoot, options.paths);
     const trackedDiffBytes = measureCombinedGitOutputBytes(
       repoRoot,
       [
-        ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff"],
-        ["diff", "--binary", "--no-ext-diff", "--submodule=diff"]
+        ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff", ...spec],
+        ["diff", "--binary", "--no-ext-diff", "--submodule=diff", ...spec]
       ],
       maxInlineDiffBytes
     );
@@ -568,21 +658,22 @@ export function collectReviewContext(cwd, target, options = {}) {
         diffBytes <= maxInlineDiffBytes);
     details = collectWorkingTreeContext(repoRoot, state, {
       includeDiff,
+      spec,
       untrackedEntries,
       maxInlineDiffBytes,
       trackedDiffBytes
     });
   } else {
     const comparison = buildBranchComparison(repoRoot, target.baseRef);
-    const changedFiles = listBranchChangedFiles(repoRoot, comparison);
+    const changedFiles = listBranchChangedFiles(repoRoot, comparison, spec);
     const fileCount = changedFiles.length;
     diffBytes = measureGitOutputBytes(
       repoRoot,
-      ["diff", "--binary", "--no-ext-diff", "--submodule=diff", comparison.commitRange],
+      ["diff", "--binary", "--no-ext-diff", "--submodule=diff", comparison.commitRange, ...spec],
       maxInlineDiffBytes
     );
     includeDiff = options.includeDiff ?? (fileCount <= maxInlineFiles && diffBytes <= maxInlineDiffBytes);
-    details = collectBranchContext(repoRoot, target.baseRef, { includeDiff, comparison, changedFiles });
+    details = collectBranchContext(repoRoot, target.baseRef, { includeDiff, comparison, changedFiles, spec });
   }
 
   return {

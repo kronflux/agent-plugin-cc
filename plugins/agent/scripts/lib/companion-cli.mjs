@@ -44,8 +44,10 @@ export function normalizeArgv(argv) {
   return argv;
 }
 
+// With `config.split === false`, `argv` is taken as already split into tokens, so a single
+// remaining token is not split again.
 export function parseCommandInput(argv, config = {}) {
-  const parsed = parseArgs(normalizeArgv(argv), {
+  const parsed = parseArgs(config.split === false ? argv : normalizeArgv(argv), {
     ...config,
     aliasMap: {
       C: "cwd",

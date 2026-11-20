@@ -4,11 +4,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
+import { installFakeAgy } from "./fake-agy-fixture.mjs";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { listJobs } from "../plugins/agent/scripts/lib/state.mjs";
+import { initGitRepo, makeTempDir, run, waitUntil } from "./helpers.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
+const AGY = path.join(ROOT, "plugins", "agent", "scripts", "agy-companion.mjs");
 
 function makeRepo() {
   const repo = makeTempDir();
@@ -55,4 +58,46 @@ test("task --from-last-review without a finished review fails before Codex start
   const stateFile = path.join(binDir, "fake-codex-state.json");
   const state = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, "utf8")) : {};
   assert.equal(state.lastTurnStart, undefined);
+});
+
+// The jobs of one class in a workspace, newest first.
+function jobsOfClass(repo, jobClass) {
+  return listJobs(repo)
+    .filter((job) => job.jobClass === jobClass)
+    .sort((left, right) => String(right.createdAt ?? "").localeCompare(String(left.createdAt ?? "")));
+}
+
+// Starts a background hand-off and waits until its job has ended; returns the launch payload.
+async function backgroundHandoff(repo, env, extra = []) {
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "--from-last-review", ...extra], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const payload = JSON.parse(launched.stdout);
+  const ended = await waitUntil(
+    () => ["completed", "failed", "cancelled"].includes(listJobs(repo).find((job) => job.id === payload.jobId)?.status),
+    { timeoutMs: 30000, describe: `job ${payload.jobId} ending` }
+  );
+  assert.ok(ended, `job ${payload.jobId} did not end`);
+  return payload;
+}
+
+test("the hand-off names the provider and job id of the review it continues", async () => {
+  const { repo, binDir, env } = makeRepo();
+  installFakeAgy(binDir);
+  const agyReview = run("node", [AGY, "review", "--target", "project"], { cwd: repo, env });
+  assert.equal(agyReview.status, 0, agyReview.stderr);
+  const [antigravity] = jobsOfClass(repo, "review");
+  const handoff = await backgroundHandoff(repo, env);
+  assert.equal(handoff.summary, `Address the findings of the Antigravity review ${antigravity.id}`);
+  assert.ok(
+    lastPrompt(binDir).includes(`Address the findings of the Antigravity review ${antigravity.id} below.`),
+    lastPrompt(binDir)
+  );
+
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+  const codexReview = run("node", [SCRIPT, "review"], { cwd: repo, env });
+  assert.equal(codexReview.status, 0, codexReview.stderr);
+  const [codex] = jobsOfClass(repo, "review");
+  const second = await backgroundHandoff(repo, env, ["skip", "style"]);
+  assert.equal(second.summary, `Address the findings of the Codex review ${codex.id}: skip style`);
+  assert.ok(lastPrompt(binDir).includes(`Address the findings of the Codex review ${codex.id} below.`), lastPrompt(binDir));
 });
