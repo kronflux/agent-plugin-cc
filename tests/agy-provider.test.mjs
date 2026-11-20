@@ -1938,3 +1938,54 @@ test("task-resume-candidate reports the newest resumable agy job of the session"
   assert.equal(fresh.status, 0, fresh.stderr);
   assert.deepEqual(JSON.parse(fresh.stdout), { available: false, jobId: null, threadId: null, label: null, status: null, provider: "agy" });
 });
+
+// Model ids and efforts as a fake `agy models` and `agy --help` would list them.
+const FAKE_MODELS = ["x-low", "x-medium", "deep-high-low", "deep-high-medium", "gpt-oss-120b-medium", "gemini-pro-orchestrator-neon"];
+const FAKE_EFFORTS = ["low", "medium", "high", "xhigh"];
+
+function resolveFake(model, effort = null, catalogStatus = "available") {
+  return agyRuntime.resolveAgyModel({ model, effort, models: catalogStatus === "available" ? FAKE_MODELS : [], efforts: FAKE_EFFORTS, catalogStatus });
+}
+
+test("resolveAgyModel joins a base name and an effort, and runs a full id as given", () => {
+  assert.deepEqual(resolveFake("x", "low"), { model: "x-low", effort: "low" });
+  assert.deepEqual(resolveFake("x-medium"), { model: "x-medium", effort: "medium" });
+  // A base that itself ends in an effort word is split at its last word only.
+  assert.deepEqual(resolveFake("deep-high", "medium"), { model: "deep-high-medium", effort: "medium" });
+  assert.deepEqual(resolveFake("deep-high-low"), { model: "deep-high-low", effort: "low" });
+  assert.deepEqual(agyRuntime.agyModelEfforts("deep-high", FAKE_MODELS, FAKE_EFFORTS), ["low", "medium"]);
+  assert.deepEqual(agyRuntime.agyModelEfforts("x", FAKE_MODELS, FAKE_EFFORTS), ["low", "medium"]);
+});
+
+test("resolveAgyModel refuses an effort given twice or not at all, with the spec texts", () => {
+  for (const effort of ["low", "medium"]) {
+    assert.deepEqual(resolveFake("x-low", effort), {
+      error: "Antigravity model x-low already includes effort low. Use either --model x-low, or --model x --effort <effort>."
+    });
+  }
+  assert.deepEqual(resolveFake("x"), {
+    error: "Antigravity model x needs an effort. Use --model x-<effort> or --model x --effort <effort>; x has: low, medium."
+  });
+  assert.deepEqual(resolveFake("x", "high"), {
+    error: "Antigravity model x has no effort high. Use --model x-<effort> or --model x --effort <effort>; x has: low, medium."
+  });
+});
+
+test("resolveAgyModel handles a single-variant base and a model without efforts", () => {
+  assert.deepEqual(resolveFake("gpt-oss-120b-medium"), { model: "gpt-oss-120b-medium", effort: "medium" });
+  assert.deepEqual(resolveFake("gpt-oss-120b", "medium"), { model: "gpt-oss-120b-medium", effort: "medium" });
+  assert.match(resolveFake("gpt-oss-120b").error, /^Antigravity model gpt-oss-120b needs an effort\. .*; gpt-oss-120b has: medium\.$/);
+  assert.deepEqual(resolveFake("gemini-pro-orchestrator-neon"), { model: "gemini-pro-orchestrator-neon", effort: null });
+  assert.match(resolveFake("gemini-pro-orchestrator-neon", "low").error, /^Antigravity model gemini-pro-orchestrator-neon has no efforts/);
+  assert.match(resolveFake("nope").error, /^Model "nope" is not in the Antigravity model list\. Available: x-low, /);
+});
+
+test("resolveAgyModel without a model list runs full ids and joined names unchecked", () => {
+  for (const status of ["unavailable", "empty"]) {
+    const warning = (id) => `The Antigravity model list is unavailable, so "${id}" was not checked.`;
+    assert.deepEqual(resolveFake("y-high", null, status), { model: "y-high", effort: "high", warning: warning("y-high") });
+    assert.deepEqual(resolveFake("y", "low", status), { model: "y-low", effort: "low", warning: warning("y-low") });
+    assert.match(resolveFake("y", null, status).error, /^Antigravity model y needs an effort\. Use --model y-<effort> or --model y --effort <effort>; /);
+    assert.match(resolveFake("y-high", "high", status).error, /already includes effort high/);
+  }
+});

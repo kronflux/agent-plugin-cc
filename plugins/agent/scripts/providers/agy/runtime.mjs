@@ -104,6 +104,93 @@ function normalizeEffort(effort, efforts, cwd, model = null) {
   return normalized;
 }
 
+// The ids of a model list whose entries are ids or `{ id }` objects.
+function modelIds(models) {
+  return (models ?? []).map((entry) => (typeof entry === "string" ? entry : entry?.id)).filter(Boolean);
+}
+
+/**
+ * The efforts that exist for the base name `base`: each effort word `e` of `efforts` for which
+ * the model list `models` holds the id `<base>-<e>`, in the order of `efforts`.
+ */
+export function agyModelEfforts(base, models, efforts) {
+  const ids = new Set(modelIds(models));
+  return (efforts ?? []).filter((effort) => ids.has(`${base}-${effort}`));
+}
+
+/**
+ * Splits a model id into `{ base, effort }` when it ends in `-<effort>` for one of agy's effort
+ * words: with an available list only for a listed id, without one for any id. Only the last word
+ * is split, so a base that itself ends in an effort word stays whole. Returns null otherwise.
+ */
+export function splitAgyModel(model, { models = [], efforts = [], catalogStatus = "available" } = {}) {
+  const id = String(model ?? "");
+  if (catalogStatus === "available" && !modelIds(models).includes(id)) {
+    return null;
+  }
+  const effort = (efforts ?? []).find((word) => id.length > word.length + 1 && id.endsWith(`-${word}`));
+  return effort ? { base: id.slice(0, -(effort.length + 1)), effort } : null;
+}
+
+const FORMS = (base) => `Use --model ${base}-<effort> or --model ${base} --effort <effort>`;
+
+/**
+ * Resolves an Antigravity model named as a full id (`<base>-<effort>`) or as a base name plus an
+ * effort into the id agy runs, which carries the effort; agy is never given `--effort`.
+ *
+ * `models` is the list `agy models` printed, `efforts` agy's effort words, and `catalogStatus`
+ * `available`, `unavailable` (the list could not be read) or `empty` (it listed nothing). An
+ * effort given both in the id and as `effort`, or in neither for a base name, is an error. Without
+ * a list, a full id and a base name with an effort run unchecked with a warning.
+ *
+ * Returns `{ model, effort, warning? }` (effort is the id's effort word, or null for a model
+ * without efforts), or `{ error }`.
+ */
+export function resolveAgyModel({ model, effort = null, models = [], efforts = [], catalogStatus = "available" }) {
+  const id = String(model).trim();
+  const given = effort == null || !String(effort).trim() ? null : String(effort).trim().toLowerCase();
+  const split = splitAgyModel(id, { models, efforts, catalogStatus });
+  if (split && given) {
+    return {
+      error: `Antigravity model ${id} already includes effort ${split.effort}. Use either --model ${id}, or --model ${split.base} --effort <effort>.`
+    };
+  }
+  if (catalogStatus !== "available") {
+    const warning = (name) => `The Antigravity model list is unavailable, so "${name}" was not checked.`;
+    if (split) {
+      return { model: id, effort: split.effort, warning: warning(id) };
+    }
+    if (!given) {
+      return { error: `Antigravity model ${id} needs an effort. ${FORMS(id)}; ${id} has: unknown, because the Antigravity model list is unavailable.` };
+    }
+    if (!(efforts ?? []).includes(given)) {
+      return { error: `agy does not support reasoning effort "${effort}". Use one of: ${(efforts ?? []).join(", ")}.` };
+    }
+    return { model: `${id}-${given}`, effort: given, warning: warning(`${id}-${given}`) };
+  }
+  if (split) {
+    return { model: id, effort: split.effort };
+  }
+  const ids = modelIds(models);
+  const variants = agyModelEfforts(id, models, efforts);
+  if (variants.length > 0) {
+    if (!given) {
+      return { error: `Antigravity model ${id} needs an effort. ${FORMS(id)}; ${id} has: ${variants.join(", ")}.` };
+    }
+    if (!variants.includes(given)) {
+      return { error: `Antigravity model ${id} has no effort ${given}. ${FORMS(id)}; ${id} has: ${variants.join(", ")}.` };
+    }
+    return { model: `${id}-${given}`, effort: given };
+  }
+  if (ids.includes(id)) {
+    if (given) {
+      return { error: `Antigravity model ${id} has no efforts, so --effort ${given} cannot be used with it. Use --model ${id} alone.` };
+    }
+    return { model: id, effort: null };
+  }
+  return { error: `Model "${id}" is not in the Antigravity model list. Available: ${ids.join(", ")}.` };
+}
+
 /**
  * Reads the model agy saved as its default from the Antigravity settings file, as agy names it
  * there (a display name such as "Model Name (Medium)"). Returns null when the file cannot be read
