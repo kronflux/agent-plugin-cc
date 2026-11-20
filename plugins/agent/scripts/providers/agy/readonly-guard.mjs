@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
+import { gitExecutable } from "../../lib/system-tools.mjs";
+
 // The read-only guard of Antigravity jobs without --write. agy's deny settings refuse the file
 // tools a read-only turn must not use, but other tools stay available, so the guard compares the
 // working tree before and after the turn and watches the stream for write tools.
@@ -31,7 +33,7 @@ export function readOnlyGuardMode(env = process.env) {
 
 function git(cwd, args) {
   return new Promise((resolve) => {
-    const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    const child = spawn(gitExecutable(), args, { cwd, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
     const chunks = [];
     child.stdout.on("data", (chunk) => chunks.push(chunk));
     child.on("error", () => resolve(null));

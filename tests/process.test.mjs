@@ -17,6 +17,7 @@ import {
   terminateProcessTree
 } from "../plugins/agent/scripts/lib/process.mjs";
 import { leaderState } from "../plugins/agent/scripts/lib/state.mjs";
+import { windowsSystemTool } from "../plugins/agent/scripts/lib/system-tools.mjs";
 import * as processLib from "../plugins/agent/scripts/lib/process.mjs";
 
 const windowsOnly = { skip: process.platform !== "win32" && "Windows command resolution" };
@@ -154,10 +155,14 @@ test("terminateProcessTree uses taskkill on Windows", () => {
     }
   });
 
+  // The system tool path on a Windows machine; bare "taskkill" elsewhere, where no SystemRoot is set.
   assert.deepEqual(captured, {
-    command: "taskkill",
+    command: windowsSystemTool("taskkill", { platform: "win32" }),
     args: ["/PID", "1234", "/T", "/F"]
   });
+  if (process.platform === "win32") {
+    assert.match(captured.command, /^[a-z]:\\.*\\System32\\taskkill\.exe$/i);
+  }
   assert.equal(outcome.delivered, true);
   assert.equal(outcome.method, "taskkill");
 });

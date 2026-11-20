@@ -1,44 +1,10 @@
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
-import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { boundary, testDelay } from "./store.mjs";
-
-const BATCH_FILE = /\.(cmd|bat)$/i;
-
-// Windows variable names are case-insensitive, and one env object can hold several
-// spellings of a name (an inherited `Path` next to an added `PATH`). Node hands a child
-// the spelling that sorts first, so lookups here read that same spelling.
-function readWindowsEnv(env, name) {
-  const keys = Object.keys(env)
-    .filter((key) => key.toUpperCase() === name)
-    .sort();
-  return keys.length > 0 ? env[keys[0]] : undefined;
-}
-
-function findWindowsExecutable(command, env) {
-  const extensions = path.win32.extname(command)
-    ? [""]
-    : (readWindowsEnv(env, "PATHEXT") || ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean);
-  const directories = /[\\/]/.test(command)
-    ? [""]
-    : (readWindowsEnv(env, "PATH") || "").split(";").filter(Boolean);
-  for (const directory of directories) {
-    for (const extension of extensions) {
-      const candidate = path.win32.join(directory, command) + extension;
-      try {
-        if (fs.statSync(candidate).isFile()) {
-          return candidate;
-        }
-      } catch {
-        // A missing candidate is skipped; the search continues with the next one.
-      }
-    }
-  }
-  return null;
-}
+import { BATCH_FILE, findWindowsExecutable, windowsSystemTool } from "./system-tools.mjs";
 
 // cmd.exe expands %NAME% even inside double quotes and cannot pass a double quote or a
 // line break through to a batch file intact, so those arguments are refused rather than
@@ -80,7 +46,7 @@ export function resolveCommand(command, args = [], env = process.env, platform =
   }
   const commandLine = [executable, ...args].map(quoteForCmd).join(" ");
   return {
-    file: readWindowsEnv(env, "COMSPEC") || "cmd.exe",
+    file: windowsSystemTool("cmd.exe", { env, platform }),
     args: ["/d", "/v:off", "/s", "/c", `"${commandLine}"`],
     options: { windowsVerbatimArguments: true, env: withoutCurrentDirectoryLookup(env) }
   };
@@ -191,7 +157,7 @@ export function terminateProcessTree(pid, options = {}) {
 
   if (platform === "win32") {
     const aliveBefore = isProcessAlive(pid, killImpl);
-    const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
+    const result = runCommandImpl(windowsSystemTool("taskkill", { env: options.env, platform }), ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
       env: options.env
     });
@@ -412,7 +378,7 @@ let scriptHostFailed = false;
 // tens of milliseconds, where starting PowerShell alone takes about half a second of processor
 // time. `ok` is false when the host did not run the query to its end.
 async function queryScriptHost(ids, timeoutMs) {
-  const result = await runBounded("cscript.exe", ["//nologo", "//E:JScript", SCRIPT_HOST_QUERY, ...ids.map(String)], timeoutMs);
+  const result = await runBounded(windowsSystemTool("cscript.exe"), ["//nologo", "//E:JScript", SCRIPT_HOST_QUERY, ...ids.map(String)], timeoutMs);
   const lines = result.stdout.split(/\r?\n/).map((line) => line.trim());
   if (result.ok && lines.includes("done")) {
     return { ok: true, stdout: lines.filter((line) => line !== "done").join("\n") };
@@ -425,7 +391,7 @@ function queryPowerShell(ids, timeoutMs) {
   const script =
     `Get-CimInstance Win32_Process -Filter '${filter}' | ` +
     'ForEach-Object { if ($_.CreationDate) { "$($_.ProcessId) $($_.CreationDate.ToUniversalTime().Ticks)" } else { "$($_.ProcessId) -" } }';
-  return runBounded("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], timeoutMs);
+  return runBounded(windowsSystemTool("powershell.exe"), ["-NoProfile", "-NonInteractive", "-Command", script], timeoutMs);
 }
 
 // Both routes give the same token for one process (the creation time in UTC ticks), so a token
@@ -640,7 +606,7 @@ export async function stopTree(identity, { deadline = undefined, expectedGroupId
   }
   const result = processSeam().stopCommandFails
     ? stopRootAloneForTest(identity.pid)
-    : await runBounded("taskkill", ["/PID", String(identity.pid), "/T", "/F"], Math.min(remaining, 30000), deadline);
+    : await runBounded(windowsSystemTool("taskkill"), ["/PID", String(identity.pid), "/T", "/F"], Math.min(remaining, 30000), deadline);
   if (result.ok) {
     return "stopped";
   }
@@ -770,7 +736,7 @@ export async function stopTrees(identities, { deadline = undefined, expectedGrou
     return results;
   }
   const command = await runBounded(
-    "taskkill",
+    windowsSystemTool("taskkill"),
     [...verified.flatMap(({ identity }) => ["/PID", String(identity.pid)]), "/T", "/F"],
     Math.min(remaining, 30000),
     deadline
@@ -947,7 +913,7 @@ export async function stopHeldTree(child, { groupId = null, deadline = undefined
   }
   const result = processSeam().stopCommandFails
     ? stopRootAloneForTest(child.pid)
-    : await runBounded("taskkill", ["/PID", String(child.pid), "/T", "/F"], Math.min(remaining, 30000), deadline);
+    : await runBounded(windowsSystemTool("taskkill"), ["/PID", String(child.pid), "/T", "/F"], Math.min(remaining, 30000), deadline);
   if (result.reason === "late") {
     return "late";
   }

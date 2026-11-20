@@ -4,19 +4,21 @@ import path from "node:path";
 import { isProbablyText } from "./fs.mjs";
 import { formatCommandFailure, runCommand, runCommandChecked } from "./process.mjs";
 import { fenceFor } from "./render.mjs";
+import { gitExecutable } from "./system-tools.mjs";
 
 const MAX_UNTRACKED_BYTES = 24 * 1024;
 const DEFAULT_INLINE_DIFF_MAX_FILES = 2;
 const DEFAULT_INLINE_DIFF_MAX_BYTES = 256 * 1024;
 const MAX_INLINE_UNTRACKED_FILES = 20;
 
-// Git is directly executable on Windows. Repository-derived arguments must never pass through a shell.
+// Git is directly executable on Windows, started by the absolute path gitExecutable finds on PATH.
+// Repository-derived arguments must never pass through a shell.
 function git(cwd, args, options = {}) {
-  return runCommand("git", args, { cwd, ...options, shell: false });
+  return runCommand(gitExecutable(), args, { cwd, ...options, shell: false });
 }
 
 function gitChecked(cwd, args, options = {}) {
-  return runCommandChecked("git", args, { cwd, ...options, shell: false });
+  return runCommandChecked(gitExecutable(), args, { cwd, ...options, shell: false });
 }
 
 // A file name as one line of a summary: a name with a control character is written as a JSON string.
