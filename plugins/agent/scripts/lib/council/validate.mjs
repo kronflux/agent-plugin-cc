@@ -2,6 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { readObject as readStoredObject } from "./objects.mjs";
+
 // Checks council answers against the round schemas and the rules a schema cannot express.
 // The schema checker covers the keywords the council schemas use: type (with nullable type
 // lists), enum, const, required, properties, additionalProperties (false or a schema), items,
@@ -192,6 +194,147 @@ function checkRound2(answer, context, errors) {
   }
   checkUniqueIds(answer.added, "added", errors, ownIds);
   checkDecisionStance(answer, context, errors);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Classification of an exact provider job, and the validation context of a seat's answer.
+
+const TRANSIENT_PATTERN = /worker-dead|launch-failed|stale-worker|stopped responding|timed out|ETIMEDOUT|ECONNRESET|EPIPE|socket hang up|\b5\d\d\b/i;
+const MISSING_OUTPUT_PATTERN = /returned no structured output|no structured output/i;
+
+/**
+ * The deposit class of an exact bound job at the per-run limit `T`, or null while the job has no
+ * end decision. A timely answer was claimed strictly before `created_at + T` and ended strictly
+ * before `claimed_at + T`; timing is tested before any validation. Returns `{ kind, eventAt,
+ * reason, timely, lateReason }`: `kind` is `missing` (no row; `job pruned or missing`),
+ * `cancelled` (`job cancelled`), `waiting` (`provider waiting`), `late` (a completed job past its
+ * limit, with the late reason), `completed` (timely) or `failed` (a failed or interrupted end,
+ * classified further by classifyFailure). `eventAt` is the job's `end_at`, null when missing.
+ */
+export function classifyJob({ row, T }) {
+  if (!row) {
+    return { kind: "missing", eventAt: null, reason: "job pruned or missing", timely: false, lateReason: null };
+  }
+  if (row.end_state === null || row.end_state === undefined) {
+    return null;
+  }
+  const eventAt = row.end_at;
+  const queueBy = row.created_at + T;
+  let lateReason = null;
+  if (row.claimed_at === null || row.claimed_at === undefined || row.claimed_at >= queueBy) {
+    lateReason = "queue deadline expired";
+  } else if (row.end_at >= row.claimed_at + T) {
+    lateReason = "execution deadline expired";
+  }
+  const timely = lateReason === null;
+  if (row.end_state === "cancelled") {
+    return { kind: "cancelled", eventAt, reason: "job cancelled", timely, lateReason };
+  }
+  if (row.end_state === "waiting") {
+    return { kind: "waiting", eventAt, reason: "provider waiting", timely, lateReason };
+  }
+  if (row.end_state === "completed") {
+    return timely
+      ? { kind: "completed", eventAt, reason: null, timely, lateReason }
+      : { kind: "late", eventAt, reason: lateReason, timely, lateReason };
+  }
+  return { kind: "failed", eventAt, reason: null, timely, lateReason };
+}
+
+function lower(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+// Whether a normalised usage object `{ groups: [{ name, description, defaultDelegation, buckets:
+// [{ remainingFraction }] }] }` holds an empty bucket in the group the job's model draws on: the
+// group named after the model, or the default delegation group when the job ran on the default.
+function applicableZeroBucket(normalized, { model, defaultModel }) {
+  const groups = Array.isArray(normalized?.groups) ? normalized.groups : [];
+  const wanted = lower(model ?? defaultModel);
+  const usesDefault = !model || (defaultModel && lower(model) === lower(defaultModel));
+  const applicable = groups.filter((group) => {
+    if (usesDefault && group.defaultDelegation) {
+      return true;
+    }
+    if (!wanted) {
+      return false;
+    }
+    const name = lower(group.name);
+    return name === wanted || `${name}\n${lower(group.description)}`.includes(wanted);
+  });
+  return applicable.some((group) => (group.buckets ?? []).some((bucket) => bucket.remainingFraction === 0));
+}
+
+// Whether a Codex rate-limit reply reports a reached limit: a raw bucket with a non-null
+// `rateLimitReachedType`, or a normalised bucket with nothing left.
+function codexLimitReached(usage) {
+  const raw = usage?.raw ?? usage;
+  const buckets = [raw?.rateLimits, ...Object.values(raw?.rateLimitsByLimitId ?? {})].filter(Boolean);
+  if (buckets.some((bucket) => bucket.rateLimitReachedType !== null && bucket.rateLimitReachedType !== undefined)) {
+    return true;
+  }
+  const normalized = usage?.normalized ?? null;
+  return Boolean(normalized && (normalized.groups ?? []).some((group) => (group.buckets ?? []).some((bucket) => bucket.remainingFraction === 0)));
+}
+
+/**
+ * The class of a failed or interrupted provider turn, in the contract's order: `quota` when the
+ * usage read (`usage`, null when it failed or was not made) shows an applicable empty bucket
+ * (Codex: a reached limit; others: an empty bucket of the model's group); `missing-output` for a
+ * known missing structured output; `transient` for an interrupted end or a transient error text;
+ * otherwise `final`. A failed usage read supplies no quota evidence.
+ */
+export function classifyFailure({ family, model = null, defaultModel = null, usage = null, row }) {
+  if (usage && !usage.error) {
+    const quota = family === "codex" ? codexLimitReached(usage) : applicableZeroBucket(usage.normalized ?? usage, { model, defaultModel });
+    if (quota) {
+      return "quota";
+    }
+  }
+  const text = `${row?.error ?? ""}\n${row?.end_reason ?? ""}`;
+  if (MISSING_OUTPUT_PATTERN.test(text)) {
+    return "missing-output";
+  }
+  if (row?.end_state === "interrupted" || TRANSIENT_PATTERN.test(text)) {
+    return "transient";
+  }
+  return "final";
+}
+
+function readJsonObject(readObject, runDir, sha256) {
+  return JSON.parse(readObject(runDir, sha256, "json").toString("utf8"));
+}
+
+/**
+ * The context validateAnswer needs for `seat`'s answer in `round`, from the committed rows of the
+ * snapshot `view` (readCouncil) and their verified objects only: `{ schema, kind, options,
+ * bundleRefs, ownFindingIds }`. Round 2 reads the seat's accepted Round 1 answer, the committed
+ * map and the other lettered seats' Round 1 answers, each through the digest-checked reader.
+ */
+export function validationContext(runDir, view, seat, round, { readObject = readStoredObject } = {}) {
+  const kind = view.run.kind;
+  const options = JSON.parse(view.run.options_json ?? "[]");
+  if (round === 1) {
+    return { schema: ROUND_SCHEMAS[1], kind, options, bundleRefs: [], ownFindingIds: [] };
+  }
+  const round1 = new Map(view.seatRounds.filter((row) => row.round === 1).map((row) => [row.seat, row]));
+  const answerOf = (name) => {
+    const row = round1.get(name);
+    return row?.state === "valid" && row.answer_sha256 ? readJsonObject(readObject, runDir, row.answer_sha256) : null;
+  };
+  const own = answerOf(seat);
+  const ownFindingIds = (own?.findings ?? []).map((finding) => finding.id);
+  const round2 = view.rounds.find((row) => row.round === 2);
+  const mapping = round2?.map_sha256 ? readJsonObject(readObject, runDir, round2.map_sha256) : {};
+  const letters = Object.keys(mapping[seat] ?? {}).sort();
+  const bundleRefs = [];
+  for (const letter of letters) {
+    const author = answerOf(mapping[seat][letter]);
+    for (const finding of author?.findings ?? []) {
+      bundleRefs.push(`${letter}-${finding.id}`);
+    }
+  }
+  return { schema: ROUND_SCHEMAS[2], kind, options, bundleRefs, ownFindingIds };
 }
 
 // round: 1 or 2. context: { kind, options, bundleRefs, ownFindingIds }; bundleRefs and

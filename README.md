@@ -23,6 +23,7 @@ All commands come from the `agent` plugin. Commands for one agent carry its name
 - `/agent:status`, `/agent:result`, `/agent:send`, `/agent:resume`, and `/agent:cancel` to manage the background jobs of both agents
 - `/agent:codex-usage` and `/agent:agy-usage` to see how much of each agent's usage limits is left
 - `/agent:fleet` to start Codex and Antigravity jobs together from one manifest and track them as one run
+- `/agent:council` to ask a read-only council of a Claude subagent, a Codex job and an Antigravity job to review work or weigh a decision in two rounds
 - `/agent:codex-setup` and `/agent:agy-setup` to check each agent and choose its delegation model and effort
 
 ## Requirements
@@ -86,7 +87,7 @@ If `agy` is installed but not signed in, run `!agy` once and sign in.
 After install, you should see:
 
 - the slash commands listed below
-- the `agent:codex-delegate` and `agent:agy-delegate` subagents in `/agents`
+- the `agent:codex-delegate`, `agent:agy-delegate` and `agent:council-member` subagents in `/agents`
 
 To try the plugin from a local checkout instead of the published marketplace, start Claude Code
 with the plugin directory for one session:
@@ -627,6 +628,70 @@ and a job that would continue in that worktree does not start. A removal that wa
 example by closing its terminal, can leave the marker behind; every later removal then refuses with
 the marker's path. Only when no removal is running and no Claude Code session uses the repository,
 delete that file and run the command again.
+
+## Council
+
+`/agent:council <question or brief>` asks a council to review work or weigh a decision. The
+`council` skill runs it; it is also available to Claude without the command. A council is a panel
+of read-only seats from different families: by default one Claude subagent (the
+`agent:council-member` agent, read-only with `Read`, `Grep` and `Glob`), one Codex job and one
+Antigravity job. You, the leader, deliver the prompts, check the findings and record verdicts, but
+you have no vote.
+
+**Seats and lenses.** Each seat answers through a lens. A review uses correctness, security and
+maintainability; a decision uses what could fail, first principles, and the cost of carrying it out.
+`--seat <family>:<lens>` (families `claude`, `codex`, `agy`) names the seats instead: at most five,
+at most one Claude seat, and opposing lenses go to different families. `--model <family>=<value>`
+picks a seat's model. A council needs at least two seats from two families; `council start` refuses
+one seat, and refuses with `No quorum possible: ...` when the seats whose CLI is ready are from one
+family. A seat whose provider check fails is kept as `missing-cli`. A provider seat's job carries
+the label `<run-id>-<seat>` and the council's run id, so `/agent:status` lists it.
+
+**Two rounds.** In Round 1 each seat answers the brief (`question`, `targets`, `kind`, `options`
+and `claims` marked `observed` or `assumed`) with JSON that matches the round's schema. In Round 2
+(`council crossexam`) each seat sees the other seats' findings under letters (`A-f1`), with a
+different letter map per seat, and validates, challenges or skips each one. Seat ids, labels, family
+and provider names, model names and the run id are replaced with `[member]` in the findings a seat
+sees; the report keeps the original text. The letter map is stored privately in
+`private/anonymisation.json`. A provider seat's Round 2 continues its accepted Round 1 job; a seat
+whose Round 1 job recorded no thread cannot continue it and ends Round 2 with `error`.
+
+**Quorum.** A round succeeds with at least two valid seats from at least two families. A round
+without a quorum ends the council: `council collect` exits 1 with `No quorum: <k> valid seats from
+<f> families. A council needs two valid seats from two families.`, and the report is titled
+`# Failed council` and holds every stored answer.
+
+**One attempt per seat.** In this release each seat gets one attempt per round: there is no repair
+of an invalid answer, no retry after a timeout or a transient error, and no grace period after a
+quorum. Each seat ends a round as `valid`, `invalid`, `timed-out`, `error`, `missing-cli` or
+`quota-exhausted`; a failed provider turn is checked against the provider's usage to tell exhausted
+quota from other failures. The time limit (`--timeout-ms`, 15 minutes by default) applies to each
+job three ways: to start it, to wait in the queue, and to run it, counted from the moment a worker
+claims the job (`claimed_at`). A seat past its limit gets one exact stop request for its job.
+
+**The status loop.** The skill repeats `council status <run-id>`, which names one next action:
+`collect`, `crossexam`, `merge`, `verify`, `report`, `report-failure`, `damaged` or `done`, with
+the prompts to deliver (`deliveries`, each with its prompt file and intent id). Claude's replies go
+back with `council submit <run-id> <seat> --intent <intent-id> --file <reply.json>`; a reply that
+arrives after its deadline is refused. `council collect <run-id> --round N` runs in the background
+and returns when the round closes, a new prompt is ready, or its 9-minute budget ends. A closed
+round returns its stored result at once (`Round N closed with quorum.`, or the no-quorum text),
+after a short separate cleanup of pending stop requests; `cleanupPending` says whether some are
+still outstanding.
+
+**Merge, verdicts and report.** `council merge` groups the findings into clusters labelled
+`consensus`, `cross-validated`, `disputed` or `solo` by explicit links only. `council verdict
+<run-id> <cluster-id|claim-id> verified|rejected|not-checked [--strongest <n>] [--] [reason]`
+records your check; the report needs a verdict on every P1, consensus and cross-validated cluster.
+`council report` writes `report.md`. At most three councils run in a row on one subject.
+
+**State.** A council's coordination state is in the job store's council tables; its brief,
+prompts, answers, map, merge and report are files named by their SHA-256 digest under
+`council/<run-id>/objects/` in the state folder, beside the exports `brief.md`, `merge.json`,
+`report.md` and `private/anonymisation.json`. `council export <run-id> brief|map|merge|report`
+rebuilds an export from its stored object. `store recover` archives the council rows with the
+rest of the store; the files stay readable, but that council cannot be continued. A council works
+in any folder, git repository or not.
 
 ## Job store
 

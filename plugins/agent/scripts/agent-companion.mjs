@@ -3,6 +3,7 @@
 import process from "node:process";
 
 import * as cancelCommand from "./commands/cancel.mjs";
+import * as councilCommand from "./commands/council.mjs";
 import * as fleetCommand from "./commands/fleet.mjs";
 import * as resultCommand from "./commands/result.mjs";
 import * as resumeCommand from "./commands/resume.mjs";
@@ -22,7 +23,8 @@ const SUBCOMMANDS = {
   cancel: cancelCommand,
   store: storeCommand,
   fleet: fleetCommand,
-  worktree: worktreeCommand
+  worktree: worktreeCommand,
+  council: councilCommand
 };
 
 function printUsage(subcommand = null) {

@@ -207,6 +207,9 @@ const COMMAND_NAMES = [
 ];
 const AGENT_NAMES = ["agy-delegate", "codex-delegate"];
 const SKILL_NAMES = ["codex-cli-runtime", "codex-prompting", "codex-result-handling"];
+// The council skill and its seat agent, beside the delegate agents and the Codex skills.
+const COUNCIL_AGENT = "council-member";
+const COUNCIL_SKILL = "council";
 const REMOVED_WORDS = /rescue|adversarial|fanout|gpt-5-4/;
 
 function listFiles(directory) {
@@ -292,8 +295,8 @@ function readFrontmatter(file) {
 test("the definition folders hold exactly the renamed files", () => {
   const folder = (name) => fs.readdirSync(path.join(PLUGIN_ROOT, name)).sort();
   assert.deepEqual(folder("commands"), COMMAND_NAMES.map((name) => `${name}.md`));
-  assert.deepEqual(folder("agents"), AGENT_NAMES.map((name) => `${name}.md`));
-  assert.deepEqual(folder("skills"), SKILL_NAMES);
+  assert.deepEqual(folder("agents"), [...AGENT_NAMES, COUNCIL_AGENT].sort().map((name) => `${name}.md`));
+  assert.deepEqual(folder("skills"), [...SKILL_NAMES, COUNCIL_SKILL].sort());
   for (const name of AGENT_NAMES) {
     assert.equal(readFrontmatter(path.join(PLUGIN_ROOT, "agents", `${name}.md`)).name, name);
   }
@@ -685,7 +688,9 @@ test("every command, agent and skill has parseable frontmatter with a descriptio
   const files = [
     ...COMMAND_NAMES.map((name) => path.join("commands", `${name}.md`)),
     ...AGENT_NAMES.map((name) => path.join("agents", `${name}.md`)),
-    ...SKILL_NAMES.map((name) => path.join("skills", name, "SKILL.md"))
+    ...SKILL_NAMES.map((name) => path.join("skills", name, "SKILL.md")),
+    path.join("agents", `${COUNCIL_AGENT}.md`),
+    path.join("skills", COUNCIL_SKILL, "SKILL.md")
   ];
   for (const file of files) {
     const description = parseFrontmatter(path.join(PLUGIN_ROOT, file)).values.description;
@@ -952,4 +957,24 @@ test("the agy delegate command and agent match the Codex pair", () => {
   const flags = (text) => [...new Set(text.match(/--[a-z][a-z-]+/g))].sort();
   assert.deepEqual(flags(agentText("agy-delegate")), flags(agentText("codex-delegate")));
   assert.match(agentText("agy-delegate"), /^model: sonnet$/m);
+});
+
+test("the council skill and the council-member agent", () => {
+  const agent = readFrontmatter(path.join(PLUGIN_ROOT, "agents", `${COUNCIL_AGENT}.md`));
+  assert.equal(agent.name, COUNCIL_AGENT);
+  assert.equal(agent.tools, "Read, Grep, Glob");
+  assert.equal(agent.model, "opus");
+  const skillFile = path.join(PLUGIN_ROOT, "skills", COUNCIL_SKILL, "SKILL.md");
+  const skill = readFrontmatter(skillFile);
+  assert.equal(skill.name, COUNCIL_SKILL);
+  assert.match(skill.description, /Codex/);
+  assert.match(skill.description, /Antigravity/);
+  assert.match(skill.description, /Claude subagent/);
+  const body = fs.readFileSync(skillFile, "utf8");
+  for (const text of ["council status", "--intent", "run_in_background", "SendMessage", "at most three", "no vote"]) {
+    assert.ok(body.includes(text), `the council skill names ${text}`);
+  }
+  for (const action of ["collect", "crossexam", "merge", "verify", "report", "report-failure", "damaged", "done"]) {
+    assert.ok(body.includes(`\`${action}\``), `the council skill names the action ${action}`);
+  }
 });

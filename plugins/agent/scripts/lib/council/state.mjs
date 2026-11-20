@@ -27,6 +27,26 @@ export const POLL_MS = 2000;
 /** The time budget of each command that advances collection. */
 export const BUDGET_MS = Object.freeze({ start: 120000, collect: 540000, submit: 120000, crossexam: 120000 });
 
+/**
+ * The named points (E8 `testPoint`) where a council command pauses under a test; none of them is
+ * inside a store transaction.
+ */
+export const COUNCIL_TEST_POINTS = Object.freeze({
+  beforeCreate: "council-before-create",
+  afterCreate: "council-after-create",
+  beforeDecide: "council-before-decide",
+  afterDecide: "council-after-decide",
+  beforeStop: "council-before-stop",
+  afterStop: "council-after-stop",
+  beforeLaunch: "council-before-launch",
+  afterLaunch: "council-after-launch",
+  afterReplyValidation: "council-after-reply-validation",
+  afterDeposit: "council-after-deposit",
+  beforeReduce: "council-before-reduce",
+  afterSeed: "council-after-seed",
+  beforeExport: "council-before-export"
+});
+
 const FORCE_REASONS = Object.freeze(["provider-exit-unobserved", "thread-barrier", "failed-predecessor", "cancelled-predecessor"]);
 const ATTEMPT_ID = /^[0-9a-f]{32}$/;
 const DIGEST = /^[0-9a-f]{64}$/;
@@ -800,6 +820,140 @@ function applyWrite(db, view, write, t) {
     default:
       throw new TypeError(`Unknown council write: ${write.op}`);
   }
+}
+
+/**
+ * Records the merge object `mergeSha256` computed from the inputs at `inputRev`, when Round 2 is
+ * closed with quorum, the run has not failed and `input_rev` is still `inputRev`: sets
+ * `merge_sha256` and `merge_rev`. Resolves to `{ ok: true }` or `{ ok: false, reason }`
+ * (`unknown-run`, `not-mergeable`, `stale-input`).
+ */
+export async function recordMerge(store, { runId, mergeSha256, inputRev, deadline } = {}) {
+  if (!isDigest(mergeSha256) || !Number.isInteger(inputRev)) {
+    throw new TypeError("A council merge needs its digest and input revision.");
+  }
+  return transact(store, deadline, (db) => {
+    const run = plain(db.prepare("SELECT * FROM council_runs WHERE id = ?").get(runId));
+    if (!run) {
+      return { ok: false, reason: "unknown-run" };
+    }
+    const round2 = db.prepare("SELECT * FROM council_rounds WHERE run_id = ? AND round = 2").get(runId);
+    if (run.failed_at !== null || !round2 || round2.closed_at === null || round2.quorum !== 1) {
+      return { ok: false, reason: "not-mergeable" };
+    }
+    if (run.input_rev !== inputRev) {
+      return { ok: false, reason: "stale-input" };
+    }
+    db.prepare("UPDATE council_runs SET merge_sha256 = ?, merge_rev = ? WHERE id = ?").run(mergeSha256, inputRev, runId);
+    return { ok: true };
+  });
+}
+
+/**
+ * Records the leader's verdict on a cluster (`targetKind` `cluster`, `target` its sorted finding
+ * ids, valid only while `merge_sha256 = mergeSha256` and `merge_rev = input_rev = inputRev`) or on
+ * a brief claim (`claim`, valid only while `brief_sha256 = briefSha256`), replacing an earlier
+ * verdict on the same target and raising `verdict_rev`. Resolves to `{ ok: true }` or
+ * `{ ok: false, reason }` (`unknown-run`, `stale-merge`, `stale-brief`).
+ */
+export async function recordVerdict(
+  store,
+  { runId, targetKind, target, clusterId = null, verdict, reason = null, strongest = null, strongestSha256 = null, mergeSha256 = null, inputRev = null, briefSha256 = null, deadline } = {}
+) {
+  return transact(store, deadline, (db) => {
+    const run = plain(db.prepare("SELECT * FROM council_runs WHERE id = ?").get(runId));
+    if (!run) {
+      return { ok: false, reason: "unknown-run" };
+    }
+    const cluster = targetKind === "cluster";
+    if (cluster && (run.merge_sha256 !== mergeSha256 || run.merge_rev !== inputRev || run.input_rev !== inputRev)) {
+      return { ok: false, reason: "stale-merge" };
+    }
+    if (!cluster && run.brief_sha256 !== briefSha256) {
+      return { ok: false, reason: "stale-brief" };
+    }
+    const { t } = sampleTimes(run.clock);
+    db.prepare(
+      `INSERT INTO council_verdicts (run_id, target_kind, target, cluster_id, merge_sha256, input_rev, brief_sha256, verdict, reason,
+         strongest, strongest_sha256, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (run_id, target_kind, target) DO UPDATE SET cluster_id = excluded.cluster_id, merge_sha256 = excluded.merge_sha256,
+         input_rev = excluded.input_rev, brief_sha256 = excluded.brief_sha256, verdict = excluded.verdict, reason = excluded.reason,
+         strongest = excluded.strongest, strongest_sha256 = excluded.strongest_sha256, recorded_at = excluded.recorded_at`
+    ).run(
+      runId,
+      targetKind,
+      target,
+      cluster ? clusterId : null,
+      cluster ? mergeSha256 : null,
+      cluster ? inputRev : null,
+      cluster ? null : briefSha256,
+      verdict,
+      reason,
+      strongest,
+      strongestSha256,
+      t
+    );
+    db.prepare("UPDATE council_runs SET verdict_rev = verdict_rev + 1 WHERE id = ?").run(runId);
+    writeClock(db, runId, t);
+    return { ok: true };
+  });
+}
+
+/**
+ * Records the report object `reportSha256` rendered at `inputRev` and `verdictRev`, while both
+ * revisions are current: outcome `failed` needs a failed run; outcome `council` needs the merge at
+ * `inputRev` and a verdict at `inputRev` for every cluster target in `requiredTargets`. Resolves
+ * to `{ ok: true }` or `{ ok: false, reason }` (`unknown-run`, `stale`, `not-reportable`).
+ */
+export async function recordReport(store, { runId, reportSha256, outcome, inputRev, verdictRev, requiredTargets = [], deadline } = {}) {
+  if (!isDigest(reportSha256) || (outcome !== "council" && outcome !== "failed")) {
+    throw new TypeError("A council report needs its digest and outcome.");
+  }
+  return transact(store, deadline, (db) => {
+    const run = plain(db.prepare("SELECT * FROM council_runs WHERE id = ?").get(runId));
+    if (!run) {
+      return { ok: false, reason: "unknown-run" };
+    }
+    if (run.input_rev !== inputRev || run.verdict_rev !== verdictRev) {
+      return { ok: false, reason: "stale" };
+    }
+    if (outcome === "failed" ? run.failed_at === null : run.merge_rev !== inputRev) {
+      return { ok: false, reason: "not-reportable" };
+    }
+    if (outcome === "council") {
+      const verdictAt = db.prepare("SELECT 1 FROM council_verdicts WHERE run_id = ? AND target_kind = 'cluster' AND target = ? AND input_rev = ?");
+      if (requiredTargets.some((target) => !verdictAt.get(runId, target, inputRev))) {
+        return { ok: false, reason: "not-reportable" };
+      }
+    }
+    db.prepare("UPDATE council_runs SET report_sha256 = ?, report_outcome = ?, report_input_rev = ?, report_verdict_rev = ? WHERE id = ?").run(
+      reportSha256,
+      outcome,
+      inputRev,
+      verdictRev,
+      runId
+    );
+    return { ok: true };
+  });
+}
+
+/**
+ * What reducing one round would do now, from one read snapshot and no write: `{ writes, nextDue }`
+ * of `reduceRound` at a raw wall sample and the council time, or null for an unknown run or an
+ * unstarted round. A collector skips the write transaction when `writes` is empty.
+ */
+export function peekRound(store, { runId, round, layer = 0 }, opts = {}) {
+  return store.read((db) => {
+    const run = plain(db.prepare("SELECT * FROM council_runs WHERE id = ?").get(runId));
+    const roundRow = run ? plain(db.prepare("SELECT * FROM council_rounds WHERE run_id = ? AND round = ?").get(runId, round)) : null;
+    if (!roundRow) {
+      return null;
+    }
+    const view = readRoundView(db, run, roundRow, []);
+    const { w, t } = sampleTimes(run.clock);
+    return reduceRound(view, { w, t, layer });
+  }, opts);
 }
 
 /**
