@@ -22,7 +22,7 @@ All commands come from the `agent` plugin. Commands for one agent carry its name
 - `/agent:codex-transfer` to hand off a Claude Code session to Codex
 - `/agent:status`, `/agent:result`, `/agent:send`, `/agent:resume`, and `/agent:cancel` to manage the background jobs of both agents
 - `/agent:codex-usage` and `/agent:agy-usage` to see how much of each agent's usage limits is left
-- `/agent:codex-fleet` to start several Codex tasks at once from a manifest
+- `/agent:fleet` to start Codex and Antigravity jobs together from one manifest and track them as one run
 - `/agent:codex-setup` and `/agent:agy-setup` to check each agent and choose its delegation model and effort
 
 ## Requirements
@@ -358,28 +358,53 @@ Examples:
 /agent:result cache-rewrite --wait
 ```
 
-### `/agent:codex-fleet`
+### `/agent:fleet`
 
-Starts one background Codex task per entry of a JSON manifest and prints the job IDs.
+Starts Codex and Antigravity jobs together from one JSON manifest and tracks them as one run.
+The members do not talk to each other; each one is an ordinary background job with its own label.
 
 ```json
-[
-  { "label": "lint", "prompt": "fix the lint errors in src/" },
-  { "label": "docs", "prompt": "update the README for the new flags", "effort": "low" },
-  { "label": "cache", "prompt": "try a rewrite of the cache layer", "write": true, "worktree": true }
-]
+{
+  "manifestVersion": 1,
+  "name": "audit",
+  "defaults": { "provider": "codex", "write": false, "worktree": false, "model": null, "effort": null },
+  "members": [
+    { "label": "audit-auth", "provider": "codex", "kind": "task", "prompt": "check the auth module for missing checks",
+      "promptFile": null, "write": false, "worktree": false, "model": null, "effort": null, "outputSchema": null,
+      "allowQuestions": false, "review": null },
+    { "label": "audit-docs", "provider": "agy", "kind": "review", "prompt": "check the README against the code",
+      "review": { "target": "project", "paths": ["README.md", "src"], "stance": "peer" } }
+  ]
+}
 ```
 
-Each entry needs a `label` and a `prompt`; `model`, `effort`, `write`, and `worktree` are
-optional. `--write`, `--worktree`, `--model`, and `--effort` on the command apply to entries
-that do not set them. Every entry is checked before any task starts, including its model and
-effort. Give write tasks `worktree: true` so parallel edits do not collide. Use a path relative
-to the repository, or quote a path that contains spaces.
+- `manifestVersion` must be `1`, and `members` lists at most 8 members. `name` and `defaults` are optional.
+- A key whose value is `null` counts as absent, so the two members above are read the same way as if they left those keys out.
+- Each member needs a `label` (1 to 40 characters from `a-z`, `0-9` and `-`, unique in the manifest) and exactly one of `prompt` and `promptFile`. `provider` falls back to `defaults.provider`, then to Codex. `kind` is `task` (the default) or `review`.
+- `write`, `worktree`, `model` and `effort` fall back to `defaults`; a member is read-only unless it sets `write: true`. `worktree: true` needs a git repository.
+- A review member needs `review` with `target` (`auto`, `changes` or `project`), and optionally `paths` and `stance` (`peer` or `critical`). Its prompt is the review's instructions, so it must not be blank, and it cannot set `outputSchema`, `allowQuestions`, `write` or `worktree`. A review always runs bound to the review schema on a thread that can be continued.
+- `promptFile` and `outputSchema` are read relative to the manifest's folder. Each file must lie inside the manifest's folder or the workspace (the git repository root of the folder you run the command in, or that folder outside a repository), judged by its real path with links resolved. `start` refuses any other file before reading it, so a manifest from another repository cannot send a file such as a key to a provider. Pass `--allow-outside-files` to `start` to read such a file.
+
+The subcommands, each with `--json` for a machine-readable reply:
 
 ```bash
-/agent:codex-fleet tasks.json
-/agent:codex-fleet tasks.json --write --worktree
+/agent:fleet start audit.json
+/agent:fleet start audit.json --allow-outside-files
+/agent:fleet status run-1794000000000-1a2b3c4d
+/agent:fleet wait run-1794000000000-1a2b3c4d --timeout-ms 900000
+/agent:fleet results run-1794000000000-1a2b3c4d --out reports
+/agent:fleet cancel run-1794000000000-1a2b3c4d
 ```
+
+- `start` checks the whole manifest and then each provider once (installed and signed in) before any job exists. A problem in either exits with code 1, names the member or the provider, and starts nothing. It then writes the run record, starts every member as a background job with its label and the run id, and prints the run id and each member's job id. A member whose start fails is listed with the reason; the others still start, and the command exits 0.
+- `status` prints one row per member from the job store: label, provider, job id, state and model. A member that continues as a new job shows the newest job of its chain.
+- `wait` returns when no member is queued, running or stopping, or with `--any` when one of them is no longer. It waits 10 minutes by default and exits with code 75 when the time runs out.
+- `results` prints each member's result under `## <label>`; `--out <dir>` also writes one `<label>.md` file per member.
+- `cancel` cancels every member that has not ended.
+
+Exit codes: 0 for success, 1 for a refused manifest, a failed provider check or an unknown run id, and 75 for a `wait` that timed out.
+
+A member beyond its provider's parallel limit (`maxParallel` in `config.json`, 8 by default) stays `queued` and starts when a place frees; `status` shows it as queued. If a fleet stops between writing its run record and recording its members' starts, `status` shows each member it finds by run id and label as its job, and any other member as `start-unknown`; nothing is started again. The run record is `runs/<run-id>.json` in the plugin's state folder for the repository, never in your project. Every member answers to `/agent:send`, `/agent:resume`, `/agent:result` and `/agent:cancel` by its label.
 
 ### `/agent:send`
 
@@ -684,7 +709,7 @@ How the two agents compare:
 | `/agent:cancel` | interrupts the turn, then stops the processes | stops the processes |
 | `/agent:status`, `/agent:result` | yes | yes |
 | Review, critical review | yes | yes |
-| Fleet (`/agent:codex-fleet`) | yes | no |
+| Fleet (`/agent:fleet`) | yes | yes |
 | `--worktree` | yes | yes |
 | Write sandbox | yes | yes (shared setting) |
 | Structured output (`--output-schema`) | yes | yes |

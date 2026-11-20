@@ -14,9 +14,6 @@ import { checkRuntime, runtimeGateMessage } from "./lib/store.mjs";
 import { createCodexDriver } from "./providers/codex/runtime.mjs";
 import { HelpRequested, parseCommandInput } from "./lib/companion-cli.mjs";
 
-// Seams that tests import from this script.
-export { launchManifestTasks } from "./providers/codex/commands/task.mjs";
-
 const COMPANION_SCRIPT = fileURLToPath(import.meta.url);
 
 const SUBCOMMAND_USAGE = {

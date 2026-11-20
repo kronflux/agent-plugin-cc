@@ -306,6 +306,39 @@ export function renderStatusJson(views) {
   return { jobs: views.map(statusJsonJob) };
 }
 
+/** One job of `status --json` for a job view. */
+export function renderStatusJsonJob(view) {
+  return statusJsonJob(view);
+}
+
+/** An object with the keys of one `status --json` job, each null, then `fields` over them. */
+export function blankStatusJsonJob(fields = {}) {
+  const keys = Object.keys(
+    statusJsonJob({ id: null, label: null, provider: null, state: null, chainId: null, row: {}, pendingMessages: null, unreadEvents: null })
+  );
+  return { ...Object.fromEntries(keys.map((key) => [key, null])), ...fields };
+}
+
+function fleetCell(value) {
+  return escapeMarkdownCell(value === null || value === undefined ? "" : String(value));
+}
+
+/**
+ * The table of a fleet's members, one row each (label, provider, job id, status, model), then one
+ * line per member that did not start.
+ */
+export function renderFleetTable(members) {
+  const lines = ["| Label | Provider | Job | Status | Model |", "| --- | --- | --- | --- | --- |"];
+  for (const member of members) {
+    lines.push(`| ${[member.label, member.provider, member.id, member.status, member.model].map(fleetCell).join(" | ")} |`);
+  }
+  const notes = members.filter((member) => member.startError).map((member) => `- ${member.label}: ${member.status}: ${member.startError}`);
+  if (notes.length > 0) {
+    lines.push("", ...notes);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 /** The command that fits a job's state, as one sentence. */
 export function renderStateHint(view) {
   const id = view.id;

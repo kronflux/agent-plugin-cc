@@ -8,7 +8,6 @@ import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeCommittedRepo, makeTempDir, run as runCommand, stopOwnedProcesses, stopWaiting, waitUntil } from "./helpers.mjs";
 import { createJob, listJobViews, readJobView, resolveStateDir } from "../plugins/agent/scripts/lib/state.mjs";
 import { openStore } from "../plugins/agent/scripts/lib/store.mjs";
-import { launchManifestTasks } from "../plugins/agent/scripts/codex-companion.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
@@ -91,72 +90,6 @@ function removeWorktrees(repo) {
   }
 }
 
-test("a manifest starts one background job per entry", async (t) => {
-  const ctx = makeRepo();
-  const manifest = path.join(makeTempDir(t), "manifest.json");
-  fs.writeFileSync(
-    manifest,
-    JSON.stringify([
-      { label: "lint", prompt: "fix lint" },
-      { label: "docs", prompt: "update docs", effort: "low" },
-      { label: "tests", prompt: "add tests", write: true }
-    ])
-  );
-
-  const result = run("node", [SCRIPT, "task", "--manifest", manifest, "--json"], { cwd: ctx.repo, env: ctx.env });
-
-  assert.equal(result.status, 0, result.stderr);
-  const { jobs, failed } = JSON.parse(result.stdout);
-  assert.deepEqual(failed, []);
-  assert.deepEqual(jobs.map((job) => job.label), ["lint", "docs", "tests"]);
-  assert.equal(new Set(jobs.map((job) => job.jobId)).size, 3);
-  const records = jobViews(ctx.repo);
-  assert.equal(records.length, 3);
-  assert.deepEqual(records.map((job) => job.row.title).sort(), ["Codex Task: docs", "Codex Task: lint", "Codex Task: tests"]);
-  assert.equal(records.find((job) => job.row.title === "Codex Task: tests").request.write, true);
-  await waitForAllCompleted(ctx.repo, 30000);
-});
-
-test("the fleet command without a manifest asks for one by its command form", () => {
-  const ctx = makeRepo();
-  for (const argv of [["--manifest "], ["--manifest"], ["--manifest --write"]]) {
-    const result = run(process.execPath, [SCRIPT, "task", ...argv], { cwd: ctx.repo, env: ctx.env });
-    assert.equal(result.status, 1, JSON.stringify(argv));
-    assert.equal(result.stderr.trim(), "Name a manifest file: /agent:codex-fleet <manifest.json>", JSON.stringify(argv));
-  }
-  assert.deepEqual(jobViews(ctx.repo), []);
-});
-
-test("a manifest path that starts with a dash is accepted in the inline form", (t) => {
-  const ctx = makeRepo();
-  const missing = run(process.execPath, [SCRIPT, "task", "--manifest=-fleet.json"], { cwd: ctx.repo, env: ctx.env });
-  assert.equal(missing.status, 1);
-  assert.match(missing.stderr, /-fleet\.json/);
-  assert.doesNotMatch(missing.stderr, /^Name a manifest file/);
-
-  const separate = run(process.execPath, [SCRIPT, "task", "--manifest", "-fleet.json"], { cwd: ctx.repo, env: ctx.env });
-  assert.equal(separate.status, 1);
-  assert.match(separate.stderr, /--manifest=-fleet\.json/);
-  assert.match(separate.stderr, /\.\/-fleet\.json/);
-  assert.deepEqual(jobViews(ctx.repo), []);
-});
-
-test("a manifest with a bad entry starts nothing", (t) => {
-  const ctx = makeRepo();
-  const manifest = path.join(makeTempDir(t), "bad.json");
-  fs.writeFileSync(manifest, JSON.stringify([{ label: "a", prompt: "one" }, { label: "a", prompt: "two" }]));
-
-  const result = run("node", [SCRIPT, "task", "--manifest", manifest], { cwd: ctx.repo, env: ctx.env });
-
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /Manifest entry 2 repeats the label "a"/);
-  assert.equal(jobViews(ctx.repo).length, 0);
-
-  const mixed = run("node", [SCRIPT, "task", "--manifest", manifest, "also this"], { cwd: ctx.repo, env: ctx.env });
-  assert.notEqual(mixed.status, 0);
-  assert.match(mixed.stderr, /--manifest takes its prompts from the file\. Remove the prompt text/);
-});
-
 test("task --worktree leaves the checkout untouched and Codex edits the worktree", () => {
   const ctx = makeRepo("edit-file");
   try {
@@ -203,19 +136,6 @@ test("a background worktree task reports the worktree when it starts", async () 
   } finally {
     removeWorktrees(ctx.repo);
   }
-});
-
-test("the fan-out command's single argument string keeps a native manifest path", async (t) => {
-  const ctx = makeRepo();
-  const manifest = path.join(makeTempDir(t), "cmd.json");
-  fs.writeFileSync(manifest, JSON.stringify([{ label: "only", prompt: "do one thing" }]));
-
-  // process.execPath avoids a shell, so the string reaches the companion as the command passes it.
-  const result = run(process.execPath, [SCRIPT, "task", `--manifest ${manifest} --json`], { cwd: ctx.repo, env: ctx.env });
-
-  assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(JSON.parse(result.stdout).jobs.map((job) => job.label), ["only"]);
-  await waitForAllCompleted(ctx.repo, 20000);
 });
 
 // Counts the repository's worktrees and lists its agent/* branches, the two things a failed
@@ -406,57 +326,6 @@ test("a worktree run whose thread cannot start leaves nothing behind", async (t)
     describe: "the unused worktree and its branch to be removed"
   });
   assert.deepEqual(worktreeLeftovers(repo), { worktrees: 1, branches: "" });
-});
-
-test("a manifest entry that fails after its worktree exists is rolled back and the next entry starts", (t) => {
-  const repo = makeCommittedRepo(t);
-  const binDir = makeTempDir(t);
-  installFakeCodex(binDir);
-  const manifest = path.join(makeTempDir(t), "manifest.json");
-  fs.writeFileSync(
-    manifest,
-    JSON.stringify([
-      { label: "first", prompt: "one", worktree: true },
-      { label: "second", prompt: "two", worktree: true }
-    ])
-  );
-  const enqueued = [];
-  const enqueue = (_cwd, job) => {
-    enqueued.push(job);
-    if (enqueued.length === 1) {
-      throw new Error("the worker could not be started");
-    }
-    return { payload: { jobId: job.id } };
-  };
-
-  // The launch checks Codex on PATH and prints its JSON report to stdout, so both are redirected
-  // for the call and restored afterwards, with the exit code it sets for the failed entry.
-  const savedPath = process.env.PATH;
-  const savedWrite = process.stdout.write;
-  const savedExitCode = process.exitCode;
-  let printed = "";
-  process.env.PATH = buildEnv(binDir).PATH;
-  process.stdout.write = (chunk) => {
-    printed += chunk;
-    return true;
-  };
-  try {
-    launchManifestTasks(repo, repo, { manifest, json: true }, [], { model: null, effort: null }, { enqueue });
-  } finally {
-    process.stdout.write = savedWrite;
-    process.env.PATH = savedPath;
-    process.exitCode = savedExitCode;
-  }
-  const [first, second] = enqueued;
-  // The worktree folder lives in the state folder, outside the repository the test removes.
-  t.after(() => fs.rmSync(second.worktreePath, { recursive: true, force: true }));
-
-  const output = JSON.parse(printed);
-  assert.deepEqual(output.failed.map((entry) => entry.label), ["first"]);
-  assert.deepEqual(output.jobs.map((entry) => entry.jobId), [second.id]);
-  assert.equal(fs.existsSync(first.worktreePath), false, "the failed entry's worktree remains");
-  assert.equal(fs.existsSync(second.worktreePath), true);
-  assert.equal(worktreeLeftovers(repo).branches, `agent/${second.id}`);
 });
 
 test("send to a finished worktree job runs in its worktree", async (t) => {

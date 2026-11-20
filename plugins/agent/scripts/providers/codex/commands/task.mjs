@@ -4,7 +4,6 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import {
-  normalizeArgv,
   outputCommandResult,
   parseCommandInput,
   resolveCommandCwd,
@@ -33,7 +32,6 @@ import {
   discardLaunchWorktree,
   augmentSchemaForQuestions,
   launchWorker,
-  readTaskManifest,
   shorten,
   validateQuestionSchema
 } from "../../../lib/task-launch.mjs";
@@ -49,7 +47,7 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("../../../..", import.meta.u
 const EFFORT_USAGE = `<${KNOWN_REASONING_EFFORTS.join("|")}>`;
 export const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
-export const usage = `task [--background] [--json] [--write] [--worktree] [--resume-last|--resume|--resume-thread <thread-id>|--fresh] [--force] [--from-last-review] [--label <name>] [--allow-questions] [--model <id|family|default|configured>] [--effort ${EFFORT_USAGE}] [--output-schema <file>] [--manifest <file.json>] [--] [prompt]`;
+export const usage = `task [--background] [--json] [--write] [--worktree] [--resume-last|--resume|--resume-thread <thread-id>|--fresh] [--force] [--from-last-review] [--label <name>] [--allow-questions] [--model <id|family|default|configured>] [--effort ${EFFORT_USAGE}] [--output-schema <file>] [--] [prompt]`;
 
 export function buildTaskRunMetadata({ prompt, resumeLast = false }) {
   if (!resumeLast && String(prompt ?? "").includes(STOP_REVIEW_TASK_MARKER)) {
@@ -159,187 +157,19 @@ export async function buildReviewHandoff(workspaceRoot, userRequest) {
   }
 }
 
-// Reads the manifest once and resolves the model and effort of every entry, in entry order,
-// before any job starts. Command-line --model and --effort apply to entries that do not set them.
-// Returns the entries and their selections, index for index.
-async function resolveManifestSelections(cwd, workspaceRoot, options) {
-  const entries = readTaskManifest(cwd, options.manifest);
-  const selections = [];
-  for (const [index, entry] of entries.entries()) {
-    try {
-      selections.push(
-        await resolveTaskSelection(workspaceRoot, cwd, { model: entry.model ?? options.model, effort: entry.effort ?? options.effort })
-      );
-    } catch (error) {
-      throw new Error(`Manifest entry ${index + 1}: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-  return { entries, selections };
-}
-
-function checkManifestOptions(options, positionals) {
-  const conflicting = ["prompt-file", "resume-last", "resume", "resume-thread", "fresh", "from-last-review", "output-schema"].filter(
-    (name) => options[name] !== undefined && options[name] !== false
-  );
-  if (positionals.length > 0 || conflicting.length > 0) {
-    throw new Error(
-      `--manifest takes its prompts from the file. Remove ${[...conflicting.map((name) => `--${name}`), ...(positionals.length > 0 ? ["the prompt text"] : [])].join(", ")}.`
-    );
-  }
-}
-
-// Starts one background task per manifest entry. Command-line --write and --worktree apply to
-// entries that do not set them. `defaults.manifestEntries` holds the entries as they were read
-// when their selections were resolved, and `defaults.entries` each entry's resolved selection at
-// the same index; the file is then not read again. Without `defaults.manifestEntries` the file is
-// read here, and without `defaults.entries` an entry's model and effort, else `defaults.model`
-// and `defaults.effort`, are sent as given. `deps.enqueue(cwd, job, fields)` starts one entry: by
-// default it creates the entry's store job (`deps.create`, createJob) and launches its worker
-// (`deps.launch`, launchWorker). A committed job is accepted: its worktree is kept through any
-// launch error or refusal, and the next scan or release launches it. Only an entry that never
-// committed has its worktree removed. Returns a promise when an entry's start is asynchronous.
-export function launchManifestTasks(cwd, workspaceRoot, options, positionals, defaults, deps = {}) {
-  const enqueue = deps.enqueue ?? ((enqueueCwd, job, built) => enqueueStoreEntry(enqueueCwd, job, built, deps));
-  checkManifestOptions(options, positionals);
-  const entries = defaults.manifestEntries ?? readTaskManifest(cwd, options.manifest);
-  if (defaults.manifestEntries && defaults.entries && defaults.entries.length !== entries.length) {
-    throw new Error("Each manifest entry needs one resolved selection.");
-  }
-  ensureCodexAvailable(cwd);
-
-  const launched = [];
-  const failed = [];
-  const report = () => {
-    const lines = [`Started ${launched.length} of ${entries.length} Codex tasks in the background:`];
-    for (const job of launched) {
-      lines.push(`- ${job.label}: ${job.jobId}${job.worktreePath ? ` (worktree ${job.worktreePath})` : ""}`);
-    }
-    for (const job of failed) {
-      lines.push(`- ${job.label}: not started. ${job.error}`);
-    }
-    lines.push("Check /agent:status for progress.");
-    outputCommandResult({ jobs: launched, failed }, `${lines.join("\n")}\n`, options.json);
-    if (failed.length > 0) {
-      process.exitCode = 1;
-    }
-  };
-  const accept = (entry, job, result) => {
-    const jobId = result?.jobId ?? result?.payload?.jobId ?? job.id;
-    launched.push({ label: entry.label, jobId, ...(job.worktreePath ? { worktreePath: job.worktreePath } : {}) });
-  };
-  const reject = (entry, job, caught) => {
-    const committed = Boolean(caught?.committedJobId);
-    const error = job?.worktreePath && !committed ? discardLaunchWorktree(workspaceRoot, job, caught) : caught;
-    failed.push({ label: entry.label, error: error instanceof Error ? error.message : String(error) });
-  };
-  const step = (index) => {
-    for (; index < entries.length; index += 1) {
-      const entry = entries[index];
-      let job = null;
-      let result;
-      try {
-        const write = entry.write ?? Boolean(options.write);
-        const selection = defaults.entries?.[index] ?? null;
-        const baseJob = { id: generateJobId("task"), workspaceRoot, title: `Codex Task: ${entry.label}`, write };
-        job = entry.worktree ?? options.worktree ? attachWorktree(baseJob) : baseJob;
-        const taskOptions = {
-          prompt: entry.prompt,
-          title: job.title,
-          write,
-          sandbox: write ? getConfig(workspaceRoot).writeSandbox ?? "workspace-write" : "read-only",
-          worktree: job.worktreePath ? { path: job.worktreePath, branch: job.worktreeBranch } : null,
-          model: selection?.model ?? entry.model ?? defaults.model ?? null,
-          effort: selection?.effort ?? entry.effort ?? defaults.effort ?? null,
-          modelSource: selection?.modelSource ?? null,
-          effortSource: selection?.effortSource ?? null,
-          background: true,
-          runId: options["run-id"] ?? null
-        };
-        result = enqueue(cwd, job, taskOptions);
-      } catch (caught) {
-        reject(entry, job, caught);
-        continue;
-      }
-      if (result && typeof result.then === "function") {
-        const current = { entry, job };
-        return result.then(
-          (value) => {
-            accept(current.entry, current.job, value);
-            return step(index + 1);
-          },
-          (caught) => {
-            reject(current.entry, current.job, caught);
-            return step(index + 1);
-          }
-        );
-      }
-      accept(entry, job, result);
-    }
-    report();
-    return undefined;
-  };
-  return step(0);
-}
-
-// Creates one manifest entry's store job and launches its worker. Once the job has committed, a
-// launch that throws or is refused leaves the entry accepted; the next scan or release launches it.
-async function enqueueStoreEntry(cwd, job, taskOptions, deps) {
-  const create = deps.create ?? ((store, fields, label) => createJob(store, fields, { label }));
-  const launch = deps.launch ?? launchWorker;
-  const requester = await readRequesterIdentity();
-  const built = buildTaskJobFields(taskOptions, { cwd, requester });
-  const { stateDir, store } = openCommandStore(cwd);
-  try {
-    const created = create(store, built.fields, built.label);
-    try {
-      await launch(store, stateDir, created.jobId);
-    } catch {
-      // The committed job is launched by the next scan or release.
-    }
-    return { jobId: created.jobId };
-  } finally {
-    store.close();
-  }
-}
-
-// /agent:codex-fleet passes its arguments after --manifest, so a missing manifest leaves the
-// option without a value or followed by another flag.
-const MISSING_MANIFEST_MESSAGE = "Name a manifest file: /agent:codex-fleet <manifest.json>";
-
 function parseTaskInput(argv) {
-  let parsed;
-  try {
-    parsed = parseCommandInput(argv, {
-      valueOptions: ["model", "effort", "cwd", "prompt-file", "output-schema", "resume-thread", "manifest", "label", "run-id"],
-      booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "from-last-review", "worktree", "allow-questions", "force"],
-      stopAtFirstPositional: true,
-      aliasMap: {
-        m: "model"
-      }
-    });
-  } catch (error) {
-    if (error instanceof Error && error.message === "Missing value for --manifest") {
-      throw new Error(MISSING_MANIFEST_MESSAGE);
+  const parsed = parseCommandInput(argv, {
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "output-schema", "resume-thread", "label", "run-id"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "from-last-review", "worktree", "allow-questions", "force"],
+    stopAtFirstPositional: true,
+    aliasMap: {
+      m: "model"
     }
-    throw error;
-  }
-  const manifest = parsed.options.manifest;
-  if (manifest !== undefined) {
-    const text = String(manifest);
-    // The parser takes the next token as the value, so a separate token that starts with a dash
-    // cannot be told from a flag. The inline form states the path unambiguously.
-    const inline = normalizeArgv(argv).some((token) => token.startsWith("--manifest="));
-    if (!text.trim()) {
-      throw new Error(MISSING_MANIFEST_MESSAGE);
-    }
-    if (text.startsWith("--") && !inline) {
-      throw new Error(MISSING_MANIFEST_MESSAGE);
-    }
-    if (text.startsWith("-") && !inline) {
-      throw new Error(
-        `${MISSING_MANIFEST_MESSAGE}. If the path starts with a dash, write --manifest=${text} or ./${text}.`
-      );
-    }
+  });
+  // A set of tasks from one file starts with the provider-neutral fleet command instead.
+  const first = parsed.positionals[0] ?? "";
+  if (first === "--manifest" || first.startsWith("--manifest=")) {
+    throw new Error("Unknown option --manifest. Start several jobs from one manifest with /agent:fleet start <manifest.json>.");
   }
   return parsed;
 }
@@ -349,13 +179,6 @@ export async function handleTask(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  if (options.manifest) {
-    checkManifestOptions(options, positionals);
-    const { entries, selections } = await resolveManifestSelections(cwd, workspaceRoot, options);
-    selections.forEach(printWarnings);
-    await launchManifestTasks(cwd, workspaceRoot, options, positionals, { model: null, effort: null, manifestEntries: entries, entries: selections });
-    return;
-  }
   const requestText = await readTaskPrompt(cwd, options, positionals);
   const handoff = options["from-last-review"] ? await buildReviewHandoff(workspaceRoot, requestText) : null;
   const prompt = handoff ? handoff.prompt : requestText;

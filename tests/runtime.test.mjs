@@ -10,7 +10,6 @@ import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeCommittedRepo, makeTempDir, run as runCommand, stopOwnedProcess, stopOwnedProcesses, waitUntil } from "./helpers.mjs";
 import { resolveStateDir } from "../plugins/agent/scripts/lib/state.mjs";
 import { createCodexDriver } from "../plugins/agent/scripts/providers/codex/runtime.mjs";
-import { launchManifestTasks } from "../plugins/agent/scripts/codex-companion.mjs";
 import { isProcessAlive } from "../plugins/agent/scripts/lib/process.mjs";
 import * as storeLib from "../plugins/agent/scripts/lib/store.mjs";
 import * as storeState from "../plugins/agent/scripts/lib/state.mjs";
@@ -2048,85 +2047,6 @@ test("task-resume-candidate prints the newest resumable Codex tip", { timeout: 1
   await codex.released(row.id);
   const found = JSON.parse(codex.cli("task-resume-candidate", "--json").stdout);
   assert.deepEqual(found, { available: true, jobId: row.id, threadId: storeFixtures.jobRow(codex.stateDir, row.id).thread_id, label: "c1", status: "completed", provider: "codex" });
-});
-
-test("a manifest entry keeps its worktree once its job committed, and loses it only when it never committed", { timeout: 120000 }, async (t) => {
-  const codex = codexCli(t);
-  const manifest = path.join(makeTempDir(t), "manifest.json");
-  fs.writeFileSync(
-    manifest,
-    JSON.stringify([
-      { label: "launch-throws", prompt: "entry one", worktree: true },
-      { label: "launch-refused", prompt: "entry two", worktree: true },
-      { label: "create-fails", prompt: "entry three", worktree: true },
-      { label: "launches", prompt: "entry four", worktree: true }
-    ])
-  );
-  const launches = [];
-  const launch = async (store, stateDir, jobId) => {
-    launches.push(jobId);
-    if (launches.length === 1) {
-      throw new Error("the worker could not be started");
-    }
-    return launches.length === 2 ? null : { pid: 1 };
-  };
-  const create = (store, fields, label) => {
-    if (fields.prompt === "entry three") {
-      throw new Error("the job could not be created");
-    }
-    return storeState.createJob(store, fields, { label });
-  };
-  setEnvFor(t, "PATH", codex.env.PATH);
-  const savedWrite = process.stdout.write;
-  const savedExitCode = process.exitCode;
-  let printed = "";
-  // The report is written as a string; the test runner's own binary messages pass through.
-  process.stdout.write = (chunk, ...rest) => {
-    if (typeof chunk !== "string") {
-      return savedWrite.call(process.stdout, chunk, ...rest);
-    }
-    printed += chunk;
-    return true;
-  };
-  try {
-    await launchManifestTasks(codex.repo, codex.repo, { manifest, json: true }, [], { model: null, effort: null }, { create, launch });
-  } finally {
-    process.stdout.write = savedWrite;
-    process.exitCode = savedExitCode;
-  }
-  const report = JSON.parse(printed);
-  t.after(() => {
-    for (const entry of report.jobs) {
-      if (entry.worktreePath) {
-        fs.rmSync(entry.worktreePath, { recursive: true, force: true });
-      }
-    }
-  });
-  assert.deepEqual(report.jobs.map((entry) => entry.label), ["launch-throws", "launch-refused", "launches"]);
-  assert.deepEqual(report.failed.map((entry) => entry.label), ["create-fails"]);
-  const rows = codex.rows();
-  assert.deepEqual(rows.map((row) => row.prompt), ["entry one", "entry two", "entry four"]);
-  for (const entry of report.jobs) {
-    assert.equal(fs.existsSync(entry.worktreePath), true, `the worktree of ${entry.label} was removed`);
-  }
-  const worktrees = fs.readdirSync(path.join(codex.stateDir, "worktrees"));
-  assert.equal(worktrees.length, 3, `worktrees left: ${worktrees.join(", ")}`);
-});
-
-test("a manifest starts one store job per entry through launchWorker", { timeout: 120000 }, async (t) => {
-  const codex = codexCli(t);
-  const manifest = path.join(makeTempDir(t), "manifest.json");
-  fs.writeFileSync(manifest, JSON.stringify([{ label: "one", prompt: "fan out one" }, { label: "two", prompt: "fan out two" }]));
-  const result = codex.cli("task", "--manifest", manifest, "--json");
-  assert.equal(result.status, 0, result.stderr);
-  const rows = codex.rows();
-  assert.equal(rows.length, 2);
-  for (const row of rows) {
-    await codex.released(row.id);
-    assert.notEqual(storeFixtures.jobRow(codex.stateDir, row.id).claimed_at, null);
-  }
-  const legacyJobs = path.join(codex.stateDir, "jobs");
-  assert.equal(fs.existsSync(legacyJobs) ? fs.readdirSync(legacyJobs).length : 0, 0, "a legacy job record was written");
 });
 
 test("a second Codex job with a live label exits 1 naming its holder and leaves no row", { timeout: 120000 }, async (t) => {

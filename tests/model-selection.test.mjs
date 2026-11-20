@@ -8,7 +8,6 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildEnv, FAKE_DEBUG_SOL_MODELS, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { makeCommittedRepo, makeTempDir, stopOwnedProcesses, waitUntil } from "./helpers.mjs";
-import { launchManifestTasks } from "../plugins/agent/scripts/codex-companion.mjs";
 import { isProcessAlive } from "../plugins/agent/scripts/lib/process.mjs";
 import { getConfig, listJobViews, resolveStateDir, setConfig } from "../plugins/agent/scripts/lib/state.mjs";
 import { openStore } from "../plugins/agent/scripts/lib/store.mjs";
@@ -547,48 +546,6 @@ test("a codex debug models run that ignores SIGTERM is stopped after a short gra
   assert.equal(report.ok, false);
   assert.ok(report.elapsed < 5000, `took ${report.elapsed} ms`);
   assert.match(report.detail, /did not answer within/);
-});
-
-test("a manifest launch pairs each entry with its own selection from one read of the file", async (t) => {
-  const ctx = makeRepo(t);
-  const manifest = path.join(makeTempDir(t), "manifest.json");
-  const first = { label: "first", prompt: "one", model: "luna" };
-  const second = { label: "second", prompt: "two" };
-  const selection = (model, effort) => ({ model, effort, modelSource: "explicit", effortSource: "catalog-default", warnings: [] });
-  // The file changed after the selections were resolved: reordered, with an entry added.
-  fs.writeFileSync(manifest, JSON.stringify([second, first, { label: "added", prompt: "three", model: "unchecked" }]));
-  // Each entry's store job is created through the create seam, which records its fields; no
-  // worker is launched.
-  const created = [];
-  const create = (_store, fields) => {
-    created.push(fields);
-    return { jobId: `task-entry-${created.length}` };
-  };
-  const launch = async () => null;
-  // The launch checks Codex on PATH and prints its report to stdout; both are restored after. The
-  // report is written as a string; the test runner's own binary messages pass through.
-  const savedPath = process.env.PATH;
-  const savedWrite = process.stdout.write;
-  const savedExitCode = process.exitCode;
-  process.env.PATH = ctx.env.PATH;
-  process.stdout.write = (chunk, ...rest) => (typeof chunk === "string" ? true : savedWrite.call(process.stdout, chunk, ...rest));
-  try {
-    await launchManifestTasks(ctx.repo, ctx.repo, { manifest, json: true }, [], {
-      model: null,
-      effort: null,
-      manifestEntries: [first, second],
-      entries: [selection("gpt-5.6-luna", "medium"), selection("m-default", "low")]
-    }, { create, launch });
-  } finally {
-    process.stdout.write = savedWrite;
-    process.env.PATH = savedPath;
-    process.exitCode = savedExitCode;
-  }
-  assert.deepEqual(
-    created.map((fields) => [fields.prompt, fields.request.model, fields.request.effort]),
-    [["one", "gpt-5.6-luna", "medium"], ["two", "m-default", "low"]]
-  );
-  assert.deepEqual(created.map((fields) => fields.model), ["gpt-5.6-luna", "m-default"]);
 });
 
 test("a follow-up's new effort is checked against the continued job's model", (t) => {

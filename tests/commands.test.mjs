@@ -195,11 +195,11 @@ const COMMAND_NAMES = [
   "agy-usage",
   "cancel",
   "codex-delegate",
-  "codex-fleet",
   "codex-review",
   "codex-setup",
   "codex-transfer",
   "codex-usage",
+  "fleet",
   "result",
   "resume",
   "send",
@@ -392,7 +392,7 @@ const COMMAND_TABLE = {
   },
   "codex-review": { tools: REVIEW_TOOLS, modelInvocation: true, calls: [/codex-companion\.mjs" review '\$ARGUMENTS'/] },
   "agy-review": { tools: REVIEW_TOOLS, modelInvocation: true, calls: [/agy-companion\.mjs" review '\$ARGUMENTS'/] },
-  "codex-fleet": { tools: PRINT_ONLY, modelInvocation: false, calls: [/codex-companion\.mjs" task '--manifest \$ARGUMENTS'/] },
+  fleet: { tools: PRINT_ONLY, modelInvocation: false, calls: [/agent-companion\.mjs" fleet '\$ARGUMENTS'/] },
   "codex-transfer": { tools: PRINT_ONLY, modelInvocation: false, calls: [/codex-companion\.mjs" transfer "\$ARGUMENTS"/] },
   "codex-usage": { tools: PRINT_ONLY, modelInvocation: false, calls: [/codex-companion\.mjs" usage "\$ARGUMENTS"/] },
   "codex-setup": {
@@ -487,7 +487,7 @@ test("command descriptions name their providers", () => {
 
 test("Codex commands show the full effort hint", () => {
   const hint = `--effort <${KNOWN_REASONING_EFFORTS.join("|")}>`;
-  for (const name of ["codex-delegate", "codex-review", "codex-fleet", "codex-setup"]) {
+  for (const name of ["codex-delegate", "codex-review", "codex-setup"]) {
     assert.ok(readFrontmatter(commandFile(name))["argument-hint"].includes(hint), `${name} lacks ${hint}`);
   }
 });
@@ -610,13 +610,12 @@ test("review and fleet commands keep a quoted path with a space as one value", (
     assert.deepEqual(quoted.paths, ["a b.md"], name);
     assert.equal(quoted.instructions, "check the user's $HOME", name);
   }
-  const fleet = parseCommandInput(companionArgv("codex-fleet", "task", "\"C:\\fleet runs\\jobs.json\" --write"), {
-    valueOptions: ["manifest", "model", "effort"],
-    booleanOptions: ["write", "worktree"]
+  const fleet = parseCommandInput(companionArgv("fleet", "fleet", "start \"C:\\fleet runs\\jobs.json\" --json"), {
+    valueOptions: ["cwd", "timeout-ms", "out"],
+    booleanOptions: ["json", "any"]
   });
-  assert.equal(fleet.options.manifest, "C:\\fleet runs\\jobs.json");
-  assert.equal(fleet.options.write, true);
-  assert.deepEqual(fleet.positionals, []);
+  assert.deepEqual(fleet.positionals, ["start", "C:\\fleet runs\\jobs.json"]);
+  assert.equal(fleet.options.json, true);
 });
 
 // A model id or family name written into a file; the program grep pattern, matched without regard to case.
