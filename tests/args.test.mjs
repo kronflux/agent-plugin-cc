@@ -1,17 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
-import test, { after } from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run, stopTestBrokers } from "./helpers.mjs";
+import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { parseArgs, splitRawArgumentString } from "../plugins/agent/scripts/lib/args.mjs";
 
 test("the raw argument splitter keeps Windows path separators", () => {
   assert.deepEqual(splitRawArgumentString(String.raw`--source C:\work\notes.json`), ["--source", String.raw`C:\work\notes.json`]);
   assert.deepEqual(splitRawArgumentString(String.raw`"C:\work dir\m.json" --x`), [String.raw`C:\work dir\m.json`, "--x"]);
-  assert.deepEqual(splitRawArgumentString(String.raw`\\server\share`), [String.raw`\server\share`]);
+  assert.deepEqual(splitRawArgumentString(String.raw`\\server\share`), [String.raw`\\server\share`]);
 });
 
 test("the raw argument splitter still escapes quotes and spaces", () => {
@@ -20,10 +20,26 @@ test("the raw argument splitter still escapes quotes and spaces", () => {
   assert.deepEqual(splitRawArgumentString("end\\\\"), ["end\\"]);
 });
 
+test("an inline value keeps text after a second equals sign", () => {
+  const parsed = parseArgs(["--base=a=b"], { valueOptions: ["base"] });
+  assert.deepEqual(parsed.options, { base: "a=b" });
+});
+
+test("an empty quoted argument is kept", () => {
+  assert.deepEqual(splitRawArgumentString(`--model "" foo`), ["--model", "", "foo"]);
+  assert.deepEqual(splitRawArgumentString(`--model '' foo`), ["--model", "", "foo"]);
+});
+
+test("a UNC path keeps both leading backslashes", () => {
+  assert.deepEqual(splitRawArgumentString(String.raw`\\server\share\x`), [String.raw`\\server\share\x`]);
+  assert.deepEqual(
+    splitRawArgumentString(String.raw`--cwd "\\server\share dir\x"`),
+    ["--cwd", String.raw`\\server\share dir\x`]
+  );
+});
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
-
-after(stopTestBrokers);
 
 function makeRepo(behavior) {
   const repo = makeTempDir();

@@ -105,6 +105,9 @@ export function spawnDetachedTaskWorker(cwd, jobId, workerScript) {
     stdio: "ignore",
     windowsHide: true
   });
+  // A spawn failure also arrives later as an "error" event. The caller reports it from the
+  // missing pid, so the event is consumed here instead of ending the process.
+  child.once("error", () => {});
   child.unref();
   return child;
 }

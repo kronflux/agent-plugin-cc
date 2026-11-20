@@ -39,7 +39,10 @@ export function parseArgs(argv, config = {}) {
     }
 
     if (token.startsWith("--")) {
-      const [rawKey, inlineValue] = token.slice(2).split("=", 2);
+      const body = token.slice(2);
+      const equalsAt = body.indexOf("=");
+      const rawKey = equalsAt === -1 ? body : body.slice(0, equalsAt);
+      const inlineValue = equalsAt === -1 ? undefined : body.slice(equalsAt + 1);
       const key = aliasMap[rawKey] ?? rawKey;
 
       if (booleanOptions.has(key)) {
@@ -47,6 +50,8 @@ export function parseArgs(argv, config = {}) {
         continue;
       }
 
+      // A value option takes the next token as its value even when that token looks like an
+      // option, so `--model --help` stores "--help" as the model.
       if (valueOptions.has(key)) {
         const nextValue = inlineValue ?? argv[index + 1];
         if (nextValue === undefined) {
@@ -88,9 +93,13 @@ export function parseArgs(argv, config = {}) {
 }
 
 // A backslash escapes only a quote, whitespace, or another backslash, so Windows paths such as
-// C:\work\notes.json keep their separators.
-function isEscapable(character) {
-  return character === "\"" || character === "'" || character === "\\" || /\s/.test(character ?? "");
+// C:\work\notes.json keep their separators. A backslash at the start of a token does not escape a
+// following backslash, so a UNC path such as \\server\share keeps both leading backslashes.
+function isEscapable(character, atTokenStart) {
+  if (character === "\\") {
+    return !atTokenStart;
+  }
+  return character === "\"" || character === "'" || /\s/.test(character ?? "");
 }
 
 export function splitRawArgumentString(raw) {
@@ -98,6 +107,7 @@ export function splitRawArgumentString(raw) {
   let current = "";
   let quote = null;
   let escaping = false;
+  let quotedToken = false;
   const characters = [...raw];
 
   for (let index = 0; index < characters.length; index += 1) {
@@ -108,7 +118,7 @@ export function splitRawArgumentString(raw) {
       continue;
     }
 
-    if (character === "\\" && isEscapable(characters[index + 1])) {
+    if (character === "\\" && isEscapable(characters[index + 1], current === "")) {
       escaping = true;
       continue;
     }
@@ -124,13 +134,15 @@ export function splitRawArgumentString(raw) {
 
     if (character === "'" || character === "\"") {
       quote = character;
+      quotedToken = true;
       continue;
     }
 
     if (/\s/.test(character)) {
-      if (current) {
+      if (current || quotedToken) {
         tokens.push(current);
         current = "";
+        quotedToken = false;
       }
       continue;
     }
@@ -138,11 +150,7 @@ export function splitRawArgumentString(raw) {
     current += character;
   }
 
-  if (escaping) {
-    current += "\\";
-  }
-
-  if (current) {
+  if (current || quotedToken) {
     tokens.push(current);
   }
 
