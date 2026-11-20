@@ -501,9 +501,14 @@ The report also names the delegation model and effort that a Codex task would us
 
 `--model <id|family|default|configured>` and `--effort <level>` store a delegation default for this repository, after checking that Codex accepts it. The [model policy](#models-and-effort) describes how the stored default combines with the flags of a command. `--write-sandbox workspace-write|danger-full-access` sets the write sandbox.
 
+`--scope user` stores `--model`, `--effort` and `--write-sandbox` in the user settings instead, so they apply in every repository that has no setting of its own; `--scope project`, the default, stores them for this repository. The review gate always belongs to the repository. See [Configuration](#configuration) for the order in which the settings apply. The report names where each value comes from: `(flag)`, `(project setting)`, `(user setting)` or `(provider-default)`, and `--json` adds `sources: { model, effort, writeSandbox }`.
+
+Setup refuses an argument it does not know, so a mistyped flag changes nothing. For example, `/agent:codex-setup --danger-full-access` exits with code 1 and `Unknown argument "--danger-full-access" for setup. Usage: ...`. `--write-sandbox` without a value exits with `Missing value for --write-sandbox` and `Use --write-sandbox workspace-write or --write-sandbox danger-full-access.`
+
 ```bash
 /agent:codex-setup --model <id> --effort high
 /agent:codex-setup --model default
+/agent:codex-setup --scope user --model <id> --write-sandbox danger-full-access
 ```
 
 You can also use `/agent:codex-setup` to manage the optional review gate.
@@ -529,8 +534,9 @@ After three blocks in a row in one Claude session, the next stop is allowed. Set
 
 Checks that `agy` is installed and signed in. agy has no sign-in status command, so the check
 lists the available models with `agy models`. Like `/agent:codex-setup`, it reports the
-delegation model and effort and accepts `--model <id>`, `--effort <level>`, and
-`--write-sandbox workspace-write|danger-full-access`.
+delegation model and effort and accepts `--scope project|user`, `--model <id>`,
+`--effort <level>`, and `--write-sandbox workspace-write|danger-full-access`, and it refuses
+an argument it does not know in the same way.
 
 The report also shows the installed agy version, the number of models, the model a delegation
 would use by its display name and where that choice comes from, and the efforts agy lists. A
@@ -541,6 +547,7 @@ cleanly, and the assumption that no MCP server is configured for agy; see
 ```bash
 /agent:agy-setup
 /agent:agy-setup --model <id>
+/agent:agy-setup --scope user --write-sandbox danger-full-access
 ```
 
 ## Models and effort
@@ -549,8 +556,9 @@ The plugin chooses the model and the effort of a Codex job in this order. The fi
 
 1. `--model` and `--effort` on the command.
 2. The delegation setting of the repository, stored by `/agent:codex-setup --model <value>` or `--effort <value>`.
-3. The default of the Codex model catalog: the visible model that `model/list` marks as its default, with that model's default effort. If `model/list` marks none or cannot be read within 10 seconds, the plugin uses the newest visible model of the Sol family in `codex debug models`, with that model's default effort.
-4. If neither gives a model, because `codex debug models` cannot be read or lists no visible Sol model, the plugin sends no model, prints "Codex chose the model; a model set in the Codex configuration applies.", and Codex chooses.
+3. The user delegation setting, stored by `/agent:codex-setup --scope user --model <value>`, when the repository has none.
+4. The default of the Codex model catalog: the visible model that `model/list` marks as its default, with that model's default effort. If `model/list` marks none or cannot be read within 10 seconds, the plugin uses the newest visible model of the Sol family in `codex debug models`, with that model's default effort.
+5. If neither gives a model, because `codex debug models` cannot be read or lists no visible Sol model, the plugin sends no model, prints "Codex chose the model; a model set in the Codex configuration applies.", and Codex chooses.
 
 `--model` takes:
 
@@ -565,7 +573,7 @@ Follow-ups keep the model and effort of the job they continue: `/agent:send` on 
 
 Reviews, fleet entries and `/agent:codex-setup` follow the same rules.
 
-Setting rules for `/agent:codex-setup`: `--model default` clears the stored setting, `--effort` alone keeps the stored model, and `--model` alone clears the stored effort. A model no catalog can check is stored with a warning.
+Setting rules for `/agent:codex-setup`, at either scope: `--model default` clears the stored setting, `--effort` alone keeps the stored model, and `--model` alone clears the stored effort. A model no catalog can check is stored with a warning.
 
 An Antigravity job uses `--model` from the command, then, on a continued conversation, the model choice of the job it continues, then the delegation setting stored by `/agent:agy-setup --model <id>`, and otherwise names no model, so agy runs on the model saved in the Antigravity settings. When the plugin names no model, the output of a delegated job shows, after Antigravity's result and before any resume information, `Model: <name> (from the Antigravity settings)`, or `Model: chosen by Antigravity` when no model is saved. `--model <id>` is checked against `agy models` before the job starts; if that list cannot be read, the model is sent as given, with one line that says it was not checked. A model id that already ends in an effort, together with a different `--effort`, is refused. When you continue a conversation after the saved model changed, the output says so.
 
@@ -585,6 +593,19 @@ The plugin keeps one `config.json` per repository in its state folder (under `CL
 
 - `stopReviewGate` is the review gate of `/agent:codex-setup`.
 - `models` holds the delegation setting of each agent, described under [Models and effort](#models-and-effort). A `null` value means the agent default applies.
+- `writeSandbox` is the sandbox of write-capable tasks of both agents.
+
+`setup --scope user` writes `user-config.json` in the plugin data folder (`CLAUDE_PLUGIN_DATA`), or, without that folder, in the plugin's temp state folder beside the per-repository folders. It holds the settings for every repository:
+
+```json
+{
+  "version": 1,
+  "models": { "agy": { "model": "<id>", "effort": null } },
+  "writeSandbox": "danger-full-access"
+}
+```
+
+A delegation takes each value from the first of these that has it: the command flag, the repository's `config.json`, `user-config.json`, the agent default. The model and effort of one agent come from one place together. A repository entry of `null`, written by `setup --model default`, means the agent default, not the user setting. A read-only task always runs read-only, whatever the write sandbox setting says. A follow-up keeps the model and effort of the job it continues, even after a setting changes. A `user-config.json` that cannot be read is ignored with one warning, and setup refuses to overwrite it.
 
 The hook that starts each Claude Code session exports `AGENT_PLUGIN_SESSION_ID` and `AGENT_PLUGIN_TRANSCRIPT_PATH` for the commands of that session.
 
