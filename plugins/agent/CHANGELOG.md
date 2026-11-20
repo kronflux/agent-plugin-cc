@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The plugin needs Node.js 22.13 or later.
+
 ## 2.0.0
 
 The plugin is now `agent` from the `agent-plugin-cc` marketplace, with commands named after the

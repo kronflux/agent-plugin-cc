@@ -32,10 +32,10 @@ All commands come from the `agent` plugin. Commands for one agent carry its name
 - **For Antigravity: the Antigravity CLI (`agy`)**, signed in with your Google account. Usage
   counts against your Antigravity limits. You need only the agents you plan to use.
 - **Git**, for reviews and worktree tasks.
-- **Node.js 18.18 or later**, findable as `node` on the PATH that Claude Code gives its hooks.
+- **Node.js 22.13 or later**, findable as `node` on the PATH that Claude Code gives its hooks.
   When Claude Code is started from a desktop launcher or an IDE, that PATH can lack a Node
   installed through nvm, fnm, asdf, mise, or Homebrew. Add Node's directory in your Claude Code
-  settings, for example `"env": { "PATH": "/home/me/.nvm/versions/node/v22.12.0/bin:/usr/local/bin:/usr/bin:/bin" }`.
+  settings, for example `"env": { "PATH": "/home/me/.nvm/versions/node/v24.11.0/bin:/usr/local/bin:/usr/bin:/bin" }`.
 
 ## Install
 
@@ -461,3 +461,7 @@ Yes. If you already use Codex, the plugin picks up the same [configuration](#com
 Yes. Because the plugin uses your local Codex CLI, your existing sign-in method and config still apply.
 
 If you need to point the built-in OpenAI provider at a different endpoint, set `openai_base_url` in your [Codex config](https://developers.openai.com/codex/config-advanced/#config-and-state-locations).
+
+## Development
+
+Run `npm ci` and then `npm run build`. If npm is configured with `omit=dev`, run `npm ci --include=dev` before `npm run build`. A plain `npm ci` skips the build tools and the build fails.
