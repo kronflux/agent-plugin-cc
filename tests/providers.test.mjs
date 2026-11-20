@@ -12,7 +12,8 @@ const CODEX_COMPANION = path.join(SCRIPTS, "codex-companion.mjs");
 const SHARED_FOLDERS = ["lib", "commands"];
 // Folders under lib/ or commands/ whose files may name a provider, each with the reason.
 const EXEMPT_FOLDERS = [
-  { folder: "lib/transfer/sources/", reason: "a source reader names the client whose files it reads" }
+  { folder: "lib/transfer/sources/", reason: "a source reader names the client whose files it reads" },
+  { folder: "lib/council/", reason: "family names are data in the council" }
 ];
 const CAPABILITIES = [
   "authCheck",

@@ -1,0 +1,234 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-plugin:schema:council-merge:1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "runId",
+    "quorum",
+    "decision",
+    "clusters",
+    "memberTurns"
+  ],
+  "properties": {
+    "schema": {
+      "type": "integer",
+      "const": 1
+    },
+    "runId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "quorum": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "validSeats",
+        "families"
+      ],
+      "properties": {
+        "validSeats": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "families": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "decision": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "choice",
+        "tally",
+        "threshold",
+        "confidence"
+      ],
+      "properties": {
+        "choice": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tally": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "threshold": {
+          "type": "string",
+          "const": "2/3"
+        },
+        "confidence": {
+          "type": "string",
+          "enum": [
+            "HIGH",
+            "MEDIUM",
+            "no consensus"
+          ]
+        }
+      }
+    },
+    "clusters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "severity",
+          "severityRange",
+          "label",
+          "path",
+          "line",
+          "claim",
+          "findings",
+          "reportedBy",
+          "validatedBy",
+          "challenges"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^c[1-9][0-9]*$"
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "P1",
+              "P2",
+              "P3"
+            ]
+          },
+          "severityRange": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "P1",
+                "P2",
+                "P3"
+              ]
+            }
+          },
+          "label": {
+            "type": "string",
+            "enum": [
+              "consensus",
+              "cross-validated",
+              "disputed",
+              "solo"
+            ]
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "line": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          },
+          "claim": {
+            "type": "string",
+            "minLength": 1
+          },
+          "findings": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^s[1-9][0-9]*-f[1-9][0-9]{0,2}$"
+            }
+          },
+          "reportedBy": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "validatedBy": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "challenges": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "by",
+                "disputes",
+                "reason"
+              ],
+              "properties": {
+                "by": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "disputes": {
+                  "type": "string",
+                  "enum": [
+                    "claim",
+                    "severity",
+                    "fix"
+                  ]
+                },
+                "reason": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "memberTurns": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "used",
+        "cap",
+        "repairs",
+        "retries"
+      ],
+      "properties": {
+        "used": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cap": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "repairs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retries": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}
