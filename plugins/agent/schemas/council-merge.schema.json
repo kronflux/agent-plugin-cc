@@ -229,6 +229,39 @@
           "minimum": 0
         }
       }
+    },
+    "substitutions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "seat",
+          "round",
+          "actor",
+          "kind",
+          "family",
+          "model",
+          "lens",
+          "state",
+          "reason",
+          "intentId",
+          "issuedAt"
+        ],
+        "properties": {
+          "seat": { "type": "string", "pattern": "^s[1-9]$" },
+          "round": { "type": "integer", "enum": [1, 2] },
+          "actor": { "type": "string", "pattern": "^s[1-9]~r[12]$" },
+          "kind": { "type": "string", "enum": ["substitute", "carry"] },
+          "family": { "type": "string", "const": "claude" },
+          "model": { "type": ["string", "null"] },
+          "lens": { "type": "string", "minLength": 1 },
+          "state": { "type": "string", "enum": ["reserved", "issued", "valid", "invalid", "timed-out", "quota-exhausted", "error"] },
+          "reason": { "type": ["string", "null"] },
+          "intentId": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+          "issuedAt": { "type": ["string", "null"] }
+        }
+      }
     }
   }
 }

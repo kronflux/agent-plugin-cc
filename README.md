@@ -659,7 +659,10 @@ whose Round 1 job recorded no thread cannot continue it and ends Round 2 with `e
 **Quorum.** A round succeeds with at least two valid seats from at least two families. A round
 without a quorum ends the council: `council collect` exits 1 with `No quorum: <k> valid seats from
 <f> families. A council needs two valid seats from two families.`, and the report is titled
-`# Failed council` and holds every stored answer.
+`# Failed council` and holds every stored answer. `council merge` on a failed council writes
+`merge.json` as the failed inventory (every accepted answer, stand-ins included, and the valid
+original families of the failed round) and exits 1 with the same count message; `council export
+<run-id> merge` rebuilds it.
 
 **One repair and one retry per seat.** In each round a seat whose answer is invalid gets one repair
 prompt: the full round prompt, the validation errors and the schema. A seat that fails for a
@@ -672,8 +675,8 @@ replacement is a new prompt among the deliveries. A cancellation that the counci
 ends the seat as `error` with no retry. Each seat ends a round as `valid`, `invalid`, `timed-out`,
 `error`, `missing-cli` or `quota-exhausted`; a failed provider turn is checked against the
 provider's usage to tell exhausted quota from other failures. The member-turn cap counts ordinary
-turns only; `repairs` and `retries` count the replacements issued and appear in `collect`, `status`
-and the report. The time limit (`--timeout-ms`, 15 minutes by default) applies to each attempt
+turns and Claude stand-in turns; `repairs` and `retries` count the replacements issued, are not
+part of the cap, and appear in `collect`, `status` and the report. The time limit (`--timeout-ms`, 15 minutes by default) applies to each attempt
 three ways: to start it, to wait in the queue, and to run it, counted from the moment a worker
 claims the job (`claimed_at`). A seat past its limit gets one exact stop request for its job.
 
@@ -688,6 +691,25 @@ sent is reported as a diagnostic. An answer that arrives before the cutoff count
 cutoff, a seat with no answer ends `timed-out` with the reason `quorum cutoff`, its running job gets
 an exact stop request, no further repair or retry is issued, and the round closes with its quorum.
 Without a quorum there is no cutoff, and each seat keeps its own time limit.
+
+**Claude stand-ins.** When a seat ends a round without a valid answer (after its repair and retry,
+or at the cutoff), a fresh read-only Claude `council-member` agent answers in that seat's place,
+through that seat's lens. This is the default: `council collect <run-id> --round N` gives consent,
+and the round stays open until the stand-ins have answered or run out of time (each gets the full
+time limit, also when it is asked after the cutoff). `council collect ... --disallow-substitute`
+declines, and the round closes without stand-ins; whichever decision comes first is final for that
+round, and `start` refuses the flag. The leader delivers a stand-in prompt like any Claude prompt:
+it is a delivery with `round` and `actor` (`s2~r1` is the stand-in for s2 asked in Round 1). A
+stand-in that answered Round 1 is carried into Round 2 for that seat, with its own Round 1
+findings. A seat that fails only in Round 2 gets a fresh stand-in that answers a separately
+shuffled bundle without that seat's own Round 1 findings. A stand-in adds an answer and a member
+turn, never a family: quorum still needs two valid seats whose original families differ, so a
+stand-in cannot rescue a round in which only one family answered, though its answer is kept in the
+failed report. A stand-in's findings, validations and challenges count as Claude's. An invalid or
+silent stand-in is not replaced again. `collect` and `status` show `validSeats` (stand-ins
+included), `families` (original families only), `substitutions`, `substitutionDecision` and
+`substitutionOptIn`; the merge lists the stand-ins under `substitutions`, and the report marks each
+as `substitute (same family as leader)`. The member-turn cap stays two turns per seat plus six.
 
 **The status loop.** The skill repeats `council status <run-id>`, which names one next action:
 `collect`, `crossexam`, `merge`, `verify`, `report`, `report-failure`, `damaged` or `done`, with

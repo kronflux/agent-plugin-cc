@@ -1,6 +1,7 @@
 // The pure reducer of one council round: the collection rows applied to a view of the round's
 // rows and exact jobs, at a raw wall sample `w` and a council time `t`.
 import { GRACE_MS, STOP_BOUND_MS } from "./state.mjs";
+import { extensionDeadlines, extensionRows } from "./reduce-ext.mjs";
 
 /** The persisted seat reason of each exact council stop cause. */
 export const STOP_CAUSE_REASONS = Object.freeze({
@@ -173,6 +174,12 @@ function finishWrite(seat, outcome) {
  * a seat with nothing timely in hand ends `timed-out`, `quorum cutoff`, each newly settled
  * seat's exact live tip gets a `quorum-cutoff` stop unless it already has a stop or a
  * cancellation request, and the round closes.
+ * With `view.ext` (see `extensionRows`), every reduction also settles the round's extension turns
+ * (X1 to X4, and S3 for a carry at a due cutoff), and B9 waits behind the substitution gate:
+ * a round whose original seats are all final closes only when no undecided stand-in candidate
+ * holds it and every extension turn of the round is terminal. Writes then also include
+ * `{ op: "ext-finish", turnId, state, reason }`, `{ op: "ext-decision", round, decision }` and
+ * `{ op: "ext-turn", turnId, seat, round, kind, promptSha256, issueBy }`.
  */
 export function reduceRound(view, { w, t, layer = 0 }) {
   if (!view.round || view.round.closed_at !== null) {
@@ -229,8 +236,17 @@ export function reduceRound(view, { w, t, layer = 0 }) {
         writes.push({ op: "stop", jobId: current.job_id, cause: "quorum-cutoff" });
       }
     }
-    writes.push(closeWrite());
-    return { writes, nextDue: null };
+    // The extension turns (S3 for a carry) and the substitution gate come before B9.
+    const extOut = view.ext ? extensionRows(view.ext, { t, round: view.round.round, states, seatRounds: ordered, cutoffAt, cutoffDue }) : null;
+    if (extOut) {
+      writes.push(...extOut.writes);
+    }
+    if (!extOut || extOut.close) {
+      writes.push(closeWrite());
+      return { writes, nextDue: null };
+    }
+    const due = extensionDeadlines(extOut.turns, extOut.events, t);
+    return { writes, nextDue: due.length > 0 ? due.reduce((best, entry) => (entry.delayMs < best.delayMs ? entry : best)) : null };
   }
   const replaced = [];
   // Before an ordinary B4, B5 or B7 candidate finishes, Layer 1 tries its repair (L1b) or retry
@@ -321,7 +337,12 @@ export function reduceRound(view, { w, t, layer = 0 }) {
     writes.push(seal);
   }
 
-  if (ordered.every((row) => FINAL_STATES.has(states.get(row.seat)))) {
+  // The extension turns, then the substitution gate, before B9.
+  const extOut = view.ext ? extensionRows(view.ext, { t, round: view.round.round, states, seatRounds: ordered }) : null;
+  if (extOut) {
+    writes.push(...extOut.writes);
+  }
+  if (ordered.every((row) => FINAL_STATES.has(states.get(row.seat))) && (!extOut || extOut.close)) {
     writes.push(closeWrite());
     return { writes, nextDue: null };
   }
@@ -329,6 +350,7 @@ export function reduceRound(view, { w, t, layer = 0 }) {
   const replacementOf = new Map(replaced.map((write) => [write.seat, write]));
   const after = {
     ...view,
+    ext: extOut ? { ...view.ext, turns: extOut.turns, events: extOut.events } : view.ext,
     round: seal ? { ...view.round, quorum_at: seal.quorumAt, cutoff_at: seal.cutoffAt } : view.round,
     seatRounds: view.seatRounds.map((row) => ({ ...row, state: states.get(row.seat), current_id: replacementOf.get(row.seat)?.attemptId ?? row.current_id })),
     attempts: [
@@ -405,6 +427,9 @@ export function nextDue(view, { w, t, layer = 0 }) {
   }
   if (view.round.cutoff_at !== null && view.round.cutoff_at !== undefined) {
     add("round", "cutoff", "council", view.round.cutoff_at, t);
+  }
+  if (view.ext) {
+    candidates.push(...extensionDeadlines(view.ext.turns, view.ext.events, t));
   }
   if (candidates.length === 0) {
     return null;

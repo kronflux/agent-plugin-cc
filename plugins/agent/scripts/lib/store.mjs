@@ -787,6 +787,313 @@ CREATE TRIGGER council_stop_cancel_delete BEFORE DELETE ON council_stop_cancels
 BEGIN SELECT RAISE(ABORT,'council cancellation cannot be deleted'); END;
 `;
 
+// The council extension tables: the request inbox, the extension turns (follow-ups, substitutes
+// and carries), their immutable event journal and the extension decisions, with the triggers that
+// keep each identity single and each event sequence possible, and two guards on council_attempts
+// so that a job or an id has one council owner. W3 job ids are historical and have no foreign key.
+const SCHEMA_COUNCIL_EXTENSIONS = `
+CREATE TABLE council_ext_requests (
+  id TEXT PRIMARY KEY NOT NULL
+    CHECK (length(id)=32 AND id NOT GLOB '*[^0-9a-f]*'),
+  run_id TEXT NOT NULL REFERENCES council_runs(id),
+  kind TEXT NOT NULL CHECK (kind IN ('followup','collect','crossexam')),
+  at INTEGER NOT NULL,
+  payload TEXT NOT NULL CHECK (json_valid(payload) AND json_type(payload)='object'),
+  result TEXT CHECK (result IS NULL OR (json_valid(result) AND json_type(result)='object'))
+) STRICT;
+
+CREATE TABLE council_ext_turns (
+  id TEXT PRIMARY KEY NOT NULL
+    CHECK (length(id)=32 AND id NOT GLOB '*[^0-9a-f]*'),
+  run_id TEXT NOT NULL,
+  seat TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('followup','substitute','carry')),
+  round INTEGER CHECK (round IN (1,2)),
+  ordinal INTEGER CHECK (ordinal>0),
+  created_at INTEGER NOT NULL,
+  issue_by INTEGER NOT NULL CHECK (issue_by>created_at),
+  prompt_sha256 TEXT NOT NULL
+    CHECK (length(prompt_sha256)=64 AND prompt_sha256 NOT GLOB '*[^0-9a-f]*'),
+  predecessor_id TEXT,
+  target TEXT,
+  question TEXT,
+  merge_sha256 TEXT CHECK (merge_sha256 IS NULL OR
+    (length(merge_sha256)=64 AND merge_sha256 NOT GLOB '*[^0-9a-f]*')),
+  input_rev INTEGER CHECK (input_rev>=0),
+  FOREIGN KEY (run_id,seat) REFERENCES council_seats(run_id,seat),
+  FOREIGN KEY (run_id,round) REFERENCES council_rounds(run_id,round),
+  CHECK (
+    (kind='followup' AND round IS NULL AND ordinal IS NOT NULL
+      AND target IS NOT NULL AND question IS NOT NULL
+      AND merge_sha256 IS NOT NULL AND input_rev IS NOT NULL
+      AND (target<>'consensus' OR predecessor_id IS NOT NULL))
+    OR
+    (kind IN ('substitute','carry') AND round IS NOT NULL
+      AND (kind<>'carry' OR round=2)
+      AND ordinal IS NULL AND predecessor_id IS NULL AND target IS NULL
+      AND question IS NULL AND merge_sha256 IS NULL AND input_rev IS NULL)
+  )
+) STRICT;
+
+CREATE UNIQUE INDEX council_ext_turn_ordinal
+  ON council_ext_turns(run_id,ordinal) WHERE ordinal IS NOT NULL;
+CREATE UNIQUE INDEX council_ext_turn_round_seat
+  ON council_ext_turns(run_id,round,seat) WHERE round IS NOT NULL;
+CREATE UNIQUE INDEX council_ext_turn_challenge_seat
+  ON council_ext_turns(run_id,seat) WHERE target='consensus';
+
+CREATE TABLE council_ext_events (
+  turn_id TEXT NOT NULL REFERENCES council_ext_turns(id),
+  kind TEXT NOT NULL CHECK (kind IN ('issue','refusal','deposit','stop','ack','finish')),
+  at INTEGER NOT NULL,
+  event_at INTEGER,
+  job_id TEXT UNIQUE,
+  code TEXT,
+  reason TEXT,
+  digest TEXT CHECK (digest IS NULL OR
+    (length(digest)=64 AND digest NOT GLOB '*[^0-9a-f]*')),
+  after_close INTEGER NOT NULL DEFAULT 0 CHECK (after_close IN (0,1)),
+  PRIMARY KEY (turn_id,kind),
+  CHECK (kind='issue' OR job_id IS NULL),
+  CHECK (kind IN ('ack','deposit') OR event_at IS NULL),
+  CHECK (kind='deposit' OR (digest IS NULL AND after_close=0)),
+  CHECK (kind<>'issue' OR
+    (reason IS NULL AND (code IS NULL OR (job_id IS NOT NULL AND json_valid(code))))),
+  CHECK (kind<>'refusal' OR (code IS NULL AND reason IS NOT NULL)),
+  CHECK (kind<>'stop' OR (code IS NOT NULL AND code IN ('queue','deadline') AND reason IS NULL)),
+  CHECK (kind<>'ack' OR (code IS NOT NULL AND reason IS NULL AND
+    ((code IN ('council','foreign') AND event_at IS NOT NULL)
+      OR (code='ineligible' AND event_at IS NULL)))),
+  CHECK (kind<>'deposit' OR (code IS NOT NULL AND
+    code IN ('valid','invalid','late','cancelled','quota','failure','missing') AND
+    ((code='missing' AND event_at IS NULL) OR (code<>'missing' AND event_at IS NOT NULL)) AND
+    (code<>'valid' OR (digest IS NOT NULL AND reason IS NULL)))),
+  CHECK (kind<>'finish' OR (code IS NOT NULL AND
+    code IN ('valid','invalid','timed-out','quota-exhausted','error') AND
+    ((code='valid' AND reason IS NULL) OR (code<>'valid' AND reason IS NOT NULL))))
+) STRICT;
+
+CREATE TABLE council_ext_decisions (
+  run_id TEXT NOT NULL REFERENCES council_runs(id),
+  kind TEXT NOT NULL CHECK (kind IN ('substitution','challenge')),
+  scope INTEGER NOT NULL,
+  at INTEGER NOT NULL,
+  decision TEXT NOT NULL,
+  turn_id TEXT UNIQUE REFERENCES council_ext_turns(id),
+  PRIMARY KEY (run_id,kind,scope),
+  CHECK (
+    (kind='substitution' AND scope IN (1,2)
+      AND decision IN ('accept','decline','capacity') AND turn_id IS NULL)
+    OR
+    (kind='challenge' AND scope=0 AND
+      ((decision='unavailable' AND turn_id IS NULL)
+        OR (decision='settled' AND turn_id IS NOT NULL)))
+  )
+) STRICT;
+
+CREATE TRIGGER council_ext_request_insert BEFORE INSERT ON council_ext_requests
+WHEN NEW.result IS NOT NULL OR EXISTS (
+  SELECT 1 FROM council_ext_requests WHERE id=NEW.id
+)
+BEGIN
+  SELECT RAISE(ABORT,'invalid or duplicate council extension request');
+END;
+
+CREATE TRIGGER council_ext_request_update BEFORE UPDATE ON council_ext_requests
+WHEN OLD.result IS NOT NULL OR NEW.result IS NULL OR NEW.id IS NOT OLD.id
+  OR NEW.run_id IS NOT OLD.run_id OR NEW.kind IS NOT OLD.kind
+  OR NEW.at IS NOT OLD.at OR NEW.payload IS NOT OLD.payload
+BEGIN
+  SELECT RAISE(ABORT,'immutable council extension request');
+END;
+
+CREATE TRIGGER council_ext_request_delete BEFORE DELETE ON council_ext_requests
+BEGIN
+  SELECT RAISE(ABORT,'immutable council extension request');
+END;
+
+CREATE TRIGGER council_ext_turn_insert BEFORE INSERT ON council_ext_turns
+BEGIN
+  SELECT CASE WHEN EXISTS (
+    SELECT 1 FROM council_ext_turns AS e
+    WHERE e.id=NEW.id OR (e.run_id=NEW.run_id AND (
+      (NEW.ordinal IS NOT NULL AND e.ordinal=NEW.ordinal)
+      OR (NEW.round IS NOT NULL AND e.round=NEW.round AND e.seat=NEW.seat)
+      OR (NEW.target='consensus' AND e.target='consensus' AND e.seat=NEW.seat)
+    ))
+  ) OR EXISTS (SELECT 1 FROM council_attempts WHERE id=NEW.id)
+  THEN RAISE(ABORT,'duplicate council extension turn') END;
+
+  SELECT CASE WHEN EXISTS (
+    SELECT 1 FROM council_runs WHERE id=NEW.run_id AND failed_at IS NOT NULL
+  ) OR (NEW.round IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM council_rounds
+    WHERE run_id=NEW.run_id AND round=NEW.round AND closed_at IS NULL
+  )) OR (NEW.kind='followup' AND NOT EXISTS (
+    SELECT 1 FROM council_rounds
+    WHERE run_id=NEW.run_id AND round=2 AND closed_at IS NOT NULL AND quorum=1
+  ))
+  THEN RAISE(ABORT,'council extension turn outside eligible round') END;
+
+  SELECT CASE WHEN NEW.target='consensus' AND (
+    EXISTS (SELECT 1 FROM council_ext_decisions WHERE run_id=NEW.run_id
+      AND kind='challenge' AND scope=0)
+    OR EXISTS (
+      SELECT 1 FROM council_ext_turns AS x
+      WHERE x.run_id=NEW.run_id AND x.target='consensus' AND (
+        NOT EXISTS (SELECT 1 FROM council_ext_events WHERE turn_id=x.id AND kind='finish')
+        OR EXISTS (SELECT 1 FROM council_ext_events WHERE turn_id=x.id AND kind='issue')
+      )
+    )
+  ) THEN RAISE(ABORT,'council challenge already open or issued') END;
+END;
+
+CREATE TRIGGER council_ext_turn_update BEFORE UPDATE ON council_ext_turns
+BEGIN
+  SELECT RAISE(ABORT,'immutable council extension turn');
+END;
+
+CREATE TRIGGER council_ext_turn_delete BEFORE DELETE ON council_ext_turns
+BEGIN
+  SELECT RAISE(ABORT,'immutable council extension turn');
+END;
+
+CREATE TRIGGER council_ext_event_insert BEFORE INSERT ON council_ext_events
+BEGIN
+  SELECT CASE WHEN EXISTS (
+    SELECT 1 FROM council_ext_events
+    WHERE (turn_id=NEW.turn_id AND kind=NEW.kind)
+      OR (NEW.job_id IS NOT NULL AND job_id=NEW.job_id)
+  ) THEN RAISE(ABORT,'duplicate council extension event') END;
+
+  SELECT CASE WHEN NOT EXISTS (
+    SELECT 1 FROM council_ext_turns WHERE id=NEW.turn_id AND created_at<=NEW.at
+  ) THEN RAISE(ABORT,'invalid council extension event time or turn') END;
+
+  SELECT CASE WHEN NEW.kind IN ('issue','refusal') AND (
+    EXISTS (SELECT 1 FROM council_ext_turns WHERE id=NEW.turn_id AND issue_by<=NEW.at)
+    OR EXISTS (SELECT 1 FROM council_ext_events WHERE turn_id=NEW.turn_id
+      AND kind IN ('issue','refusal','finish'))
+  ) THEN RAISE(ABORT,'council extension issuance is closed') END;
+
+  SELECT CASE WHEN NEW.kind='issue' AND (
+    EXISTS (SELECT 1 FROM council_attempts WHERE job_id=NEW.job_id)
+    OR EXISTS (SELECT 1 FROM council_ext_turns WHERE id=NEW.turn_id
+      AND ((predecessor_id IS NULL)<>(NEW.job_id IS NULL)))
+  ) THEN RAISE(ABORT,'invalid or duplicate council extension binding') END;
+
+  SELECT CASE WHEN NEW.kind IN ('deposit','stop','ack') AND NOT EXISTS (
+    SELECT 1 FROM council_ext_events WHERE turn_id=NEW.turn_id AND kind='issue'
+  ) THEN RAISE(ABORT,'council extension event requires issuance') END;
+
+  SELECT CASE WHEN NEW.kind='stop' AND (
+    NOT EXISTS (SELECT 1 FROM council_ext_events WHERE turn_id=NEW.turn_id
+      AND kind='issue' AND job_id IS NOT NULL)
+    OR EXISTS (SELECT 1 FROM council_ext_events WHERE turn_id=NEW.turn_id
+      AND kind IN ('deposit','finish'))
+  ) THEN RAISE(ABORT,'invalid council extension stop') END;
+
+  SELECT CASE WHEN NEW.kind='ack' AND NOT EXISTS (
+    SELECT 1 FROM council_ext_events WHERE turn_id=NEW.turn_id AND kind='stop'
+  ) THEN RAISE(ABORT,'council extension acknowledgement requires stop') END;
+
+  SELECT CASE WHEN NEW.kind='deposit' AND (
+    NEW.after_close<>EXISTS (
+      SELECT 1 FROM council_ext_events WHERE turn_id=NEW.turn_id AND kind='finish'
+    )
+    OR EXISTS (
+      SELECT 1 FROM council_ext_events AS e
+      JOIN council_ext_turns AS x ON x.id=e.turn_id
+      WHERE e.turn_id=NEW.turn_id AND e.kind='issue' AND e.job_id IS NULL
+        AND (NEW.after_close=1 OR NEW.at>=x.issue_by OR NEW.event_at IS NOT NEW.at
+          OR NEW.code NOT IN ('valid','invalid'))
+    )
+  ) THEN RAISE(ABORT,'invalid council extension deposit') END;
+
+  SELECT CASE WHEN NEW.kind='finish' AND (
+    (NEW.code IN ('valid','invalid','quota-exhausted') AND NOT EXISTS (
+      SELECT 1 FROM council_ext_events WHERE turn_id=NEW.turn_id AND kind='deposit'
+        AND after_close=0 AND code=CASE NEW.code WHEN 'quota-exhausted' THEN 'quota'
+                                            ELSE NEW.code END
+    ))
+    OR (NOT EXISTS (
+      SELECT 1 FROM council_ext_events WHERE turn_id=NEW.turn_id AND kind IN ('issue','refusal')
+    ) AND (NEW.code<>'error' OR EXISTS (
+      SELECT 1 FROM council_ext_turns WHERE id=NEW.turn_id AND issue_by>NEW.at
+    )))
+    OR (NEW.code<>'valid' AND EXISTS (
+      SELECT 1 FROM council_ext_events WHERE turn_id=NEW.turn_id AND kind='deposit'
+        AND after_close=0 AND code='valid'
+    ))
+  ) THEN RAISE(ABORT,'invalid council extension finish') END;
+END;
+
+CREATE TRIGGER council_ext_event_update BEFORE UPDATE ON council_ext_events
+BEGIN
+  SELECT RAISE(ABORT,'immutable council extension event');
+END;
+
+CREATE TRIGGER council_ext_event_delete BEFORE DELETE ON council_ext_events
+BEGIN
+  SELECT RAISE(ABORT,'immutable council extension event');
+END;
+
+CREATE TRIGGER council_ext_decision_insert BEFORE INSERT ON council_ext_decisions
+BEGIN
+  SELECT CASE WHEN EXISTS (
+    SELECT 1 FROM council_ext_decisions
+    WHERE (run_id=NEW.run_id AND kind=NEW.kind AND scope=NEW.scope)
+      OR (NEW.turn_id IS NOT NULL AND turn_id=NEW.turn_id)
+  ) THEN RAISE(ABORT,'duplicate council extension decision') END;
+
+  SELECT CASE WHEN NEW.kind='substitution' AND NOT EXISTS (
+    SELECT 1 FROM council_rounds WHERE run_id=NEW.run_id AND round=NEW.scope
+      AND closed_at IS NULL
+  ) THEN RAISE(ABORT,'substitution decision requires open round') END;
+
+  SELECT CASE WHEN NEW.turn_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM council_ext_turns AS x
+    JOIN council_ext_events AS issue ON issue.turn_id=x.id AND issue.kind='issue'
+    JOIN council_ext_events AS finish ON finish.turn_id=x.id AND finish.kind='finish'
+    WHERE x.id=NEW.turn_id AND x.run_id=NEW.run_id AND x.kind='followup'
+      AND x.target='consensus' AND issue.job_id IS NOT NULL
+  ) THEN RAISE(ABORT,'challenge decision requires this run''s settled consensus turn') END;
+
+  SELECT CASE WHEN NEW.kind='challenge' AND NEW.decision='unavailable' AND EXISTS (
+    SELECT 1 FROM council_ext_turns AS x WHERE x.run_id=NEW.run_id AND x.target='consensus'
+      AND (NOT EXISTS (SELECT 1 FROM council_ext_events WHERE turn_id=x.id AND kind='finish')
+        OR EXISTS (SELECT 1 FROM council_ext_events WHERE turn_id=x.id AND kind='issue'))
+  ) THEN RAISE(ABORT,'council challenge already open or issued') END;
+END;
+
+CREATE TRIGGER council_ext_decision_update BEFORE UPDATE ON council_ext_decisions
+BEGIN
+  SELECT RAISE(ABORT,'immutable council extension decision');
+END;
+
+CREATE TRIGGER council_ext_decision_delete BEFORE DELETE ON council_ext_decisions
+BEGIN
+  SELECT RAISE(ABORT,'immutable council extension decision');
+END;
+
+CREATE TRIGGER council_ext_core_attempt_insert BEFORE INSERT ON council_attempts
+WHEN EXISTS (SELECT 1 FROM council_ext_turns WHERE id=NEW.id)
+  OR (NEW.job_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM council_ext_events WHERE job_id=NEW.job_id
+  ))
+BEGIN
+  SELECT RAISE(ABORT,'council identity already owned by extension');
+END;
+
+CREATE TRIGGER council_ext_core_attempt_bind BEFORE UPDATE OF job_id ON council_attempts
+WHEN NEW.job_id IS NOT NULL AND EXISTS (
+  SELECT 1 FROM council_ext_events WHERE job_id=NEW.job_id
+)
+BEGIN
+  SELECT RAISE(ABORT,'council job already owned by extension');
+END;
+`;
+
 /**
  * The schema migrations in order, one entry per schema version. `openStore` applies every entry
  * above the stored `user_version` in one transaction. A new version appends an entry.
@@ -822,6 +1129,13 @@ export const MIGRATIONS = Object.freeze([
     version: 4,
     apply(db) {
       db.exec(SCHEMA_COUNCIL);
+    }
+  }),
+  Object.freeze({
+    version: 5,
+    apply(db) {
+      // Additive: the council extension tables; no earlier council table, row or trigger changes.
+      db.exec(SCHEMA_COUNCIL_EXTENSIONS);
     }
   })
 ]);

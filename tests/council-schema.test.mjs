@@ -4,7 +4,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 
-import { dumpTables, makeStoreDir, rawAll, runLibChild } from "./store-fixtures.mjs";
+import { dumpTables, makeStoreDir, rawAll, rawExec, runLibChild } from "./store-fixtures.mjs";
 import { stopOwnedProcess } from "./helpers.mjs";
 import {
   EPOCH,
@@ -39,6 +39,10 @@ const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
 
 const COUNCIL_TABLES = [
   "council_attempts",
+  "council_ext_decisions",
+  "council_ext_events",
+  "council_ext_requests",
+  "council_ext_turns",
   "council_observations",
   "council_rounds",
   "council_runs",
@@ -119,6 +123,26 @@ function accepts(db, steps, { commit = false, label = "" } = {}) {
 
 const CHECK = /CHECK constraint failed/;
 const FOREIGN_KEY = /FOREIGN KEY constraint failed/;
+
+// The indexes and triggers the extension migration (version 5) adds.
+const EXTENSION_INDEXES = ["council_ext_turn_challenge_seat", "council_ext_turn_ordinal", "council_ext_turn_round_seat"];
+const EXTENSION_TRIGGERS = [
+  "council_ext_core_attempt_bind",
+  "council_ext_core_attempt_insert",
+  "council_ext_decision_delete",
+  "council_ext_decision_insert",
+  "council_ext_decision_update",
+  "council_ext_event_delete",
+  "council_ext_event_insert",
+  "council_ext_event_update",
+  "council_ext_request_delete",
+  "council_ext_request_insert",
+  "council_ext_request_update",
+  "council_ext_turn_delete",
+  "council_ext_turn_insert",
+  "council_ext_turn_update"
+];
+const EXTENSION_TABLES = ["council_ext_decisions", "council_ext_events", "council_ext_turns", "council_ext_requests"];
 
 // A Round 1 seed in insertion order (run, round, seats, then each seat round before its attempt),
 // three seats: a Claude prompt seat (s1, running), a Codex seat (s2, issuing) and an Antigravity
@@ -201,27 +225,27 @@ async function libChildWithin(op, args, env, timeoutMs = 60000) {
 }
 
 test("migration 2 creates the council tables once", { timeout: 120000 }, async (t) => {
-  assert.equal(store.SCHEMA_VERSION, 4);
-  assert.equal(store.MIGRATIONS.at(-1).version, 4);
+  assert.equal(store.SCHEMA_VERSION, 5);
+  assert.equal(store.MIGRATIONS.at(-1).version, 5);
   const stateDir = makeStoreDir(t);
   const countFile = path.join(stateDir, "migrations.txt");
   const env = { AGENT_PLUGIN_TEST_MIGRATION_COUNT_FILE: countFile, FIXTURE_START_AT: String(Date.now() + 1500) };
   const results = await Promise.all([0, 1].map(() => libChildWithin("fixture.coldOpen", [stateDir], env)));
   for (const result of results) {
     assert.equal(result.ok, true, JSON.stringify(result.error));
-    assert.equal(result.value.userVersion, 4);
+    assert.equal(result.value.userVersion, 5);
   }
-  assert.equal(rawAll(stateDir, "PRAGMA user_version")[0].user_version, 4);
+  assert.equal(rawAll(stateDir, "PRAGMA user_version")[0].user_version, 5);
   assert.deepEqual(
     rawAll(stateDir, "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'council\\_%' ESCAPE '\\' ORDER BY name").map((r) => r.name),
     COUNCIL_TABLES
   );
-  assert.equal(countObjects(stateDir, "index"), 2);
+  assert.equal(countObjects(stateDir, "index"), 2 + EXTENSION_INDEXES.length);
   assert.deepEqual(
     rawAll(stateDir, "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'council\\_%' ESCAPE '\\' ORDER BY name").map((r) => r.name),
-    ["council_pending_stops", "council_seat_label"]
+    ["council_ext_turn_challenge_seat", "council_ext_turn_ordinal", "council_ext_turn_round_seat", "council_pending_stops", "council_seat_label"]
   );
-  assert.equal(countObjects(stateDir, "trigger"), 24);
+  assert.equal(countObjects(stateDir, "trigger"), 24 + EXTENSION_TRIGGERS.length);
   assert.equal(fs.readFileSync(countFile, "utf8").trim().split(/\r?\n/).length, 1);
   const later = await libChildWithin("fixture.coldOpen", [stateDir], { AGENT_PLUGIN_TEST_MIGRATION_COUNT_FILE: countFile });
   assert.equal(later.ok, true, JSON.stringify(later.error));
@@ -1095,4 +1119,99 @@ test("objects install without clobbering and exports re-check the row", (t) => {
     []
   );
   assert.throws(() => publishExport(runDir, "report.md", absent, () => absent), ObjectDamagedError);
+});
+
+// Turns a store written by this version back into a version-4 store: the council tables of
+// migration 4 with their rows, without the extension tables, indexes and triggers.
+function asVersion4Store(stateDir) {
+  for (const trigger of EXTENSION_TRIGGERS) {
+    rawExec(stateDir, `DROP TRIGGER IF EXISTS ${trigger}`);
+  }
+  for (const table of EXTENSION_TABLES) {
+    rawExec(stateDir, `DROP TABLE IF EXISTS ${table}`);
+  }
+  rawExec(stateDir, "PRAGMA user_version = 4");
+}
+
+function migration4Rows(stateDir) {
+  const dump = dumpTables(stateDir);
+  return Object.fromEntries(Object.entries(dump).filter(([name]) => name.startsWith("council_") && !name.startsWith("council_ext_")));
+}
+
+test("migration 5 adds the extension tables to a version-4 store once and keeps its council runs", (t) => {
+  const { db, stateDir } = seededDb(t);
+  accepts(db, [...BIND_S2, OBSERVE_S2, ...FINISH_S2], { commit: true, label: "a bound, observed and final seat" });
+  asVersion4Store(stateDir);
+  assert.equal(rawAll(stateDir, "SELECT count(*) AS n FROM sqlite_master WHERE name LIKE 'council\\_ext\\_%' ESCAPE '\\'")[0].n, 0);
+  const before = migration4Rows(stateDir);
+  assert.equal(before.council_runs.length, 1);
+  const countFile = path.join(stateDir, "migrations.txt");
+  process.env.AGENT_PLUGIN_TEST_MIGRATION_COUNT_FILE = countFile;
+  try {
+    store.openStore(stateDir).close();
+    store.openStore(stateDir).close();
+  } finally {
+    delete process.env.AGENT_PLUGIN_TEST_MIGRATION_COUNT_FILE;
+  }
+  assert.equal(fs.readFileSync(countFile, "utf8").trim().split(/\r?\n/).length, 1);
+  assert.equal(rawAll(stateDir, "PRAGMA user_version")[0].user_version, 5);
+  assert.deepEqual(migration4Rows(stateDir), before);
+  assert.deepEqual(rawAll(stateDir, "PRAGMA foreign_key_check"), []);
+  const names = (type) =>
+    rawAll(stateDir, "SELECT name FROM sqlite_master WHERE type = ? AND name LIKE 'council\\_ext\\_%' ESCAPE '\\' ORDER BY name", [type]).map((row) => row.name);
+  assert.deepEqual(names("table"), [...EXTENSION_TABLES].sort());
+  assert.deepEqual(names("index"), EXTENSION_INDEXES);
+  assert.deepEqual(names("trigger"), EXTENSION_TRIGGERS);
+});
+
+const TURN = id("e");
+const TURN_2 = id("d");
+const SUBSTITUTE = (turnId, { round = 1, seat = "s2", kind = "substitute", at = 10 } = {}) =>
+  `INSERT INTO council_ext_turns (id, run_id, seat, kind, round, created_at, issue_by, prompt_sha256) VALUES ('${turnId}', 'run-1', '${seat}', '${kind}', ${round}, ${at}, ${at + 1000}, '${hex("5")}')`;
+const ISSUE = (turnId, at = 10) => `INSERT INTO council_ext_events (turn_id, kind, at) VALUES ('${turnId}', 'issue', ${at})`;
+const DEPOSIT = (turnId, at = 20, code = "valid") =>
+  `INSERT INTO council_ext_events (turn_id, kind, at, event_at, code, digest) VALUES ('${turnId}', 'deposit', ${at}, ${at}, '${code}', ${code === "valid" ? `'${hex("6")}'` : "NULL"})`;
+const FINISH = (turnId, code, at = 21) =>
+  `INSERT INTO council_ext_events (turn_id, kind, at, code, reason) VALUES ('${turnId}', 'finish', ${at}, '${code}', ${code === "valid" ? "NULL" : "'a reason'"})`;
+const CLOSE_ROUND_1 = ["UPDATE council_rounds SET closed_at = 30, quorum = 0 WHERE run_id = 'run-1' AND round = 1", "UPDATE council_runs SET failed_at = 30 WHERE id = 'run-1'"];
+const DECISION = (decision, at = 31) => `INSERT INTO council_ext_decisions (run_id, kind, scope, at, decision) VALUES ('run-1', 'substitution', 1, ${at}, '${decision}')`;
+
+test("migration 5 accepts one substitute per seat and round and refuses impossible extension rows", (t) => {
+  const { db } = seededDb(t);
+  accepts(db, [SUBSTITUTE(TURN), ISSUE(TURN), DEPOSIT(TURN), FINISH(TURN, "valid")], { commit: true, label: "substitute, issue, valid deposit, valid finish" });
+  accepts(db, [SUBSTITUTE(TURN_2, { seat: "s3" }), ISSUE(TURN_2), FINISH(TURN_2, "timed-out", 1010)], { label: "a silent substitute times out" });
+  refuses(db, [SUBSTITUTE(TURN_2)], /duplicate council extension turn/, { label: "a second substitute for the same seat and round" });
+  refuses(db, [SUBSTITUTE(TURN_2, { seat: "s3", kind: "carry" })], CHECK, { label: "a carry in round 1" });
+  refuses(db, [SUBSTITUTE(TURN_2, { seat: "s3", round: 2 })], /council extension turn outside eligible round/, { label: "a substitute in a round that does not exist" });
+  // A finish other than valid on a turn with a timely valid deposit (the migration's one change).
+  refuses(db, [SUBSTITUTE(TURN_2, { seat: "s3" }), ISSUE(TURN_2), DEPOSIT(TURN_2), FINISH(TURN_2, "invalid")], /invalid council extension finish/, { label: "invalid finish over a valid deposit" });
+  refuses(db, [SUBSTITUTE(TURN_2, { seat: "s3" }), ISSUE(TURN_2), DEPOSIT(TURN_2, 1010)], /invalid council extension deposit/, { label: "a Claude deposit at its issue_by" });
+  refuses(db, [SUBSTITUTE(TURN_2, { seat: "s3" }), DEPOSIT(TURN_2)], /council extension event requires issuance/, { label: "a deposit before issue" });
+  refuses(db, [SUBSTITUTE(TURN_2, { seat: "s3" }), ISSUE(TURN_2), FINISH(TURN_2, "valid")], /invalid council extension finish/, { label: "a valid finish with no deposit" });
+  refuses(db, [FINISH(TURN, "valid", 22)], /duplicate council extension event/, { label: "a second finish" });
+  refuses(db, [`UPDATE council_ext_events SET at = 25 WHERE turn_id = '${TURN}' AND kind = 'finish'`], /immutable council extension event/, { label: "event update" });
+  refuses(db, [`DELETE FROM council_ext_turns WHERE id = '${TURN}'`], /immutable council extension turn/, { label: "turn delete" });
+  // Identity: an extension turn id is never a core attempt id.
+  refuses(
+    db,
+    [
+      `INSERT INTO council_attempts (id, run_id, round, seat, charge, replaces_id, kind, created_at, issue_by, prompt_sha256) VALUES ('${TURN}', 'run-1', 1, 's2', 'repair', '${A2}', 'create', 10, 1010, '${hex("c")}')`
+    ],
+    /council identity already owned by extension/,
+    { label: "a core attempt with an extension turn id" }
+  );
+  // A closed round or failed run takes no new turn and no decision.
+  refuses(db, [...CLOSE_ROUND_1, SUBSTITUTE(TURN_2, { seat: "s3" })], /council extension turn outside eligible round/, { label: "a substitute after close" });
+  refuses(db, [...CLOSE_ROUND_1, DECISION("decline")], /substitution decision requires open round/, { label: "a decision after close" });
+  accepts(db, [DECISION("accept")], { commit: true, label: "a decision" });
+  refuses(db, [DECISION("decline", 32)], /duplicate council extension decision/, { label: "a second decision" });
+  // Requests: inserted without a result, finalized once.
+  const request = `INSERT INTO council_ext_requests (id, run_id, kind, at, payload) VALUES ('${id("a")}', 'run-1', 'collect', 40, '{"round":1}')`;
+  refuses(db, [`INSERT INTO council_ext_requests (id, run_id, kind, at, payload, result) VALUES ('${id("a")}', 'run-1', 'collect', 40, '{"round":1}', '{}')`], /invalid or duplicate council extension request/, {
+    label: "a request with a result"
+  });
+  accepts(db, [request, `UPDATE council_ext_requests SET result = '{"decision":"accept"}' WHERE id = '${id("a")}'`], { label: "a request finalized once" });
+  refuses(db, [request, `UPDATE council_ext_requests SET result = '{"decision":"accept"}'`, `UPDATE council_ext_requests SET result = '{"decision":"decline"}'`], /immutable council extension request/, {
+    label: "a request finalized twice"
+  });
 });

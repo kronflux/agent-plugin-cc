@@ -120,6 +120,12 @@ export function renderRepairPrompt({ basePrompt, errors, schemaText }) {
   });
 }
 
+// The prompt of a Claude stand-in for a seat that ended the round without a valid answer: the
+// round prompt for that seat's lens under a line that says whose place the stand-in takes.
+export function renderSubstitutePrompt({ basePrompt }) {
+  return render("council-substitute", { BASE_PROMPT: trimEnd(basePrompt) });
+}
+
 // The round's prompt under a first line that names the reissue time and, when a reason is
 // given, a second line that names what happened to the previous attempt. `round` is accepted
 // for the caller's record and does not change the text.

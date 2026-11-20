@@ -32,7 +32,8 @@ import { checkProviders, newRunId } from "../lib/runs.mjs";
 import { launchWorker } from "../lib/task-launch.mjs";
 import { buildSeatJob, readSeatUsage } from "../lib/council/jobs.mjs";
 import { installObject, ObjectDamagedError, publishExport, readObject } from "../lib/council/objects.mjs";
-import { buildBundles } from "../lib/council/anonymise.mjs";
+import { buildBundles, bundleFromMap } from "../lib/council/anonymise.mjs";
+import { depositExtensionReceipt, depositSubstitutionOptIn } from "../lib/council/extensions.mjs";
 import { mergeCouncil, serializeMerge, sortedTally } from "../lib/council/merge.mjs";
 import {
   CUTOFF_NOTICE,
@@ -42,13 +43,16 @@ import {
   renderRepairPrompt,
   renderRetryPrompt,
   renderRound1Prompt,
-  renderRound2Prompt
+  renderRound2Prompt,
+  renderSubstitutePrompt
 } from "../lib/council/prompts.mjs";
+import { actorKey, effectivePanel, eventsByTurn, quorumFamilies, substitutionCandidates, turnActor, turnState } from "../lib/council/reduce-ext.mjs";
 import {
   acknowledgeStop,
   BUDGET_MS,
   CLEANUP_BUDGET_MS,
   continueBindingHook,
+  COUNCIL_EXTENSIONS,
   COUNCIL_LAYER,
   COUNCIL_TEST_POINTS as POINTS,
   CouncilFenceError,
@@ -595,9 +599,41 @@ function defaultSleep(ms) {
   });
 }
 
+// The prompts of issued Claude extension turns (stand-ins and carries) that are open at `t`: no
+// deposit or finish, an open round, before the turn's own deadline, and for a carry before a
+// sealed round's cutoff. A stand-in asked after the cutoff keeps its own full time.
+function extensionDeliveries(snapshot, runDir, t) {
+  const ext = snapshot.ext ?? { turns: [], events: [] };
+  const byTurn = eventsByTurn(ext.events);
+  const rounds = new Map(snapshot.rounds.map((row) => [row.round, row]));
+  const deliveries = [];
+  for (const turn of ext.turns) {
+    const roundRow = rounds.get(turn.round);
+    const { issue, deposit, finish } = turnState(turn, byTurn);
+    if (turn.kind === "followup" || !roundRow || roundRow.closed_at !== null || !issue || issue.job_id !== null || deposit || finish || t >= turn.issue_by) {
+      continue;
+    }
+    if (turn.kind === "carry" && roundRow.cutoff_at !== null && t >= roundRow.cutoff_at) {
+      continue;
+    }
+    deliveries.push({
+      seat: turn.seat,
+      intentId: turn.id,
+      promptFile: path.join(runDir, "objects", `${turn.prompt_sha256}.md`),
+      deadline: new Date(turn.issue_by).toISOString(),
+      round: turn.round,
+      actor: turnActor(turn),
+      sort: [turn.round, turn.seat, 1, turn.created_at, turn.id]
+    });
+  }
+  return deliveries;
+}
+
 /**
  * The prompts a seat's agent should answer now: current, unretired, unanswered and open (before
- * its own deadline and before a sealed round's cutoff).
+ * its own deadline and before a sealed round's cutoff), then the open prompts of Claude extension
+ * turns, which add `round` and `actor` (`<seat>~r<round>` of the stand-in; a carry keeps its Round
+ * 1 key). Sorted by round, seat, core before extension, creation time, then id.
  */
 export function openDeliveries(snapshot, runDir, t) {
   const observed = new Set(snapshot.observations.map((row) => row.attempt_id));
@@ -613,16 +649,23 @@ export function openDeliveries(snapshot, runDir, t) {
       continue;
     }
     deliveries.push({
-      round: attempt.round,
       seat: attempt.seat,
       intentId: attempt.id,
       promptFile: path.join(runDir, "objects", `${attempt.prompt_sha256}.md`),
-      deadline: new Date(attempt.issue_by).toISOString()
+      deadline: new Date(attempt.issue_by).toISOString(),
+      sort: [attempt.round, attempt.seat, 0, attempt.created_at, attempt.id]
     });
   }
-  return deliveries
-    .sort((a, b) => a.round - b.round || (a.seat < b.seat ? -1 : a.seat > b.seat ? 1 : 0))
-    .map(({ round: _round, ...delivery }) => delivery);
+  deliveries.push(...extensionDeliveries(snapshot, runDir, t));
+  const compare = (a, b) => {
+    for (let index = 0; index < a.length; index += 1) {
+      if (a[index] !== b[index]) {
+        return a[index] < b[index] ? -1 : 1;
+      }
+    }
+    return 0;
+  };
+  return deliveries.sort((a, b) => compare(a.sort, b.sort)).map(({ sort: _sort, ...delivery }) => delivery);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -795,7 +838,7 @@ function issuable(snapshot, round) {
  * `round-not-started`); `notes` are launch lines for standard error.
  */
 export async function advance(runDir, options) {
-  const { runId, round, layer = 0, deadline } = options;
+  const { runId, round, layer = 0, deadline, extensions = {}, consent = null } = options;
   const stateDir = options.stateDir ?? path.dirname(path.dirname(runDir));
   const ownStore = !options.openStore;
   const store = ownStore ? openStore(stateDir, { busyTimeoutMs: RETRY_BUDGETS.command.attemptMs }) : options.openStore();
@@ -855,7 +898,7 @@ export async function advance(runDir, options) {
       if (cutoffAt !== null && t0 >= cutoffAt) {
         await observeJobs(store, runDir, snapshot, deps);
       }
-      await reduceIfNeeded(store, { runId, round, layer, deadline });
+      await reduceIfNeeded(store, { runId, round, layer, deadline, extensions, consent, runDir });
       const stopped = await dispatchStops(store, snapshot.run, deps);
       errors.push(...stopped.errors);
       snapshot = readCouncil(store, runId);
@@ -869,7 +912,7 @@ export async function advance(runDir, options) {
       snapshot = readCouncil(store, runId);
       await observeJobs(store, runDir, snapshot, deps);
       testPoint(POINTS.beforeReduce);
-      const peek = await reduceIfNeeded(store, { runId, round, layer, deadline });
+      const peek = await reduceIfNeeded(store, { runId, round, layer, deadline, extensions, consent, runDir });
       snapshot = readCouncil(store, runId);
       const t = Math.max(snapshot.run.clock, wallNow());
       const deliveries = openDeliveries(snapshot, runDir, t);
@@ -924,15 +967,92 @@ async function dispatchStopsDelay(store, run, deps) {
   return delay;
 }
 
-// Reduces the round only when the reducer has a row to write; resolves to the read-only peek
-// after any reduction (its `nextDue` is the next wake).
-async function reduceIfNeeded(store, { runId, round, layer, deadline }) {
-  const peek = peekRound(store, { runId, round, layer });
-  if (!peek || peek.writes.length === 0) {
-    return peek;
+// The Round 1 answers of the effective panel by actor key, and the author rows buildBundles
+// scrubs: each valid original seat and each Round 1 stand-in that answered validly.
+function round1Actors(runDir, snapshot, jobModels = () => []) {
+  const panel = effectivePanel(snapshot, 1).filter((entry) => entry.valid);
+  const seatRows = new Map(snapshot.seats.map((row) => [row.seat, row]));
+  const answers = {};
+  const rows = [];
+  for (const entry of panel) {
+    answers[entry.actor] = readJsonObject(runDir, entry.answerSha256);
+    const seat = seatRows.get(entry.seat);
+    rows.push(
+      entry.kind === "original"
+        ? { seat: entry.seat, family: seat.family, label: seat.label, model: seat.model, identities: jobModels(entry.seat) }
+        : { seat: entry.actor, family: "claude", label: null, model: null, identities: [entry.seat] }
+    );
   }
-  await reduceRun(store, { runId, round, layer, deadline });
-  return peekRound(store, { runId, round, layer });
+  return { panel, answers, rows };
+}
+
+/**
+ * The stand-in prompt of each seat of `round` that may get one now (an original seat round that
+ * ended without a valid answer, with no extension turn in the round, while the round has no
+ * substitution decision), installed as an object: `{ seat: digest }`, with null for a seat whose
+ * prompt cannot be prepared (a missing or damaged object). Round 1 is the seat's Round 1 prompt
+ * for its lens; Round 2 answers the seat's `$alternates` bundle, which leaves out that seat's own
+ * Round 1 findings, with no own findings of its own. Both sit under the stand-in preface.
+ */
+export function prepareStandIns(runDir, snapshot, round) {
+  const roundRow = snapshot.rounds.find((row) => row.round === round);
+  const decided = (snapshot.ext?.decisions ?? []).some((row) => row.kind === "substitution" && row.scope === round);
+  if (!roundRow || roundRow.closed_at !== null || decided) {
+    return {};
+  }
+  const seatRounds = snapshot.seatRounds.filter((row) => row.round === round);
+  const states = new Map(seatRounds.map((row) => [row.seat, row.state]));
+  const candidates = substitutionCandidates(seatRounds, states, (snapshot.ext?.turns ?? []).filter((turn) => turn.round === round));
+  if (candidates.length === 0) {
+    return {};
+  }
+  const prepared = {};
+  for (const seat of candidates) {
+    try {
+      const lens = snapshot.seats.find((row) => row.seat === seat).lens;
+      const brief = readObject(runDir, snapshot.run.brief_sha256, "md").toString("utf8");
+      let basePrompt;
+      if (round === 1) {
+        basePrompt = renderRound1Prompt({ brief, lens, kind: snapshot.run.kind, schemaText: fs.readFileSync(roundSchemaPath(1), "utf8") });
+      } else {
+        const mapping = readJsonObject(runDir, roundRow.map_sha256);
+        const letterMap = mapping.$alternates?.[actorKey(seat, 2)];
+        if (!letterMap) {
+          prepared[seat] = null;
+          continue;
+        }
+        const { answers, rows } = round1Actors(runDir, snapshot);
+        const bundle = bundleFromMap(rows, answers, letterMap, { runId: snapshot.run.id });
+        basePrompt = renderRound2Prompt({ brief, lens, ownFindings: [], bundle, schemaText: fs.readFileSync(roundSchemaPath(2), "utf8") });
+      }
+      prepared[seat] = installObject(runDir, renderSubstitutePrompt({ basePrompt }), "md");
+    } catch (error) {
+      if (!(error instanceof ObjectDamagedError) && typeof error?.code !== "string") {
+        throw error;
+      }
+      prepared[seat] = null;
+    }
+  }
+  return prepared;
+}
+
+// Reduces the round only when the reducer has a row to write; resolves to the read-only peek
+// after any reduction (its `nextDue` is the next wake). With substitution on, each look first
+// prepares the stand-in prompts the current snapshot calls for, and a reduction that makes a new
+// seat a candidate is followed by one more look.
+async function reduceIfNeeded(store, { runId, round, layer, deadline, extensions = {}, consent = null, runDir = null }) {
+  let peek = null;
+  for (let pass = 0; pass < 3; pass += 1) {
+    const snapshot = extensions.substitution && runDir ? readCouncil(store, runId) : null;
+    const prepared = snapshot ? prepareStandIns(runDir, snapshot, round) : {};
+    const options = { runId, round, layer, extensions, consent, prepared };
+    peek = peekRound(store, options);
+    if (!peek || peek.writes.length === 0) {
+      return peek;
+    }
+    await reduceRun(store, { ...options, deadline });
+  }
+  return peekRound(store, { runId, round, layer, extensions, consent });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -940,7 +1060,7 @@ async function reduceIfNeeded(store, { runId, round, layer, deadline }) {
 
 export const usage =
   "council start --brief <file> [--kind review|decision] [--seat <family>:<lens>]... [--model <family>=<value>]... [--timeout-ms <ms>] [--json]" +
-  " | collect <run-id> --round 1|2 [--budget-ms <ms>] [--json]" +
+  " | collect <run-id> --round 1|2 [--disallow-substitute] [--budget-ms <ms>] [--json]" +
   " | submit <run-id> <seat> --intent <intent-id> --file <answer.json> [--json]" +
   " | crossexam <run-id> [--json] | merge <run-id> [--json]" +
   " | verdict <run-id> <cluster-id|claim-id> verified|rejected|not-checked [--strongest <n>] [--] [reason]" +
@@ -1142,25 +1262,45 @@ function isoOrNull(value) {
  * cleanupPending, memberTurns, repairs, retries, seats }`, each seat `{ seat, family, state,
  * reason, jobId, answerSha256, forcedReasons }`; `closedAt` and `quorum` are null while open. At
  * `layer` 2 or more it also has `quorumAt` and `cutoffAt`, null until the round is sealed.
+ * `validSeats` counts the round's effective panel (a valid original, else a valid stand-in or
+ * carry for that seat), `validFamilies` the families of its valid originals only, and
+ * `memberTurns` the round's issued turns, stand-ins and carries included. With substitution on
+ * (`extensions.substitution`) it also has `families` (the sorted quorum families),
+ * `substitutions`, `substitutionDecision` (`null`, `accept`, `decline` or `capacity`) and
+ * `substitutionOptIn`.
  */
-export function roundObject(snapshot, round, { layer = 0 } = {}) {
+export function roundObject(snapshot, round, { layer = 0, extensions = {} } = {}) {
   const roundRow = snapshot.rounds.find((row) => row.round === round);
   const seats = new Map(snapshot.seats.map((row) => [row.seat, row]));
   const attempts = new Map(snapshot.attempts.map((row) => [row.id, row]));
   const seatRounds = snapshot.seatRounds.filter((row) => row.round === round);
-  const valid = seatRounds.filter((row) => row.state === "valid");
+  const panel = effectivePanel(snapshot, round);
+  const families = quorumFamilies(panel, familySort);
   const roundJobs = new Set(snapshot.attempts.filter((row) => row.round === round && row.job_id).map((row) => row.job_id));
   const charges = snapshot.charges.rounds[round] ?? { turn: 0, repair: 0, retry: 0 };
+  const extIssued = snapshot.ext?.issued.rounds[round] ?? 0;
+  const substitution = extensions.substitution
+    ? {
+        families,
+        substitutions: substitutionEntries(snapshot, round),
+        substitutionDecision: snapshot.ext.decisions.find((row) => row.kind === "substitution" && row.scope === round)?.decision ?? null,
+        substitutionOptIn: snapshot.ext.requests.some((row) => {
+          const payload = JSON.parse(row.payload);
+          return row.kind === "collect" && payload.round === round && payload.substitution === "allow";
+        })
+      }
+    : {};
   return {
     runId: snapshot.run.id,
     round,
     closedAt: isoOrNull(roundRow.closed_at),
     quorum: roundRow.closed_at === null ? null : roundRow.quorum === 1,
     ...(layer >= 2 ? { quorumAt: isoOrNull(roundRow.quorum_at), cutoffAt: isoOrNull(roundRow.cutoff_at) } : {}),
-    validSeats: valid.length,
-    validFamilies: familyCount(valid.map((row) => seats.get(row.seat).family)),
+    validSeats: panel.filter((entry) => entry.valid).length,
+    validFamilies: families.length,
+    ...substitution,
     cleanupPending: snapshot.stops.some((stop) => stop.acknowledged_at === null && roundJobs.has(stop.job_id)),
-    memberTurns: charges.turn,
+    memberTurns: charges.turn + extIssued,
     repairs: charges.repair,
     retries: charges.retry,
     seats: seatRounds.map((row) => ({
@@ -1176,6 +1316,39 @@ export function roundObject(snapshot, round, { layer = 0 } = {}) {
         .map((attempt) => JSON.parse(attempt.force_reason))
     }))
   };
+}
+
+/** The model a Claude stand-in runs on: the `council-member` agent's model. */
+const STAND_IN_MODEL = "opus";
+
+/**
+ * The stand-ins and carries of a round (every round when `round` is null), in round and seat
+ * order: `{ seat, round, actor, kind, family: "claude", model, lens, state, reason, intentId,
+ * issuedAt }`, `state` being `issued` until the turn's finish gives its outcome.
+ */
+export function substitutionEntries(snapshot, round = null) {
+  const ext = snapshot.ext ?? { turns: [], events: [] };
+  const byTurn = eventsByTurn(ext.events);
+  const lens = new Map(snapshot.seats.map((row) => [row.seat, row.lens]));
+  return ext.turns
+    .filter((turn) => (turn.kind === "substitute" || turn.kind === "carry") && (round === null || turn.round === round))
+    .sort((a, b) => a.round - b.round || (a.seat < b.seat ? -1 : a.seat > b.seat ? 1 : 0))
+    .map((turn) => {
+      const { state, issue, finish } = turnState(turn, byTurn);
+      return {
+        seat: turn.seat,
+        round: turn.round,
+        actor: turnActor(turn),
+        kind: turn.kind,
+        family: "claude",
+        model: STAND_IN_MODEL,
+        lens: lens.get(turn.seat),
+        state,
+        reason: finish?.reason ?? null,
+        intentId: turn.id,
+        issuedAt: isoOrNull(issue?.at ?? null)
+      };
+    });
 }
 
 function closedText(object) {
@@ -1274,7 +1447,7 @@ async function startCouncil(options, repeated, ctx) {
       throw new CouncilRefusal(created.reason, `The council could not be created: ${created.reason}.`);
     }
     publishExport(runDir, "brief.md", briefSha256, () => readCouncil(store, runId)?.run.brief_sha256 ?? null);
-    const passed = await advance(runDir, { runId, round: 1, layer: ctx.layer, deadline, stateDir, once: true, openStore: () => store, ...ctx.advance });
+    const passed = await advance(runDir, { runId, round: 1, layer: ctx.layer, extensions: ctx.extensions, deadline, stateDir, once: true, openStore: () => store, ...ctx.advance });
     writeDiagnostics(ctx.io, passed.diagnostics, passed.notes);
     const cap = 2 * seats.length + 6;
     const seatText = seats.map((seat) => `${seat.seat} ${seat.family}/${seat.lens}`).join(", ");
@@ -1331,7 +1504,7 @@ async function closedResult(store, runId, round, { runDir, deadline, ctx, json, 
   await withdrawStaleNotices(store, runDir, deadline);
   const pendingLeft = await cleanupStops(store, runId, { deadline, cleanupDeadline, ctx });
   const snapshot = readCouncil(store, runId);
-  const object = { ...roundObject(snapshot, round, { layer: ctx.layer }), wake: "closed" };
+  const object = { ...roundObject(snapshot, round, { layer: ctx.layer, extensions: ctx.extensions }), wake: "closed" };
   object.cleanupPending = pendingLeft || object.cleanupPending;
   if (diagnostics.length > 0) {
     object.diagnostics = diagnostics;
@@ -1347,9 +1520,12 @@ async function collectCouncil(options, positionals, ctx) {
   const deadline = now() + budget;
   const runId = positionals[0];
   if (!runId || positionals.length > 1) {
-    throw new CouncilRefusal("invalid-arguments", "Usage: council collect <run-id> --round 1|2 [--budget-ms <ms>] [--json]");
+    throw new CouncilRefusal("invalid-arguments", "Usage: council collect <run-id> --round 1|2 [--disallow-substitute] [--budget-ms <ms>] [--json]");
   }
   const round = roundOption(options.round);
+  // A plain collect consents to Claude stand-ins; --disallow-substitute declines them.
+  const substitution = Boolean(ctx.extensions?.substitution);
+  const consent = options["disallow-substitute"] ? "disallow" : null;
   const stateDir = resolveStateDir(resolveCommandCwd(options));
   const store = await commandStore(stateDir, deadline);
   try {
@@ -1364,16 +1540,33 @@ async function collectCouncil(options, positionals, ctx) {
     if (roundRow.closed_at !== null) {
       return await closedResult(store, runId, round, { runDir: runDirOf(stateDir, runId), deadline, ctx, json: options.json });
     }
-    const outcome = await advance(runDirOf(stateDir, runId), { runId, round, layer: ctx.layer, deadline, stateDir, openStore: () => store, ...ctx.advance });
+    if (substitution && consent === null) {
+      await depositSubstitutionOptIn(store, { runId, round, deadline });
+    }
+    const outcome = await advance(runDirOf(stateDir, runId), { runId, round, layer: ctx.layer, extensions: ctx.extensions, consent, deadline, stateDir, openStore: () => store, ...ctx.advance });
     writeDiagnostics(ctx.io, outcome.diagnostics, outcome.notes);
     if (outcome.wake === "closed") {
       return await closedResult(store, runId, round, { runDir: runDirOf(stateDir, runId), deadline, ctx, json: options.json, diagnostics: outcome.diagnostics });
     }
     const wake = outcome.wake === "prompt" || outcome.wake === "notice" ? outcome.wake : "budget";
-    const payload = { runId, round, wake, deliveries: outcome.deliveries, ...(outcome.diagnostics.length > 0 ? { diagnostics: outcome.diagnostics } : {}) };
+    const standIns = substitution ? substitutionEntries(readCouncil(store, runId), round) : [];
+    const payload = {
+      runId,
+      round,
+      wake,
+      deliveries: outcome.deliveries,
+      ...(standIns.length > 0 ? { substitutions: standIns } : {}),
+      ...(outcome.diagnostics.length > 0 ? { diagnostics: outcome.diagnostics } : {})
+    };
     const prompts = outcome.deliveries.filter((delivery) => delivery.kind !== "notice");
     const fresh = prompts[prompts.length - 1];
-    const lines = [wake === "prompt" ? `Wake: a prompt for ${fresh.seat} is ready. Run council status.` : wake === "notice" ? "Wake: notice." : "Wake: budget. Run council collect again."];
+    const lines = [
+      wake === "prompt"
+        ? `Wake: a ${fresh.actor ? "stand-in " : ""}prompt for ${fresh.seat} is ready. Run council status.`
+        : wake === "notice"
+          ? "Wake: notice."
+          : "Wake: budget. Run council collect again."
+    ];
     for (const notice of outcome.deliveries.filter((delivery) => delivery.kind === "notice")) {
       lines.push(`Notice for ${notice.seat}: ${notice.text}`);
     }
@@ -1408,6 +1601,63 @@ function receiptVerdict(runDir, snapshot, attempt, bytes, layer) {
   return withReplacement(runDir, snapshot, attempt, { outcome: "invalid", errorsSha256, reason: "schema validation failed" }, layer);
 }
 
+// The receipt verdict of a stand-in's or carry's reply: its answer checked as that actor's (a
+// carry owns its Round 1 findings, a fresh Round 2 stand-in answers its alternate bundle and owns
+// none). An invalid reply has no repair: an extension turn settles once.
+function extensionReceiptVerdict(runDir, snapshot, turn, bytes) {
+  let answer;
+  try {
+    answer = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    answer = undefined;
+  }
+  const answerSha256 = installObject(runDir, bytes, "json");
+  const context = validationContext(runDir, snapshot, turn.seat, turn.round, { actor: turnActor(turn) });
+  const checked = answer === undefined ? { ok: false, errors: ["answer: not valid JSON"] } : validateAnswer(turn.round, answer, context);
+  if (checked.ok) {
+    return { outcome: "valid", answerSha256 };
+  }
+  return { outcome: "invalid", errorsSha256: installObject(runDir, `${JSON.stringify(checked.errors)}\n`, "json"), reason: "schema validation failed" };
+}
+
+// `council submit` for the intent of a Claude extension turn: the extension receipt, the round's
+// reduction and one executor pass. Prints the turn's state (`issued` until it is settled).
+async function submitExtension(store, turn, { runId, seat, intentId, bytes, runDir, stateDir, snapshot, deadline, ctx, json }) {
+  const verdict = extensionReceiptVerdict(runDir, snapshot, turn, bytes);
+  testPoint(POINTS.afterReplyValidation);
+  const receipt = await depositExtensionReceipt(store, { runId, seat, intentId, verdict, deadline });
+  const round = turn.round;
+  testPoint(POINTS.beforeReduce);
+  try {
+    await reduceRun(store, { runId, round, layer: ctx.layer, extensions: ctx.extensions, deadline });
+  } catch (error) {
+    if (receipt.ok && error instanceof StoreError) {
+      throw new CouncilRefusal("store-error", `The reply for intent ${intentId} was recorded, but the round could not be reduced: ${error.message}`);
+    }
+    throw error;
+  }
+  if (!receipt.ok) {
+    if (receipt.reason === "duplicate-receipt") {
+      throw new CouncilRefusal("duplicate-receipt", `A reply for intent ${intentId} was already recorded.`);
+    }
+    throw new CouncilRefusal("intent-not-open", `Intent ${intentId} is not open for ${seat}; nothing was recorded.`);
+  }
+  const passed = await advance(runDir, { runId, round, layer: ctx.layer, extensions: ctx.extensions, deadline, stateDir, once: true, openStore: () => store, ...ctx.advance });
+  writeDiagnostics(ctx.io, passed.diagnostics, passed.notes);
+  const after = readCouncil(store, runId);
+  const state = turnState(turn, eventsByTurn(after.ext.events)).state;
+  const actor = turnActor(turn);
+  const payload = { runId, round, seat, actor, intentId, state, deliveries: passed.deliveries };
+  const lines = [`Recorded the reply of the stand-in ${actor} for ${seat} in round ${round}: ${state}.`];
+  for (const delivery of passed.deliveries) {
+    if (delivery.kind === "notice") {
+      lines.push(`Notice for ${delivery.seat}: ${delivery.text}`);
+    }
+  }
+  emit(ctx.io, json, payload, lines.join("\n"));
+  return 0;
+}
+
 // `council submit <run-id> <seat> --intent <id> --file <answer.json>`: the receipt, then reduction.
 async function submitCouncil(options, positionals, ctx) {
   const deadline = performance.now() + BUDGET_MS.submit;
@@ -1431,6 +1681,11 @@ async function submitCouncil(options, positionals, ctx) {
     if (!snapshot) {
       throw new CouncilRefusal("unknown-run", unknownRunMessage(runId));
     }
+    // An extension intent goes to the extension receipt, also when its extension is now off.
+    const turn = snapshot.ext.turns.find((row) => row.id === intentId && row.kind !== "followup") ?? null;
+    if (turn) {
+      return await submitExtension(store, turn, { runId, seat, intentId, bytes, runDir, stateDir, snapshot, deadline, ctx, json: options.json });
+    }
     const attempt = snapshot.attempts.find((row) => row.id === intentId && row.seat === seat && row.kind === "prompt") ?? null;
     const verdict = receiptVerdict(runDir, snapshot, attempt, bytes, ctx.layer);
     testPoint(POINTS.afterReplyValidation);
@@ -1442,7 +1697,7 @@ async function submitCouncil(options, positionals, ctx) {
     if (round !== null) {
       testPoint(POINTS.beforeReduce);
       try {
-        await reduceRun(store, { runId, round, layer: ctx.layer, deadline });
+        await reduceRun(store, { runId, round, layer: ctx.layer, extensions: ctx.extensions, deadline });
       } catch (error) {
         if (receipt.ok && error instanceof StoreError) {
           throw new CouncilRefusal("store-error", `The reply for intent ${intentId} was recorded, but the round could not be reduced: ${error.message}`);
@@ -1456,7 +1711,7 @@ async function submitCouncil(options, positionals, ctx) {
       }
       throw new CouncilRefusal("intent-not-open", `Intent ${intentId} is not open for ${seat}; nothing was recorded.`);
     }
-    const passed = await advance(runDir, { runId, round, layer: ctx.layer, deadline, stateDir, once: true, openStore: () => store, ...ctx.advance });
+    const passed = await advance(runDir, { runId, round, layer: ctx.layer, extensions: ctx.extensions, deadline, stateDir, once: true, openStore: () => store, ...ctx.advance });
     writeDiagnostics(ctx.io, passed.diagnostics, passed.notes);
     const after = readCouncil(store, runId);
     const state = after.seatRounds.find((row) => row.round === round && row.seat === seat)?.state ?? null;
@@ -1513,8 +1768,6 @@ export async function crossExamine(runDir, deps) {
   if (round1.quorum !== 1 || snapshot.run.failed_at !== null) {
     throw refusalOf("no-quorum");
   }
-  const valid = snapshot.seatRounds.filter((row) => row.round === 1 && row.state === "valid");
-  const answers = Object.fromEntries(valid.map((row) => [row.seat, readJsonObject(runDir, row.answer_sha256)]));
   // A seat started without a model override still ran on some model: the name its job recorded
   // is scrubbed from the other seats' bundles too.
   const jobModels = (seat) =>
@@ -1522,32 +1775,45 @@ export async function crossExamine(runDir, deps) {
       .filter((row) => row.seat === seat && row.round === 1 && row.job_id)
       .map((row) => readJobView(store, row.job_id)?.row.model)
       .filter(Boolean);
-  const seatRows = snapshot.seats
-    .filter((row) => answers[row.seat])
-    .map((row) => ({ seat: row.seat, family: row.family, label: row.label, model: row.model, identities: jobModels(row.seat) }));
-  const { bundles, mapping } = buildBundles(seatRows, answers, { runId, ...(deps.random ? { random: deps.random } : {}) });
+  // The effective Round 1 panel: valid originals, and each Round 1 stand-in that answered validly
+  // under its actor key (`<seat>~r1`), which is carried into Round 2 for that seat.
+  const { panel, answers, rows: actorRows } = round1Actors(runDir, snapshot, jobModels);
+  const random = deps.random ? { random: deps.random } : {};
+  const { bundles, mapping } = buildBundles(actorRows, answers, { runId, ...random });
+  const ordinary = panel.filter((entry) => entry.kind === "original");
+  if (deps.extensions?.substitution && ordinary.length > 0) {
+    // Each ordinary Round 2 seat gets an independently shuffled alternate bundle: what a fresh
+    // Round 2 stand-in for that seat answers, without that seat's own Round 1 findings.
+    const alternates = buildBundles(actorRows, answers, { runId, ...random }).mapping;
+    mapping.$alternates = Object.fromEntries(ordinary.map((entry) => [actorKey(entry.seat, 2), alternates[entry.seat]]));
+  }
   const mapSha256 = installObject(runDir, `${JSON.stringify(mapping, null, 2)}\n`, "json");
   const briefText = readObject(runDir, snapshot.run.brief_sha256, "md").toString("utf8");
   const schemaText = fs.readFileSync(roundSchemaPath(2), "utf8");
   const lenses = new Map(snapshot.seats.map((row) => [row.seat, row.lens]));
-  const entries = valid.map((row) => {
-    const prompt = renderRound2Prompt({ brief: briefText, lens: lenses.get(row.seat), ownFindings: answers[row.seat].findings, bundle: bundles[row.seat], schemaText });
+  const promptOf = (entry) =>
+    renderRound2Prompt({ brief: briefText, lens: lenses.get(entry.seat), ownFindings: answers[entry.actor].findings, bundle: bundles[entry.actor], schemaText });
+  const entries = ordinary.map((entry) => {
+    const prompt = promptOf(entry);
     return {
-      seat: row.seat,
+      seat: entry.seat,
       attemptId: randomBytes(16).toString("hex"),
       promptSha256: installObject(runDir, prompt, "md"),
       retryPromptSha256: retryPromptOf(runDir, prompt, layer),
       mapSha256
     };
   });
-  const seeded = await startRound2(store, { runId, mapSha256, entries, layer, deadline });
+  const carries = panel
+    .filter((entry) => entry.kind === "substitute")
+    .map((entry) => ({ seat: entry.seat, turnId: randomBytes(16).toString("hex"), promptSha256: installObject(runDir, promptOf(entry), "md") }));
+  const seeded = await startRound2(store, { runId, mapSha256, entries, carries, layer, deadline });
   if (!seeded.ok) {
     throw refusalOf(seeded.reason);
   }
   testPoint(POINTS.afterSeed);
   testPoint(POINTS.beforeExport);
   publishExport(runDir, "private/anonymisation.json", mapSha256, () => committedMap(store, runId));
-  return advance(runDir, { runId, round: 2, layer, deadline, stateDir: deps.stateDir, once: true, openStore: () => store, ...deps.advance });
+  return advance(runDir, { runId, round: 2, layer, extensions: deps.extensions, deadline, stateDir: deps.stateDir, once: true, openStore: () => store, ...deps.advance });
 }
 
 function committedMap(store, runId) {
@@ -1564,7 +1830,7 @@ async function crossexamCouncil(options, positionals, ctx) {
   const stateDir = resolveStateDir(resolveCommandCwd(options));
   const store = await commandStore(stateDir, deadline);
   try {
-    const passed = await crossExamine(runDirOf(stateDir, runId), { store, stateDir, runId, layer: ctx.layer, deadline, random: ctx.random, advance: ctx.advance });
+    const passed = await crossExamine(runDirOf(stateDir, runId), { store, stateDir, runId, layer: ctx.layer, extensions: ctx.extensions, deadline, random: ctx.random, advance: ctx.advance });
     writeDiagnostics(ctx.io, passed.diagnostics, passed.notes);
     const seats = readCouncil(store, runId).seatRounds.filter((row) => row.round === 2).length;
     const payload = { runId, round: 2, seats, deliveries: passed.deliveries, ...(passed.diagnostics.length > 0 ? { diagnostics: passed.diagnostics } : {}) };
@@ -1575,23 +1841,48 @@ async function crossexamCouncil(options, positionals, ctx) {
   }
 }
 
-/** The merge input of a run from one snapshot: final valid seat rounds and their verified answers. */
+/**
+ * The merge input of a run from one snapshot: the effective panel's verified answers per logical
+ * seat and round (a valid original, else its valid stand-in or carry). A seat answered by a
+ * stand-in carries the stand-in's family (`claude`) for that round, no quorum family, and for a
+ * fresh Round 2 stand-in its actor key for the findings it adds; each responder's letter map
+ * names logical seats. `substitutions` lists every stand-in and carry of the run.
+ */
 export function mergeInput(runDir, snapshot) {
-  const answersOf = (round) =>
-    Object.fromEntries(
-      snapshot.seatRounds.filter((row) => row.round === round && row.state === "valid").map((row) => [row.seat, readJsonObject(runDir, row.answer_sha256)])
-    );
+  const panels = { 1: effectivePanel(snapshot, 1), 2: effectivePanel(snapshot, 2) };
+  const entryOf = (round, seat) => panels[round].find((entry) => entry.seat === seat && entry.valid) ?? null;
+  const answersOf = (round) => Object.fromEntries(panels[round].filter((entry) => entry.valid).map((entry) => [entry.seat, readJsonObject(runDir, entry.answerSha256)]));
   const round2 = snapshot.rounds.find((row) => row.round === 2);
+  const map = round2?.map_sha256 ? readJsonObject(runDir, round2.map_sha256) : {};
+  const logical = (actor) => String(actor).replace(/~r[12]$/, "");
+  const anonymisation = {};
+  for (const entry of panels[2].filter((item) => item.valid)) {
+    const letterMap = (entry.kind === "substitute" ? map.$alternates?.[entry.actor] : map[entry.actor]) ?? {};
+    anonymisation[entry.seat] = Object.fromEntries(Object.entries(letterMap).map(([letter, author]) => [letter, logical(author)]));
+  }
   const charges = snapshot.charges.total;
+  const standIns = substitutionEntries(snapshot);
   return {
     runId: snapshot.run.id,
     kind: snapshot.run.kind,
     options: JSON.parse(snapshot.run.options_json),
-    seats: snapshot.seats.map((row) => ({ seat: row.seat, family: row.family })),
+    seats: snapshot.seats.map((row) => {
+      const first = entryOf(1, row.seat);
+      const second = entryOf(2, row.seat);
+      const seat = { seat: row.seat, family: row.family };
+      if ((first && first.kind !== "original") || (second && second.kind !== "original")) {
+        seat.round1Family = first?.family ?? row.family;
+        seat.round2Family = second?.family ?? row.family;
+        seat.quorumFamily = second?.kind === "original" ? row.family : null;
+        seat.round2Key = second?.kind === "substitute" ? second.actor : null;
+      }
+      return seat;
+    }),
     round1: answersOf(1),
     round2: answersOf(2),
-    anonymisation: round2?.map_sha256 ? readJsonObject(runDir, round2.map_sha256) : {},
-    turns: { used: charges.turn, repairs: charges.repair, retries: charges.retry }
+    anonymisation,
+    turns: { used: charges.turn + (snapshot.ext?.issued.total ?? 0), repairs: charges.repair, retries: charges.retry },
+    ...(standIns.length > 0 ? { substitutions: standIns } : {})
   };
 }
 
@@ -1623,6 +1914,51 @@ function cellText(text) {
   return String(text ?? "").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
 }
 
+/**
+ * The inventory of a failed council: `{ runId, inputRev, outcome: "failed", families,
+ * substitutions, answers }`, with every accepted answer of every round (originals and stand-ins)
+ * in round, seat and actor order as `{ round, seat, actor, family, answerSha256, answer }`, and
+ * `families` the valid original families of the round that failed.
+ */
+export function failedInventory(runDir, snapshot) {
+  const failedRound = [...snapshot.rounds].filter((row) => row.closed_at !== null && row.quorum === 0).sort((a, b) => b.round - a.round)[0];
+  const answers = [];
+  for (const row of [...snapshot.rounds].sort((a, b) => a.round - b.round)) {
+    for (const entry of effectivePanel(snapshot, row.round)) {
+      const original = snapshot.seatRounds.find((item) => item.round === row.round && item.seat === entry.seat && item.state === "valid");
+      const accepted = [
+        ...(original ? [{ actor: entry.seat, family: snapshot.seats.find((seat) => seat.seat === entry.seat).family, sha256: original.answer_sha256 }] : []),
+        ...(entry.valid && entry.kind !== "original" ? [{ actor: entry.actor, family: entry.family, sha256: entry.answerSha256 }] : [])
+      ];
+      for (const item of accepted) {
+        answers.push({ round: row.round, seat: entry.seat, actor: item.actor, family: item.family, answerSha256: item.sha256, answer: readJsonObject(runDir, item.sha256) });
+      }
+    }
+  }
+  return {
+    runId: snapshot.run.id,
+    inputRev: snapshot.run.input_rev,
+    outcome: "failed",
+    families: failedRound ? quorumFamilies(effectivePanel(snapshot, failedRound.round), familySort) : [],
+    substitutions: substitutionEntries(snapshot),
+    answers
+  };
+}
+
+// The bytes of a failed inventory, and their digest.
+function inventoryBytes(runDir, snapshot) {
+  const text = `${JSON.stringify(failedInventory(runDir, snapshot), null, 2)}\n`;
+  return { text, sha256: createHash("sha256").update(text).digest("hex") };
+}
+
+// Publishes the failed inventory of the current snapshot as merge.json while the inventory of a
+// fresh snapshot still has the same digest; the successful merge pointer stays unset.
+function publishFailedInventory(store, runDir, runId) {
+  const { text } = inventoryBytes(runDir, readCouncil(store, runId));
+  const sha256 = installObject(runDir, text, "json");
+  return { sha256, published: publishExport(runDir, "merge.json", sha256, () => inventoryBytes(runDir, readCouncil(store, runId)).sha256) };
+}
+
 // `council merge <run-id>`: the scripted merge of the final valid answers, written once per input.
 async function mergeCouncilCommand(options, positionals, ctx) {
   const deadline = performance.now() + BUDGET_MS.submit;
@@ -1634,7 +1970,10 @@ async function mergeCouncilCommand(options, positionals, ctx) {
     const snapshot = requireRun(store, runId);
     const round2 = snapshot.rounds.find((row) => row.round === 2);
     if (snapshot.run.failed_at !== null) {
-      throw new CouncilRefusal("run-failed", "The council failed; run council report for the failed-council report.");
+      // A failed council publishes its inventory of answers, then reports the failed quorum.
+      publishFailedInventory(store, runDir, runId);
+      const failedRound = [...snapshot.rounds].filter((row) => row.closed_at !== null && row.quorum === 0).sort((a, b) => b.round - a.round)[0];
+      throw new CouncilRefusal("no-quorum", closedText(roundObject(snapshot, failedRound.round)));
     }
     if (!round2 || round2.closed_at === null || round2.quorum !== 1) {
       throw new CouncilRefusal("round-2-not-closed", "Round 2 has not closed with a quorum; run council collect --round 2 first.");
@@ -1770,7 +2109,17 @@ async function exportCouncil(options, positionals, ctx) {
   const store = await commandStore(stateDir, deadline);
   try {
     const spec = EXPORTS[name];
-    const digest = spec.digest(requireRun(store, runId));
+    const snapshot = requireRun(store, runId);
+    if (name === "merge" && snapshot.run.failed_at !== null) {
+      const { sha256, published } = publishFailedInventory(store, runDir, runId);
+      if (!published) {
+        throw new CouncilRefusal("stale-input", "The merge changed while it was exported; run council export again.");
+      }
+      const file = path.join(runDir, spec.file);
+      emit(ctx.io, options.json, { runId, name, file, sha256 }, file);
+      return 0;
+    }
+    const digest = spec.digest(snapshot);
     if (!digest) {
       throw new CouncilRefusal("not-committed", `Nothing to export: ${name} is not committed.`);
     }
@@ -1820,6 +2169,15 @@ export function checkObjects(runDir, snapshot) {
   for (const observation of snapshot.observations) {
     if (prompts.has(observation.attempt_id) && observation.answer_sha256) {
       required.push([observation.answer_sha256, "json"]);
+    }
+  }
+  // Extension turns: every prompt, and the answer of each valid Claude deposit.
+  for (const turn of snapshot.ext?.turns ?? []) {
+    required.push([turn.prompt_sha256, "md"]);
+  }
+  for (const event of snapshot.ext?.events ?? []) {
+    if (event.kind === "deposit" && event.code === "valid" && event.digest) {
+      required.push([event.digest, "json"]);
     }
   }
   if (snapshot.run.merge_sha256) {
@@ -1898,6 +2256,22 @@ export function nextAction(snapshot, { t, objects, runDir = "" }) {
   return result("done");
 }
 
+// The stand-in candidates of an open round that has no substitution decision yet:
+// `{ seat, state, reason, lens }` per original seat that ended the round without a valid answer.
+function standInCandidates(snapshot, round) {
+  const roundRow = snapshot.rounds.find((row) => row.round === round);
+  const decided = snapshot.ext.decisions.some((row) => row.kind === "substitution" && row.scope === round);
+  if (!roundRow || roundRow.closed_at !== null || decided) {
+    return [];
+  }
+  const seatRounds = snapshot.seatRounds.filter((row) => row.round === round);
+  const states = new Map(seatRounds.map((row) => [row.seat, row.state]));
+  return substitutionCandidates(seatRounds, states, snapshot.ext.turns.filter((turn) => turn.round === round)).map((seat) => {
+    const row = seatRounds.find((entry) => entry.seat === seat);
+    return { seat, state: row.state, reason: row.reason ?? null, lens: snapshot.seats.find((entry) => entry.seat === seat).lens };
+  });
+}
+
 const ACTION_TEXT = {
   damaged: (next) => `The council object ${next.damaged} is missing or damaged; this council cannot continue.`,
   collect: (next, runId) => `Next: run council collect ${runId} --round ${next.round}.`,
@@ -1927,15 +2301,25 @@ async function statusCouncil(options, positionals, ctx) {
       runId,
       action: next.action,
       round: next.round,
-      rounds: snapshot.rounds.map((row) => roundObject(snapshot, row.round, { layer: ctx.layer })),
+      rounds: snapshot.rounds.map((row) => roundObject(snapshot, row.round, { layer: ctx.layer, extensions: ctx.extensions })),
       deliveries: [...next.deliveries, ...notices],
       clusters: next.clusters,
       cleanupPending: snapshot.stops.some((stop) => stop.acknowledged_at === null),
       ...(next.damaged ? { damaged: next.damaged } : {})
     };
+    // While the open round waits for its stand-in decision, status names the seats a collect would
+    // ask a stand-in for.
+    const candidates = next.action === "collect" && ctx.extensions?.substitution ? standInCandidates(snapshot, next.round) : [];
+    if (candidates.length > 0) {
+      payload.substitutionCandidates = candidates;
+    }
     const lines = [`Council ${runId}: ${next.action}${next.round ? ` (round ${next.round})` : ""}.`];
     for (const delivery of next.deliveries) {
-      lines.push(`Prompt for ${delivery.seat}: ${delivery.promptFile} (intent ${delivery.intentId}, reply by ${delivery.deadline}).`);
+      const who = delivery.actor ? `${delivery.seat} (stand-in ${delivery.actor}, a fresh council-member agent unless it carries its own earlier answer)` : delivery.seat;
+      lines.push(`Prompt for ${who}: ${delivery.promptFile} (intent ${delivery.intentId}, reply by ${delivery.deadline}).`);
+    }
+    for (const candidate of candidates) {
+      lines.push(`Seat ${candidate.seat} ended round ${next.round} ${candidate.state} (${candidate.reason}); a collect asks a Claude stand-in for its lens.`);
     }
     for (const notice of notices) {
       lines.push(`Notice for ${notice.seat}: ${notice.text}`);
@@ -1985,6 +2369,10 @@ function seatTable(snapshot) {
       if (row && row.state !== "valid" && row.reason) {
         notes.push(`round ${round}: ${row.reason}`);
       }
+      for (const entry of substitutionEntries(snapshot, round).filter((item) => item.seat === seat.seat)) {
+        const kind = entry.kind === "carry" ? "carried substitute" : "substitute";
+        notes.push(`round ${round}: ${kind} (same family as leader) ${entry.actor}, ${entry.state}${entry.reason ? `, ${entry.reason}` : ""}`);
+      }
     }
     lines.push(
       `| ${seat.seat} | ${seat.family} | ${seat.model ?? "-"} | ${cellText(seat.lens)} | ${state(1)?.state ?? "-"} | ${state(2)?.state ?? "-"} | ${cellText(notes.join("; "))} |`
@@ -1995,7 +2383,7 @@ function seatTable(snapshot) {
 
 function runLine(snapshot) {
   const charges = snapshot.charges.total;
-  const used = charges.turn;
+  const used = charges.turn + (snapshot.ext?.issued.total ?? 0);
   return `Run ${snapshot.run.id} · ${snapshot.run.kind} · 2 rounds · member turns ${used} of ${snapshot.run.turn_cap} (repairs ${charges.repair}, retries ${charges.retry})`;
 }
 
@@ -2025,8 +2413,16 @@ function lateDeposits(snapshot) {
 /** The Markdown report of a failed council: seats, turns and every stored answer. */
 export function renderFailedReport(runDir, snapshot) {
   const lines = ["# Failed council", "", runLine(snapshot), "", ...seatTable(snapshot), "", notValidLine(snapshot), "", ...lateDeposits(snapshot), "", "## Answers", ""];
-  for (const row of snapshot.seatRounds.filter((entry) => entry.answer_sha256)) {
-    lines.push(`Round ${row.round}, ${row.seat}:`, "", "```json", readObject(runDir, row.answer_sha256, "json").toString("utf8").trim(), "```", "");
+  const answers = [
+    ...snapshot.seatRounds.filter((entry) => entry.answer_sha256).map((row) => ({ round: row.round, seat: row.seat, label: row.seat, sha256: row.answer_sha256, order: 0 })),
+    ...[1, 2].flatMap((round) =>
+      effectivePanel(snapshot, round)
+        .filter((entry) => entry.valid && entry.kind !== "original")
+        .map((entry) => ({ round, seat: entry.seat, label: `${entry.seat}, ${entry.kind === "carry" ? "carried substitute" : "substitute"} ${entry.actor}`, sha256: entry.answerSha256, order: 1 }))
+    )
+  ].sort((a, b) => a.round - b.round || (a.seat < b.seat ? -1 : a.seat > b.seat ? 1 : 0) || a.order - b.order);
+  for (const entry of answers) {
+    lines.push(`Round ${entry.round}, ${entry.label}:`, "", "```json", readObject(runDir, entry.sha256, "json").toString("utf8").trim(), "```", "");
   }
   return `${lines.join("\n").replace(/\n+$/, "")}\n`;
 }
@@ -2076,9 +2472,9 @@ export function renderCouncilReport(runDir, snapshot, merge) {
   lines.push("", "## Minority positions", "");
   const minority = [];
   if (merge.decision) {
-    const eligible = snapshot.seatRounds.filter((row) => row.round === 2 && row.state === "valid");
+    const eligible = effectivePanel(snapshot, 2).filter((entry) => entry.valid);
     for (const row of eligible) {
-      const stance = readJsonObject(runDir, row.answer_sha256).stance;
+      const stance = readJsonObject(runDir, row.answerSha256).stance;
       if (!merge.decision.choice || stance !== merge.decision.choice) {
         minority.push(`- ${row.seat}: ${stance ?? "no stance"}`);
       }
@@ -2154,7 +2550,7 @@ const SUBCOMMANDS = {
     run: (parsed, ctx) => startCouncil(parsed.options, parsed.repeated, ctx)
   },
   collect: {
-    args: { valueOptions: ["round", "budget-ms"] },
+    args: { valueOptions: ["round", "budget-ms"], booleanOptions: ["disallow-substitute"] },
     run: (parsed, ctx) => collectCouncil(parsed.options, parsed.positionals, ctx)
   },
   submit: {
@@ -2188,13 +2584,13 @@ const SUBCOMMANDS = {
 };
 
 /**
- * Runs one council subcommand. `layer` (default COUNCIL_LAYER) is read once and passed to every
- * state interface; `io`, `checkProviders`, `readRequester` and `advance` (options merged into
+ * Runs one council subcommand. `layer` (default COUNCIL_LAYER) and `extensions` (default
+ * COUNCIL_EXTENSIONS) are read once and passed to every state interface; `io`, `checkProviders`, `readRequester` and `advance` (options merged into
  * every advance call) replace the process's outputs and services in tests. Resolves to the exit
  * code: 0, or 1 for a refusal, printed as `{ error, message }` with --json and as its message on
  * standard error otherwise.
  */
-export async function handleCouncil(argv, { layer = COUNCIL_LAYER, io = nodeIo(), ...services } = {}) {
+export async function handleCouncil(argv, { layer = COUNCIL_LAYER, extensions = COUNCIL_EXTENSIONS, io = nodeIo(), ...services } = {}) {
   const [name, ...rest] = argv;
   const command = Object.hasOwn(SUBCOMMANDS, name ?? "") ? SUBCOMMANDS[name] : null;
   const json = rest.includes("--json");
@@ -2203,8 +2599,12 @@ export async function handleCouncil(argv, { layer = COUNCIL_LAYER, io = nodeIo()
     if (!command) {
       throw new CouncilRefusal("invalid-arguments", `Usage: council ${usage.replace(/^council /, "")}`);
     }
+    const separator = rest.indexOf("--");
+    if (name !== "collect" && (separator === -1 ? rest : rest.slice(0, separator)).includes("--disallow-substitute")) {
+      throw new CouncilRefusal("invalid-arguments", "--disallow-substitute is only valid on council collect.");
+    }
     const parsed = parseCouncilArgs(rest, { repeatable: [], ...command.args });
-    code = await command.run(parsed, { layer, io, ...services });
+    code = await command.run(parsed, { layer, extensions, io, ...services });
   } catch (error) {
     let refusal = error;
     if (!(error instanceof CouncilRefusal)) {

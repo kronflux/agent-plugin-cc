@@ -126,7 +126,7 @@ async function submit(fx, seat, intentId, text, name = "reply.json") {
 }
 
 function collect(fx, { round = 1, budgetMs = 6000, advance = {} } = {}) {
-  return council(["collect", fx.runId, "--round", String(round), "--budget-ms", String(budgetMs), "--json"], { cwd: fx.cwd, advance });
+  return council(["collect", fx.runId, "--round", String(round), "--disallow-substitute", "--budget-ms", String(budgetMs), "--json"], { cwd: fx.cwd, advance });
 }
 
 async function status(fx) {

@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 
 import { wallNow, withRetry } from "../store.mjs";
 import { reduceRound } from "./reduce.mjs";
+import { turnActor } from "./reduce-ext.mjs";
 
 /**
  * The collection layer this release ships: 0 is one attempt per seat, 1 adds repair, retry and
@@ -11,6 +12,14 @@ import { reduceRound } from "./reduce.mjs";
  * every state function as `layer`; no state function reads it.
  */
 export const COUNCIL_LAYER = 2;
+
+/**
+ * The council extensions this release ships: follow-up questions, a Claude stand-in for a seat
+ * that ended a round without a valid answer, and the agreed-panel challenge. Commands read the
+ * object once and pass it as `extensions`; a disabled extension takes no new request, while the
+ * reducer, the read projections and submit still settle extension work already committed.
+ */
+export const COUNCIL_EXTENSIONS = Object.freeze({ followups: false, substitution: true, challenge: false });
 
 /** How long a selected stop dispatch, or a foreign cancellation, may stay unsettled. */
 export const STOP_BOUND_MS = 120000;
@@ -306,6 +315,53 @@ function emptyCharges() {
   return { turn: 0, repair: 0, retry: 0 };
 }
 
+// The extension rows of a run: turns in creation order, their events, the decisions, the
+// requests, and the issued extension turns per round and in total (each issue is one charge).
+function readExtension(db, runId) {
+  const all = (sql) => db.prepare(sql).all(runId).map(plain);
+  const turns = all("SELECT * FROM council_ext_turns WHERE run_id = ? ORDER BY created_at, id");
+  const events = all(
+    `SELECT e.* FROM council_ext_events AS e JOIN council_ext_turns AS x ON x.id = e.turn_id
+     WHERE x.run_id = ? ORDER BY x.created_at, x.id, e.at, e.kind`
+  );
+  const issued = { total: 0, rounds: {} };
+  const roundOf = new Map(turns.map((turn) => [turn.id, turn.round]));
+  for (const event of events) {
+    if (event.kind !== "issue") {
+      continue;
+    }
+    issued.total += 1;
+    const round = roundOf.get(event.turn_id);
+    if (round !== null && round !== undefined) {
+      issued.rounds[round] = (issued.rounds[round] ?? 0) + 1;
+    }
+  }
+  return {
+    turns,
+    events,
+    decisions: all("SELECT * FROM council_ext_decisions WHERE run_id = ? ORDER BY kind, scope"),
+    requests: all("SELECT * FROM council_ext_requests WHERE run_id = ? ORDER BY at, id"),
+    issued
+  };
+}
+
+// The Round 1 answer digest of each Round 1 stand-in with a valid finish, by actor key (`s2~r1`):
+// the answers a Round 2 letter map names.
+function actorAnswers(ext) {
+  const answers = {};
+  for (const turn of ext.turns) {
+    if (turn.kind !== "substitute" || turn.round !== 1) {
+      continue;
+    }
+    const finish = ext.events.find((event) => event.turn_id === turn.id && event.kind === "finish");
+    const deposit = ext.events.find((event) => event.turn_id === turn.id && event.kind === "deposit");
+    if (finish?.code === "valid" && deposit?.digest) {
+      answers[turnActor(turn)] = deposit.digest;
+    }
+  }
+  return answers;
+}
+
 function readSnapshot(db, runId) {
   const run = plain(db.prepare("SELECT * FROM council_runs WHERE id = ?").get(runId));
   if (!run) {
@@ -322,11 +378,14 @@ function readSnapshot(db, runId) {
     charges.rounds[attempt.round][attempt.charge] += 1;
     charges.total[attempt.charge] += 1;
   }
+  const ext = readExtension(db, runId);
   return {
     run,
     rounds: all("SELECT * FROM council_rounds WHERE run_id = ? ORDER BY round"),
     seats: all("SELECT * FROM council_seats WHERE run_id = ? ORDER BY seat"),
     seatRounds: all("SELECT * FROM council_seat_rounds WHERE run_id = ? ORDER BY round, seat"),
+    ext,
+    actorAnswers: actorAnswers(ext),
     attempts,
     observations: all(
       `SELECT o.* FROM council_observations AS o JOIN council_attempts AS a ON a.id = o.attempt_id
@@ -693,8 +752,11 @@ function entriesMatch(entries, mapSha256, validSeats) {
  * promptSha256, retryPromptSha256, mapSha256 }`, exactly one per valid Round 1 seat. Resolves to
  * `{ ok: true }` or `{ ok: false, reason }` (`unknown-run`, `round-2-already-started`,
  * `round-1-not-closed`, `no-quorum`, `entries-mismatch`) with nothing written.
+ * `carries` are `{ seat, turnId, promptSha256 }`, exactly one per Round 1 stand-in whose answer
+ * was valid: after the ordinary seat rounds, each gets a `carry` turn issued at seeding with its
+ * own reply bound (a stand-in that answered Round 1 also answers Round 2 for that seat).
  */
-export async function startRound2(store, { runId, mapSha256, entries, layer = 0, deadline } = {}) {
+export async function startRound2(store, { runId, mapSha256, entries, carries = [], layer = 0, deadline } = {}) {
   void layer;
   return transact(store, deadline, (db) => {
     const run = plain(db.prepare("SELECT * FROM council_runs WHERE id = ?").get(runId));
@@ -727,6 +789,23 @@ export async function startRound2(store, { runId, mapSha256, entries, layer = 0,
     if (accepted.some((row) => row.family !== "claude" && row.job_id === null)) {
       return { ok: false, reason: "entries-mismatch" };
     }
+    // The Round 1 stand-ins whose answers were valid: each is carried, exactly once.
+    const carried = db
+      .prepare(
+        `SELECT x.seat AS seat FROM council_ext_turns AS x
+         JOIN council_ext_events AS f ON f.turn_id = x.id AND f.kind = 'finish' AND f.code = 'valid'
+         WHERE x.run_id = ? AND x.round = 1 AND x.kind = 'substitute' ORDER BY x.seat`
+      )
+      .all(runId)
+      .map((row) => row.seat);
+    const carrySeats = (carries ?? []).map((carry) => carry?.seat);
+    if (
+      carrySeats.length !== carried.length ||
+      carried.some((seat) => !carrySeats.includes(seat)) ||
+      (carries ?? []).some((carry) => typeof carry.turnId !== "string" || !ATTEMPT_ID.test(carry.turnId) || !isDigest(carry.promptSha256))
+    ) {
+      return { ok: false, reason: "entries-mismatch" };
+    }
     const { t } = sampleTimes(run.clock);
     db.prepare("INSERT INTO council_rounds (run_id, round, started_at, map_sha256) VALUES (?, 2, ?, ?)").run(runId, t, mapSha256);
     const bySeat = new Map(entries.map((entry) => [entry.seat, entry]));
@@ -756,6 +835,12 @@ export async function startRound2(store, { runId, mapSha256, entries, layer = 0,
         host ? t : null
       );
     }
+    for (const carry of carries ?? []) {
+      db.prepare(
+        "INSERT INTO council_ext_turns (id, run_id, seat, kind, round, created_at, issue_by, prompt_sha256) VALUES (?, ?, ?, 'carry', 2, ?, ?, ?)"
+      ).run(carry.turnId, runId, carry.seat, t, t + run.timeout_ms, carry.promptSha256);
+      db.prepare("INSERT INTO council_ext_events (turn_id, kind, at) VALUES (?, 'issue', ?)").run(carry.turnId, t);
+    }
     writeClock(db, runId, t);
     return { ok: true };
   });
@@ -781,8 +866,49 @@ LEFT JOIN thread_barriers AS b
   ON b.provider=j.provider AND b.thread_id=j.thread_id
 WHERE j.id=:exactJobId;`;
 
+// The extension part of the reducer's view of one round: the round's substitute and carry turns
+// and their events, the round's substitution decision, whether an opt-in request exists, the
+// member turns used by the run (issued core turns and extension issues) and its cap, and the
+// caller's options (`extensions`, `consent`, `prepared`, `freshTurnIds`).
+function readRoundExtension(db, run, round, { extensions = {}, consent = null, prepared = {}, freshTurnIds = [] } = {}) {
+  const turns = db.prepare("SELECT * FROM council_ext_turns WHERE run_id = ? AND round = ? ORDER BY created_at, id").all(run.id, round).map(plain);
+  const events = db
+    .prepare(
+      `SELECT e.* FROM council_ext_events AS e JOIN council_ext_turns AS x ON x.id = e.turn_id
+       WHERE x.run_id = ? AND x.round = ? ORDER BY x.created_at, x.id, e.at, e.kind`
+    )
+    .all(run.id, round)
+    .map(plain);
+  const decision = db.prepare("SELECT decision FROM council_ext_decisions WHERE run_id = ? AND kind = 'substitution' AND scope = ?").get(run.id, round)?.decision ?? null;
+  const optIn = Boolean(
+    db
+      .prepare(
+        `SELECT 1 FROM council_ext_requests WHERE run_id = ? AND kind = 'collect'
+           AND json_extract(payload, '$.round') = ? AND json_extract(payload, '$.substitution') = 'allow'`
+      )
+      .get(run.id, round)
+  );
+  const coreTurns = db.prepare("SELECT count(*) AS n FROM council_attempts WHERE run_id = ? AND charge = 'turn' AND issued_at IS NOT NULL").get(run.id).n;
+  const extIssues = db
+    .prepare("SELECT count(*) AS n FROM council_ext_events AS e JOIN council_ext_turns AS x ON x.id = e.turn_id WHERE x.run_id = ? AND e.kind = 'issue'")
+    .get(run.id).n;
+  return {
+    enabled: Boolean(extensions.substitution),
+    turns,
+    events,
+    decision,
+    optIn,
+    consent,
+    prepared,
+    freshTurnIds,
+    used: coreTurns + extIssues,
+    cap: run.turn_cap,
+    timeoutMs: run.timeout_ms
+  };
+}
+
 // The reducer's view of one round, read in the caller's transaction.
-function readRoundView(db, run, roundRow, freshIds) {
+function readRoundView(db, run, roundRow, freshIds, extOptions = {}) {
   const runId = run.id;
   const round = roundRow.round;
   const attempts = db.prepare("SELECT * FROM council_attempts WHERE run_id = ? AND round = ? ORDER BY seat, created_at, id").all(runId, round).map(plain);
@@ -823,8 +949,17 @@ function readRoundView(db, run, roundRow, freshIds) {
     stops,
     cancels,
     jobs,
-    freshIds
+    freshIds,
+    ext: readRoundExtension(db, run, round, extOptions)
   };
+}
+
+// Records the result of every collect request of a round that has none yet.
+function finalizeRequests(db, runId, round, result) {
+  db.prepare(
+    `UPDATE council_ext_requests SET result = ? WHERE run_id = ? AND kind = 'collect' AND result IS NULL
+       AND json_extract(payload, '$.round') = ?`
+  ).run(JSON.stringify(result), runId, round);
 }
 
 function applyWrite(db, view, write, t) {
@@ -893,13 +1028,34 @@ function applyWrite(db, view, write, t) {
         round
       );
       return;
-    case "close":
+    case "ext-finish":
+      db.prepare("INSERT INTO council_ext_events (turn_id, kind, at, code, reason) VALUES (?, 'finish', ?, ?, ?)").run(write.turnId, t, write.state, write.reason);
+      if (write.state === "valid") {
+        db.prepare("UPDATE council_runs SET input_rev = input_rev + 1 WHERE id = ?").run(runId);
+      }
+      return;
+    case "ext-decision": {
+      db.prepare("INSERT INTO council_ext_decisions (run_id, kind, scope, at, decision) VALUES (?, 'substitution', ?, ?, ?)").run(runId, write.round, t, write.decision);
+      finalizeRequests(db, runId, write.round, { decision: write.decision });
+      return;
+    }
+    case "ext-turn":
+      // A Claude turn is issued, and charged, with its admission.
+      db.prepare(
+        "INSERT INTO council_ext_turns (id, run_id, seat, kind, round, created_at, issue_by, prompt_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      ).run(write.turnId, runId, write.seat, write.kind, write.round, t, write.issueBy, write.promptSha256);
+      db.prepare("INSERT INTO council_ext_events (turn_id, kind, at) VALUES (?, 'issue', ?)").run(write.turnId, t);
+      return;
+    case "close": {
+      const decision = db.prepare("SELECT decision FROM council_ext_decisions WHERE run_id = ? AND kind = 'substitution' AND scope = ?").get(runId, round)?.decision ?? null;
+      finalizeRequests(db, runId, round, { decision });
       db.prepare("UPDATE council_rounds SET closed_at = ?, quorum = ? WHERE run_id = ? AND round = ?").run(t, write.quorum, runId, round);
       db.prepare("UPDATE council_runs SET input_rev = input_rev + 1 WHERE id = ?").run(runId);
       if (write.quorum === 0) {
         db.prepare("UPDATE council_runs SET failed_at = ? WHERE id = ? AND failed_at IS NULL").run(t, runId);
       }
       return;
+    }
     default:
       throw new TypeError(`Unknown council write: ${write.op}`);
   }
@@ -1026,14 +1182,14 @@ export async function recordReport(store, { runId, reportSha256, outcome, inputR
  * of `reduceRound` at a raw wall sample and the council time, or null for an unknown run or an
  * unstarted round. A collector skips the write transaction when `writes` is empty.
  */
-export function peekRound(store, { runId, round, layer = 0 }, opts = {}) {
+export function peekRound(store, { runId, round, layer = 0, extensions = {}, consent = null, prepared = {} }, opts = {}) {
   return store.read((db) => {
     const run = plain(db.prepare("SELECT * FROM council_runs WHERE id = ?").get(runId));
     const roundRow = run ? plain(db.prepare("SELECT * FROM council_rounds WHERE run_id = ? AND round = ?").get(runId, round)) : null;
     if (!roundRow) {
       return null;
     }
-    const view = readRoundView(db, run, roundRow, []);
+    const view = readRoundView(db, run, roundRow, [], { extensions, consent, prepared, freshTurnIds: [] });
     const { w, t } = sampleTimes(run.clock);
     return reduceRound(view, { w, t, layer });
   }, opts);
@@ -1045,10 +1201,15 @@ export function peekRound(store, { runId, round, layer = 0 }, opts = {}) {
  * Resolves to `{ ok: true, changed, closed }` (`changed` when any row other than the clock was
  * written, `closed` when the round is closed afterwards) or `{ ok: false, reason }` (`unknown-run`,
  * `round-not-started`).
+ * The extension rows run in the same transaction: X1 to X4 and S3 on the round's extension turns,
+ * then the substitution gate before B9. `extensions` is the shipped flags object; `consent` is
+ * `"disallow"` for a collect that declines stand-ins, else null; `prepared` maps a candidate seat
+ * to its installed stand-in prompt digest (a candidate without one holds the decision).
  */
-export async function reduceRun(store, { runId, round, layer = 0, deadline } = {}) {
+export async function reduceRun(store, { runId, round, layer = 0, extensions = {}, consent = null, prepared = {}, deadline } = {}) {
   const seatCount = 5;
   const freshIds = Array.from({ length: seatCount * 2 }, () => randomBytes(16).toString("hex"));
+  const freshTurnIds = Array.from({ length: seatCount }, () => randomBytes(16).toString("hex"));
   return transact(store, deadline, (db) => {
     const run = plain(db.prepare("SELECT * FROM council_runs WHERE id = ?").get(runId));
     if (!run) {
@@ -1058,7 +1219,7 @@ export async function reduceRun(store, { runId, round, layer = 0, deadline } = {
     if (!roundRow) {
       return { ok: false, reason: "round-not-started" };
     }
-    const view = readRoundView(db, run, roundRow, freshIds.slice(0, run.seat_count * 2));
+    const view = readRoundView(db, run, roundRow, freshIds.slice(0, run.seat_count * 2), { extensions, consent, prepared, freshTurnIds });
     const { w, t } = sampleTimes(run.clock);
     const { writes } = reduceRound(view, { w, t, layer });
     for (const write of writes) {

@@ -978,7 +978,8 @@ test("collect returns the stored close or a named wake", async (t) => {
     assert.deepEqual([closed.code, closed.stdout], [0, "Round 1 closed with quorum.\n"]);
     const closedJson = await council(["collect", "run-1", "--round", "1", "--json"], { cwd });
     assert.deepEqual(Object.keys(closedJson.json), [
-      "runId", "round", "closedAt", "quorum", "validSeats", "validFamilies", "cleanupPending", "memberTurns", "repairs", "retries", "seats", "wake"
+      "runId", "round", "closedAt", "quorum", "validSeats", "validFamilies", "families", "substitutions", "substitutionDecision", "substitutionOptIn",
+      "cleanupPending", "memberTurns", "repairs", "retries", "seats", "wake"
     ]);
     assert.deepEqual([closedJson.json.wake, closedJson.json.quorum, closedJson.json.validSeats, closedJson.json.memberTurns], ["closed", true, 3, 3]);
   }
@@ -996,7 +997,7 @@ test("collect returns the stored close or a named wake", async (t) => {
     // stop stays selectable, and a fake E18 that never selects it keeps the stop pending.
     setJob(store, job2, { end_state: "completed", end_at: EPOCH + 1011, result_json: answerText() });
     const time = fakeTime();
-    const closed = await council(["collect", "run-1", "--round", "1", "--budget-ms", "50", "--json"], {
+    const closed = await council(["collect", "run-1", "--round", "1", "--disallow-substitute", "--budget-ms", "50", "--json"], {
       cwd,
       advance: { now: time.now, sleep: time.sleep, requestStop: () => ({ selection: [] }) }
     });
@@ -1006,7 +1007,7 @@ test("collect returns the stored close or a named wake", async (t) => {
     assert.equal(closed.json.quorum, false);
     // The cleanup ended at the 50 ms command deadline, not after a fresh 30 seconds.
     assert.ok(time.state.sleeps.reduce((a, b) => a + b, 0) <= 50);
-    const text = await council(["collect", "run-1", "--round", "1", "--budget-ms", "50"], {
+    const text = await council(["collect", "run-1", "--round", "1", "--disallow-substitute", "--budget-ms", "50"], {
       cwd,
       advance: { now: time.now, sleep: time.sleep, requestStop: () => ({ selection: [] }) }
     });
@@ -1040,14 +1041,14 @@ test("collect returns the closed round with a usage read still held", async (t) 
   const files = makeTempDir(t);
   const [started, release, ack] = ["started", "release", "ack"].map((name) => path.join(files, name));
   const env = { ...process.env, COUNCIL_CHILD_USAGE: "hold", COUNCIL_CHILD_STARTED_FILE: started, COUNCIL_CHILD_RELEASE_FILE: release, COUNCIL_CHILD_ACK_FILE: ack };
-  const collectorA = spawn(process.execPath, [CHILD, "0", "collect", "run-1", "--round", "1", "--json", "--cwd", cwd], { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  const collectorA = spawn(process.execPath, [CHILD, "0", "collect", "run-1", "--round", "1", "--disallow-substitute", "--json", "--cwd", cwd], { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
   t.after(() => stopOwnedProcess(collectorA));
   let outputA = "";
   collectorA.stdout.setEncoding("utf8").on("data", (chunk) => {
     outputA += chunk;
   });
   await waitUntil(() => fs.existsSync(started), { timeoutMs: 30000, describe: "collector A started its usage read" });
-  const collectorB = childRun(["collect", "run-1", "--round", "1", "--json", "--cwd", cwd], { cwd, env: { ...process.env, COUNCIL_CHILD_USAGE: "answer" } });
+  const collectorB = childRun(["collect", "run-1", "--round", "1", "--disallow-substitute", "--json", "--cwd", cwd], { cwd, env: { ...process.env, COUNCIL_CHILD_USAGE: "answer" } });
   assert.equal(collectorB.status, 0, collectorB.stderr);
   assert.equal(JSON.parse(collectorB.stdout).wake, "closed");
   // A prints the closed result while its read is still held.
@@ -1122,7 +1123,7 @@ test("a silent Claude seat with provider deadlines", async (t) => {
     clock.set(Math.min(clock.now() + ms, 5000));
     return time.sleep(ms);
   };
-  const result = await council(["collect", "run-1", "--round", "1", "--json"], { cwd, advance: { buildJob, launch, now: time.now, sleep } });
+  const result = await council(["collect", "run-1", "--round", "1", "--disallow-substitute", "--json"], { cwd, advance: { buildJob, launch, now: time.now, sleep } });
   assert.equal(result.json.wake, "closed");
   assert.deepEqual(seatState(store, "s1"), ["timed-out", "reply deadline expired"]);
   assert.deepEqual(seatState(store, "s2"), ["valid", null]);
@@ -1375,7 +1376,8 @@ function round2Answers(runDir, snapshot, respond = () => null) {
     return JSON.parse(fs.readFileSync(path.join(runDir, "objects", `${row.answer_sha256}.json`), "utf8"));
   };
   const answers = {};
-  for (const seat of Object.keys(mapping)) {
+  // `$alternates` holds the letter maps of possible Round 2 stand-ins, not a seat.
+  for (const seat of Object.keys(mapping).filter((key) => !key.startsWith("$"))) {
     const responses = [];
     for (const letter of Object.keys(mapping[seat]).sort()) {
       for (const own of answerOf(mapping[seat][letter]).findings) {
@@ -1668,7 +1670,7 @@ test("a council without quorum renders Failed council from stored answers", asyn
   clock.set(100);
   await receive(store, "run-1", "s1", seats[0].attemptId, { outcome: "valid", answerSha256: installObject(runDir("run-1"), JSON.stringify(answer), "json") });
   clock.set(1000);
-  const closed = await council(["collect", "run-1", "--round", "1"], { cwd });
+  const closed = await council(["collect", "run-1", "--round", "1", "--disallow-substitute"], { cwd });
   assert.deepEqual([closed.code, closed.stdout], [1, "No quorum: 1 valid seats from 1 families. A council needs two valid seats from two families.\n"]);
   assert.equal((await council(["status", "run-1", "--json"], { cwd })).json.action, "report-failure");
   const report = await council(["report", "run-1"], { cwd });
@@ -1719,7 +1721,8 @@ test("the council loop from start to done", async (t) => {
       for (const delivery of status.json.deliveries.filter((entry) => !delivered.has(entry.intentId))) {
         delivered.add(delivery.intentId);
         const snapshot = readCouncil(store, runId);
-        const round = snapshot.attempts.find((row) => row.id === delivery.intentId).round;
+        // A stand-in's delivery names its round; a seat's prompt is one of its attempts.
+        const round = delivery.round ?? snapshot.attempts.find((row) => row.id === delivery.intentId).round;
         const answer = round === 1 ? round1Answer() : failRound2 ? { schema: 1 } : round2Answers(runDirOfRun(runId), snapshot)[delivery.seat];
         const reply = path.join(cwd, `reply-${delivery.intentId}.json`);
         fs.writeFileSync(reply, JSON.stringify(answer));
@@ -1749,5 +1752,6 @@ test("the council loop from start to done", async (t) => {
   const passing = await loop({ failRound2: false });
   assert.deepEqual(passing, ["collect", "crossexam", "collect", "merge", "verify", "report", "done"]);
   const failing = await loop({ failRound2: true });
-  assert.deepEqual(failing, ["collect", "crossexam", "collect", "report-failure", "done"]);
+  // Round 2's failed seats get Claude stand-ins (whose invalid answers settle once): one more collect.
+  assert.deepEqual(failing, ["collect", "crossexam", "collect", "collect", "report-failure", "done"]);
 });

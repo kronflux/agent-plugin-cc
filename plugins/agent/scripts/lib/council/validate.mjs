@@ -310,8 +310,12 @@ function readJsonObject(readObject, runDir, sha256) {
  * snapshot `view` (readCouncil) and their verified objects only: `{ schema, kind, options,
  * bundleRefs, ownFindingIds }`. Round 2 reads the seat's accepted Round 1 answer, the committed
  * map and the other lettered seats' Round 1 answers, each through the digest-checked reader.
+ * `actor` names the answering actor when it is not the seat's original: a carried Round 1
+ * stand-in (`<seat>~r1`) owns its Round 1 findings and its primary map entry; a fresh Round 2
+ * stand-in (`<seat>~r2`) owns no findings and answers the bundle of its `$alternates` entry. A
+ * map value with `~` names a stand-in author, whose answer is `view.actorAnswers[actor]`.
  */
-export function validationContext(runDir, view, seat, round, { readObject = readStoredObject } = {}) {
+export function validationContext(runDir, view, seat, round, { readObject = readStoredObject, actor = seat } = {}) {
   const kind = view.run.kind;
   const options = JSON.parse(view.run.options_json ?? "[]");
   if (round === 1) {
@@ -319,17 +323,23 @@ export function validationContext(runDir, view, seat, round, { readObject = read
   }
   const round1 = new Map(view.seatRounds.filter((row) => row.round === 1).map((row) => [row.seat, row]));
   const answerOf = (name) => {
+    if (name.includes("~")) {
+      const digest = view.actorAnswers?.[name];
+      return digest ? readJsonObject(readObject, runDir, digest) : null;
+    }
     const row = round1.get(name);
     return row?.state === "valid" && row.answer_sha256 ? readJsonObject(readObject, runDir, row.answer_sha256) : null;
   };
-  const own = answerOf(seat);
+  const fresh = actor !== seat && actor.endsWith("~r2");
+  const own = fresh ? null : answerOf(actor);
   const ownFindingIds = (own?.findings ?? []).map((finding) => finding.id);
   const round2 = view.rounds.find((row) => row.round === 2);
   const mapping = round2?.map_sha256 ? readJsonObject(readObject, runDir, round2.map_sha256) : {};
-  const letters = Object.keys(mapping[seat] ?? {}).sort();
+  const letterMap = (fresh ? mapping.$alternates?.[actor] : mapping[actor]) ?? {};
+  const letters = Object.keys(letterMap).sort();
   const bundleRefs = [];
   for (const letter of letters) {
-    const author = answerOf(mapping[seat][letter]);
+    const author = answerOf(letterMap[letter]);
     for (const finding of author?.findings ?? []) {
       bundleRefs.push(`${letter}-${finding.id}`);
     }

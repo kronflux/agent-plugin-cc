@@ -33,16 +33,25 @@ export function sortedTally(tally) {
   return Object.entries(tally).sort((a, b) => b[1] - a[1] || compareText(a[0], b[0]));
 }
 
+// The family that authored a seat's answer in a round: a stand-in's family when one answered.
+function authorFamily(entry, round) {
+  return (round === 1 ? entry.round1Family : entry.round2Family) ?? entry.family;
+}
+
 function collectFindings(seats, round1, round2) {
   const findings = new Map();
-  seats.forEach(({ seat, family }, seatIndex) => {
+  seats.forEach((entry, seatIndex) => {
+    const { seat } = entry;
     const first = round1[seat];
     if (!first) {
       return;
     }
-    const own = [...first.findings, ...(round2[seat]?.added ?? [])];
-    own.forEach((item, index) => {
-      const id = `${seat}-${item.id}`;
+    const own = [
+      ...first.findings.map((item) => ({ item, key: seat, family: authorFamily(entry, 1) })),
+      ...(round2[seat]?.added ?? []).map((item) => ({ item, key: entry.round2Key ?? seat, family: authorFamily(entry, 2) }))
+    ];
+    own.forEach(({ item, key, family }, index) => {
+      const id = `${key}-${item.id}`;
       if (!findings.has(id)) {
         findings.set(id, { id, seat, family, position: [seatIndex, index], ...pick(item) });
       }
@@ -132,8 +141,13 @@ function decide(kind, options, eligible, round2) {
 
 // Inputs: seats in seat order ({ seat, family }); round1 and round2 map a seat to its valid
 // answer; anonymisation maps a responder to its letter map; turns is { used, repairs, retries }.
-export function mergeCouncil({ runId, kind, options = [], seats, round1 = {}, round2 = {}, anonymisation = {}, turns = {} }) {
-  const familyOf = new Map(seats.map(({ seat, family }) => [seat, family]));
+// A seat answered by a stand-in in a round adds `round1Family` / `round2Family` (the stand-in's
+// family, which authors, validates and challenges for it), `quorumFamily` (null when its Round 2
+// answer is a stand-in's) and `round2Key` (the actor key of a fresh Round 2 stand-in, which keys
+// the findings it adds). A response never validates a finding of its own logical seat.
+// `substitutions`, when not empty, is passed through to the output.
+export function mergeCouncil({ runId, kind, options = [], seats, round1 = {}, round2 = {}, anonymisation = {}, turns = {}, substitutions = [] }) {
+  const familyOf = new Map(seats.map((entry) => [entry.seat, authorFamily(entry, 2)]));
   const findings = collectFindings(seats, round1, round2);
   const eligible = seats.filter(({ seat }) => round1[seat] && round2[seat]);
 
@@ -169,7 +183,8 @@ export function mergeCouncil({ runId, kind, options = [], seats, round1 = {}, ro
   for (const { responder, target, entry } of responses) {
     const group = groups.get(find(target));
     const responderFamily = familyOf.get(responder);
-    if (entry.response === "validate" && findings.get(target).family !== responderFamily) {
+    const ownSeat = findings.get(target).seat === responder;
+    if (entry.response === "validate" && !ownSeat && findings.get(target).family !== responderFamily) {
       group.validatedBy.push(responderFamily);
     } else if (entry.response === "challenge") {
       group.challenges.push({ by: responderFamily, disputes: entry.disputes, reason: entry.reason });
@@ -223,7 +238,7 @@ export function mergeCouncil({ runId, kind, options = [], seats, round1 = {}, ro
     runId,
     quorum: {
       validSeats: eligible.length,
-      families: sortFamilies(eligible.map(({ family }) => family))
+      families: sortFamilies(eligible.map((entry) => (entry.quorumFamily === undefined ? entry.family : entry.quorumFamily)).filter((family) => family !== null))
     },
     decision: decide(kind, options, eligible, round2),
     clusters: clusters.map((entry) => entry.cluster),
@@ -232,12 +247,13 @@ export function mergeCouncil({ runId, kind, options = [], seats, round1 = {}, ro
       cap: 2 * seats.length + 6,
       repairs: turns.repairs ?? 0,
       retries: turns.retries ?? 0
-    }
+    },
+    ...(substitutions.length > 0 ? { substitutions } : {})
   };
 }
 
 const KEY_ORDER = {
-  merge: ["schema", "runId", "quorum", "decision", "clusters", "memberTurns"],
+  merge: ["schema", "runId", "quorum", "decision", "clusters", "memberTurns", "substitutions"],
   quorum: ["validSeats", "families"],
   decision: ["choice", "tally", "threshold", "confidence"],
   cluster: ["id", "severity", "severityRange", "label", "path", "line", "claim", "findings", "reportedBy", "validatedBy", "challenges"],

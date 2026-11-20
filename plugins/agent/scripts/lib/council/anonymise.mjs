@@ -97,6 +97,32 @@ export function buildBundles(seats, round1, { random = crypto.randomInt, runId =
   return { bundles, mapping };
 }
 
+/**
+ * The bundle of one recipient under a fixed letter map (`{ letter: author key }`): each author's
+ * Round 1 findings under its letter, in letter order, with every identity of the lettered authors
+ * (and `runId`) scrubbed. `seats` are the author rows as for buildBundles; `round1` maps an author
+ * key to its answer.
+ */
+export function bundleFromMap(seats, round1, letterMap, { runId = null } = {}) {
+  const rows = new Map(seats.map((seat) => [seatId(seat), seat]));
+  const letters = Object.keys(letterMap ?? {}).sort();
+  const identities = [runId, ...letters.flatMap((letter) => seatIdentities(rows.get(letterMap[letter]) ?? letterMap[letter]))];
+  const bundle = [];
+  for (const letter of letters) {
+    for (const item of round1[letterMap[letter]]?.findings ?? []) {
+      bundle.push({
+        ref: `${letter}-${item.id}`,
+        severity: item.severity,
+        claim: scrubIdentity(item.claim, identities),
+        path: scrubIdentity(item.path, identities),
+        line: item.line,
+        evidence: scrubIdentity(item.evidence, identities)
+      });
+    }
+  }
+  return bundle;
+}
+
 export function resolveRef(mapping, responder, ref) {
   const match = REF_PATTERN.exec(typeof ref === "string" ? ref : "");
   if (!match) {
