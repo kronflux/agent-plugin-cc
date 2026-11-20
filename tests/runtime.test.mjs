@@ -2,12 +2,15 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run, waitUntil } from "./helpers.mjs";
-import { resolveStateDir } from "../plugins/agent/scripts/lib/state.mjs";
+import { initGitRepo, makeCommittedRepo, makeTempDir, run, waitUntil } from "./helpers.mjs";
+import { markJobCancelled, resolveJobFile, resolveStateDir, writeJobFile } from "../plugins/agent/scripts/lib/state.mjs";
+import { readStoredJob } from "../plugins/agent/scripts/lib/job-control.mjs";
+import { cancelJob } from "../plugins/agent/scripts/codex-companion.mjs";
+import { runAppServerTurn } from "../plugins/agent/scripts/providers/codex/runtime.mjs";
 import { isProcessAlive } from "../plugins/agent/scripts/lib/process.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -422,6 +425,163 @@ test("task --resume-last resumes the latest persisted task thread", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
+});
+
+for (const value of ["0", "abc"]) {
+  test(`status --timeout-ms ${value} is rejected`, (t) => {
+    const repo = makeCommittedRepo(t);
+    // A running record without a pid stays active, so a wait that accepted the value would block.
+    writeJobFile(repo, "task-waiting", {
+      id: "task-waiting",
+      provider: "codex",
+      status: "running",
+      phase: "running",
+      jobClass: "task",
+      title: "Codex Task",
+      pid: null
+    });
+
+    const result = spawnSync(process.execPath, [SCRIPT, "status", "task-waiting", "--wait", "--timeout-ms", value], {
+      cwd: repo,
+      encoding: "utf8",
+      timeout: 10000,
+      windowsHide: true
+    });
+
+    assert.equal(result.error?.code ?? null, null, "status kept waiting");
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /--timeout-ms must be a positive number of milliseconds\./);
+  });
+}
+
+test("a Codex job cancelled after its worker recorded its pid starts no turn", { timeout: 60000 }, async (t) => {
+  const repo = makeCommittedRepo(t);
+  const binDir = makeTempDir(t);
+  installFakeCodex(binDir);
+  const id = "task-cancelled-starting";
+  const sessionId = "session-cancelled-starting";
+  writeJobFile(repo, id, {
+    id,
+    provider: "codex",
+    status: "queued",
+    phase: "queued",
+    jobClass: "task",
+    title: "Codex Task",
+    sessionId,
+    pid: null,
+    request: { cwd: repo, prompt: "do not run", write: false, resumeLast: false, jobId: id }
+  });
+  const jobFile = resolveJobFile(repo, id);
+  // A module loaded before the worker stops it right after it replaced the record with one that
+  // holds its pid, until the test has written the cancel marker.
+  const pauseDir = makeTempDir(t);
+  const pausedFile = path.join(pauseDir, "paused");
+  const resumeFile = path.join(pauseDir, "resume");
+  const preload = path.join(pauseDir, "pause-after-pid.mjs");
+  fs.writeFileSync(
+    preload,
+    [
+      `import fs from "node:fs";`,
+      `const jobFile = ${JSON.stringify(jobFile)};`,
+      "const rename = fs.renameSync;",
+      "let paused = false;",
+      "fs.renameSync = (from, to) => {",
+      "  rename(from, to);",
+      "  if (paused || String(to) !== jobFile) return;",
+      "  if (JSON.parse(fs.readFileSync(jobFile, 'utf8')).pid !== process.pid) return;",
+      "  paused = true;",
+      `  fs.writeFileSync(${JSON.stringify(pausedFile)}, "");`,
+      "  const deadline = Date.now() + 30000;",
+      `  while (!fs.existsSync(${JSON.stringify(resumeFile)}) && Date.now() < deadline) {`,
+      "    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);",
+      "  }",
+      "};"
+    ].join("\n")
+  );
+
+  const workerArgs = ["--import", pathToFileURL(preload).href, SCRIPT, "task-worker", "--cwd", repo, "--job-id", id];
+  const worker = spawn(process.execPath, workerArgs, {
+    cwd: repo,
+    env: { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: sessionId },
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true
+  });
+  let stderr = "";
+  worker.stderr.setEncoding("utf8");
+  worker.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const exitCode = new Promise((resolve) => worker.on("close", resolve));
+  t.after(() => {
+    if (worker.exitCode === null && worker.signalCode === null) {
+      worker.kill("SIGKILL");
+    }
+  });
+
+  await waitUntil(() => fs.existsSync(pausedFile), { timeoutMs: 20000, describe: "the worker to record its pid" });
+  markJobCancelled(repo, id);
+  fs.writeFileSync(resumeFile, "");
+
+  assert.equal(await exitCode, 0, stderr);
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  const fakeState = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : {};
+  assert.equal(fakeState.lastTurnStart, undefined);
+  assert.equal(readStoredJob(repo, id).status, "cancelled");
+});
+
+// Records a finished agy task job with a conversation id, written after every earlier record.
+async function writeNewerAgyTaskJob(repo, id) {
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  writeJobFile(repo, id, {
+    id,
+    provider: "agy",
+    status: "completed",
+    phase: "done",
+    title: "Agy Task",
+    jobClass: "task",
+    threadId: "agy-conversation-1",
+    summary: "agy work",
+    completedAt: new Date().toISOString()
+  });
+}
+
+test("task --resume-last ignores a finished agy job", async (t) => {
+  const repo = makeCommittedRepo(t);
+  const binDir = makeTempDir(t);
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir);
+  const firstRun = run("node", [SCRIPT, "task", "initial task"], { cwd: repo, env });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+  await writeNewerAgyTaskJob(repo, "task-agy-finished");
+
+  const resume = run("node", [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env });
+
+  assert.equal(resume.status, 0, resume.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
+  assert.equal(fakeState.lastTurnStart.prompt, "follow up");
+});
+
+test("task-resume-candidate offers only Codex jobs", async (t) => {
+  const repo = makeCommittedRepo(t);
+  writeJobFile(repo, "task-codex-finished", {
+    id: "task-codex-finished",
+    provider: "codex",
+    status: "completed",
+    phase: "done",
+    title: "Codex Task",
+    jobClass: "task",
+    threadId: "thr_codex",
+    summary: "codex work"
+  });
+  await writeNewerAgyTaskJob(repo, "task-agy-finished");
+
+  const result = run("node", [SCRIPT, "task-resume-candidate", "--json"], { cwd: repo });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.candidate?.id, "task-codex-finished");
+  assert.equal(payload.candidate?.threadId, "thr_codex");
 });
 
 test("task-resume-candidate returns the latest rescue thread from the current session", () => {
@@ -1550,6 +1710,106 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   assert.match(fs.readFileSync(logFile, "utf8"), /Cancelled by user/);
 });
 
+test("cancel keeps the output the worker recorded as it was stopped", async (t) => {
+  const repo = makeCommittedRepo(t);
+  const id = "task-partial";
+  const logFile = path.join(resolveStateDir(repo), "jobs", `${id}.log`);
+  writeJobFile(repo, id, {
+    id,
+    provider: "codex",
+    status: "running",
+    phase: "running",
+    title: "Codex Task",
+    jobClass: "task",
+    summary: "Investigate",
+    logFile,
+    startedAt: "2026-03-18T15:30:01.000Z"
+  });
+  fs.writeFileSync(logFile, "Starting Codex Task.\n", "utf8");
+  const existing = readStoredJob(repo, id);
+
+  // The worker writes its result between cancel's first read and the stop of its process.
+  await cancelJob(repo, existing, existing, {
+    terminate: () => {
+      writeJobFile(repo, id, { ...existing, result: { rawOutput: "partial answer" }, rendered: "partial answer\n" });
+      return [{ jobId: id, outcome: "terminated" }];
+    }
+  });
+
+  const result = run("node", [SCRIPT, "result", id], { cwd: repo });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /partial answer/);
+  assert.equal(readStoredJob(repo, id).status, "cancelled");
+});
+
+test("cancel keeps a result the worker records after cancel's last read", async (t) => {
+  const repo = makeCommittedRepo(t);
+  const id = "task-late-result";
+  const logFile = path.join(resolveStateDir(repo), "jobs", `${id}.log`);
+  writeJobFile(repo, id, {
+    id,
+    provider: "codex",
+    status: "running",
+    phase: "running",
+    title: "Codex Task",
+    jobClass: "task",
+    logFile
+  });
+  fs.writeFileSync(logFile, "Starting Codex Task.\n", "utf8");
+  const existing = readStoredJob(repo, id);
+
+  // The worker commits its result right after cancel reads the record.
+  let committed = false;
+  await cancelJob(repo, existing, existing, {
+    terminate: () => [{ jobId: id, outcome: "terminated" }],
+    readStoredJob: (root, jobId) => {
+      const record = readStoredJob(root, jobId);
+      if (!committed) {
+        committed = true;
+        writeJobFile(repo, id, { ...existing, result: { rawOutput: "late answer" }, rendered: "late answer\n" });
+      }
+      return record;
+    }
+  });
+
+  assert.equal(committed, true);
+  const stored = readStoredJob(repo, id);
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.rendered, "late answer\n");
+});
+
+test("cancel stops a worker that recorded its pid after the caller read the job", async (t) => {
+  const repo = makeCommittedRepo(t);
+  const id = "task-late-pid";
+  const logFile = path.join(resolveStateDir(repo), "jobs", `${id}.log`);
+  writeJobFile(repo, id, {
+    id,
+    provider: "codex",
+    status: "queued",
+    phase: "queued",
+    title: "Codex Task",
+    jobClass: "task",
+    pid: null,
+    logFile
+  });
+  fs.writeFileSync(logFile, "", "utf8");
+  const existing = readStoredJob(repo, id);
+  // The worker publishes its pid after the caller's read and before cancel writes its marker.
+  writeJobFile(repo, id, { ...existing, status: "running", phase: "starting", pid: 424242, processMarker: id });
+
+  const stopped = [];
+  await cancelJob(repo, existing, existing, {
+    terminate: (jobs) => {
+      stopped.push(...jobs);
+      return [{ jobId: id, outcome: "terminated" }];
+    }
+  });
+
+  assert.equal(stopped.length, 1);
+  assert.equal(stopped[0].pid, 424242);
+  assert.equal(stopped[0].processMarker, id);
+});
+
 test("cancel without a job id ignores active jobs from other Claude sessions", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
@@ -2045,59 +2305,226 @@ test("each command starts its own app server and stops it", async (t) => {
   }
 });
 
-test("status reports direct startup after a command ran", async (t) => {
-  const repo = makeTempDir();
-  const binDir = makeTempDir();
-  installFakeCodex(binDir);
-  const exited = new Set();
-  stopLeftoverProcesses(t, () => readAppServerPids(binDir), exited);
-  initGitRepo(repo);
-  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
-  run("git", ["add", "README.md"], { cwd: repo });
-  run("git", ["commit", "-m", "init"], { cwd: repo });
-  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
-
-  const review = run("node", [SCRIPT, "review"], {
-    cwd: repo,
-    env: buildEnv(binDir)
-  });
-  assert.equal(review.status, 0, review.stderr);
-  await waitForExit(readAppServerPids(binDir), exited, "the review's app server to exit");
-
-  const result = run("node", [SCRIPT, "status", "--json"], {
-    cwd: repo,
-    env: buildEnv(binDir)
-  });
-
-  assert.equal(result.status, 0, result.stderr);
-  const payload = JSON.parse(result.stdout);
-  assert.equal(payload.sessionRuntime.mode, "direct");
-  assert.equal(payload.sessionRuntime.endpoint, null);
-});
-
-test("setup and status honor --cwd for the session runtime", async (t) => {
-  const targetWorkspace = makeTempDir();
-  const invocationWorkspace = makeTempDir();
-  const binDir = makeTempDir();
+test("setup and status read the workspace named by --cwd", async (t) => {
+  const targetWorkspace = makeTempDir(t);
+  const invocationWorkspace = makeTempDir(t);
+  const binDir = makeTempDir(t);
   installFakeCodex(binDir);
   const exited = new Set();
   stopLeftoverProcesses(t, () => readAppServerPids(binDir), exited);
   const env = buildEnv(binDir);
-
-  const status = run("node", [SCRIPT, "status", "--cwd", targetWorkspace, "--json"], {
-    cwd: invocationWorkspace,
-    env
+  writeJobFile(targetWorkspace, "task-in-target", {
+    id: "task-in-target",
+    provider: "codex",
+    status: "completed",
+    phase: "done",
+    jobClass: "task",
+    title: "Codex Task",
+    summary: "target workspace job",
+    completedAt: new Date().toISOString()
   });
+
+  const status = run("node", [SCRIPT, "status", "--all", "--cwd", targetWorkspace, "--json"], { cwd: invocationWorkspace, env });
   assert.equal(status.status, 0, status.stderr);
-  assert.equal(JSON.parse(status.stdout).sessionRuntime.mode, "direct");
+  assert.match(status.stdout, /task-in-target/);
+  const localStatus = run("node", [SCRIPT, "status", "--all", "--json"], { cwd: invocationWorkspace, env });
+  assert.equal(localStatus.status, 0, localStatus.stderr);
+  assert.doesNotMatch(localStatus.stdout, /task-in-target/);
 
-  const setup = run("node", [SCRIPT, "setup", "--cwd", targetWorkspace, "--json"], {
+  const enable = run("node", [SCRIPT, "setup", "--cwd", targetWorkspace, "--enable-review-gate", "--json"], {
     cwd: invocationWorkspace,
     env
   });
-  assert.equal(setup.status, 0, setup.stderr);
-  const payload = JSON.parse(setup.stdout);
-  assert.equal(payload.sessionRuntime.mode, "direct");
-  assert.equal(payload.sessionRuntime.endpoint, null);
-  await waitForExit(readAppServerPids(binDir), exited, "the setup app server to exit");
+  assert.equal(enable.status, 0, enable.stderr);
+  assert.equal(JSON.parse(enable.stdout).reviewGateEnabled, true);
+  const localSetup = run("node", [SCRIPT, "setup", "--json"], { cwd: invocationWorkspace, env });
+  assert.equal(localSetup.status, 0, localSetup.stderr);
+  assert.equal(JSON.parse(localSetup.stdout).reviewGateEnabled, false);
+  await waitForExit(readAppServerPids(binDir), exited, "the setup app servers to exit");
+});
+
+// Runs a foreground task with a reasoning effort, which makes the companion read the model list,
+// and stops the companion after 20 s so a paging loop fails the test instead of hanging it.
+function runTaskWithEffort(t, behavior) {
+  const repo = makeCommittedRepo(t);
+  const binDir = makeTempDir(t);
+  installFakeCodex(binDir, behavior);
+  const exited = new Set();
+  stopLeftoverProcesses(t, () => readAppServerPids(binDir), exited);
+  const result = spawnSync(process.execPath, [SCRIPT, "task", "--effort", "high", "check the cache"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    encoding: "utf8",
+    timeout: 20000,
+    windowsHide: true
+  });
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  return { result, fakeState: JSON.parse(fs.readFileSync(statePath, "utf8")) };
+}
+
+test("a repeating model cursor does not loop", (t) => {
+  const { result, fakeState } = runTaskWithEffort(t, "model-list-repeat-cursor");
+
+  assert.equal(result.error?.code ?? null, null, "the model list kept paging");
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fakeState.modelListPages, 2);
+  assert.equal(fakeState.lastTurnStart.effort, "high");
+});
+
+test("an endless model cursor stops after 50 pages", (t) => {
+  const { result, fakeState } = runTaskWithEffort(t, "model-list-endless-cursor");
+
+  assert.equal(result.error?.code ?? null, null, "the model list kept paging");
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fakeState.modelListPages, 50);
+});
+
+test("a model list that is not an array skips the effort check", (t) => {
+  const { result, fakeState } = runTaskWithEffort(t, "model-list-not-array");
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fakeState.lastTurnStart.effort, "high");
+});
+
+test("an empty prompt contacts no app server", async (t) => {
+  const binDir = makeTempDir(t);
+  installFakeCodex(binDir);
+  const workspace = makeTempDir(t);
+  const savedPath = process.env.PATH;
+  process.env.PATH = buildEnv(binDir).PATH;
+  t.after(() => {
+    process.env.PATH = savedPath;
+  });
+
+  await assert.rejects(runAppServerTurn(workspace, { prompt: "  ", resumeThreadId: "thr-1" }), /A prompt is required/);
+  assert.deepEqual(readAppServerPids(binDir), []);
+});
+
+test("a foreign thread start is not counted as a subagent", (t) => {
+  const repo = makeCommittedRepo(t);
+  const binDir = makeTempDir(t);
+  installFakeCodex(binDir, "foreign-thread-start");
+
+  const result = run("node", [SCRIPT, "task", "--json", "check the cache"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.doesNotMatch(payload.rawOutput, /Answer from another session/);
+  const log = fs.readFileSync(readStoredJob(repo, payload.jobId).logFile, "utf8");
+  assert.doesNotMatch(log, /other-session|Answer from another session|turn_foreign/);
+});
+
+test("status prints no resume command for an ephemeral review thread", (t) => {
+  const repo = makeCommittedRepo(t);
+  const binDir = makeTempDir(t);
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir);
+  fs.writeFileSync(path.join(repo, "README.md"), "changed\n");
+
+  const review = run("node", [SCRIPT, "review", "--json"], { cwd: repo, env });
+  assert.equal(review.status, 0, review.stderr);
+  const [job] = readJobsState(resolveStateDir(repo)).jobs.filter((candidate) => candidate.jobClass === "review");
+  assert.ok(job?.threadId, "the review recorded no thread");
+  assert.equal(job.ephemeralThread, true);
+
+  const status = run("node", [SCRIPT, "status", job.id], { cwd: repo, env });
+  assert.equal(status.status, 0, status.stderr);
+  assert.doesNotMatch(status.stdout, /codex resume/);
+  const result = run("node", [SCRIPT, "result", job.id], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stdout, /codex resume/);
+});
+
+for (const [behavior, name] of [
+  ["exit-mid-turn", "a task whose app server dies mid-turn fails within 30 seconds"],
+  ["close-stdin-on-turn", "a task whose app server closes its input fails the job"]
+]) {
+  test(name, (t) => {
+    const repo = makeCommittedRepo(t);
+    const binDir = makeTempDir(t);
+    installFakeCodex(binDir, behavior);
+    const exited = new Set();
+    stopLeftoverProcesses(t, () => readAppServerPids(binDir), exited);
+
+    const result = spawnSync(process.execPath, [SCRIPT, "task", "check the cache"], {
+      cwd: repo,
+      env: buildEnv(binDir),
+      encoding: "utf8",
+      timeout: 30000,
+      windowsHide: true
+    });
+
+    assert.equal(result.error?.code ?? null, null, "the task did not end within 30 s");
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /app-server exited unexpectedly/);
+    assert.doesNotMatch(result.stderr, /Unhandled 'error' event/);
+    const [job] = readJobsState(resolveStateDir(repo)).jobs;
+    assert.equal(job.status, "failed");
+  });
+}
+
+test("a progress writer that throws on turn completion does not leave the turn waiting", { timeout: 30000 }, async (t) => {
+  const binDir = makeTempDir(t);
+  // The turn completes after the turn/start response, through the notification handler, and
+  // sends no final answer from which its end could be inferred.
+  installFakeCodex(binDir, "slow-task-no-final-phase");
+  const workspace = makeCommittedRepo(t);
+  const savedPath = process.env.PATH;
+  const savedIdle = process.env.CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS;
+  process.env.PATH = buildEnv(binDir).PATH;
+  // A turn left waiting ends through the idle limit, which this test must not reach.
+  process.env.CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS = "8000";
+  t.after(() => {
+    process.env.PATH = savedPath;
+    if (savedIdle === undefined) {
+      delete process.env.CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS;
+    } else {
+      process.env.CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS = savedIdle;
+    }
+  });
+
+  const started = Date.now();
+  const result = await runAppServerTurn(workspace, {
+    prompt: "check the cache",
+    onProgress: (event) => {
+      if (/^Turn (completed|failed|interrupted)/.test(String(event?.message ?? event))) {
+        throw new Error("Could not lock the job record.");
+      }
+    }
+  });
+
+  assert.ok(Date.now() - started < 6000, `the turn took ${Date.now() - started} ms to end`);
+  assert.doesNotMatch(String(result.error?.message ?? ""), /sent no events/);
+});
+
+test("a progress writer that throws during the turn fails the turn at once", { timeout: 30000 }, async (t) => {
+  const binDir = makeTempDir(t);
+  installFakeCodex(binDir, "slow-task-no-final-phase");
+  const workspace = makeCommittedRepo(t);
+  const savedPath = process.env.PATH;
+  const savedIdle = process.env.CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS;
+  process.env.PATH = buildEnv(binDir).PATH;
+  process.env.CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS = "8000";
+  t.after(() => {
+    process.env.PATH = savedPath;
+    if (savedIdle === undefined) {
+      delete process.env.CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS;
+    } else {
+      process.env.CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS = savedIdle;
+    }
+  });
+
+  const started = Date.now();
+  await assert.rejects(
+    runAppServerTurn(workspace, {
+      prompt: "check the cache",
+      onProgress: (event) => {
+        if (/^Turn started/.test(String(event?.message ?? event))) {
+          throw new Error("progress log is not writable");
+        }
+      }
+    }),
+    /progress log is not writable/
+  );
+  assert.ok(Date.now() - started < 6000, `the turn took ${Date.now() - started} ms to fail`);
 });

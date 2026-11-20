@@ -22,7 +22,7 @@ import {
   } from "./providers/codex/runtime.mjs";
 import { resolveClaudeSessionPath, stageClaudeSessionForImport } from "./providers/codex/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
-import { collectReviewContext, createWorktree, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { collectReviewContext, createWorktree, ensureGitRepository, removeWorktree, resolveReviewTarget } from "./lib/git.mjs";
 import { KNOWN_REASONING_EFFORTS } from "./providers/codex/model-catalog.mjs";
 import { binaryAvailable, isProcessAlive } from "./lib/process.mjs";
 import { codexProvider } from "./providers/codex/index.mjs";
@@ -43,6 +43,7 @@ import {
   writeJobMessageOutcome,
   setConfig,
   takeJobRequest,
+  upsertJob,
   writeJobFile
 } from "./lib/state.mjs";
 import {
@@ -301,10 +302,16 @@ function filterJobsForCurrentClaudeSession(jobs) {
   return jobs.filter((job) => job.sessionId === sessionId);
 }
 
+// Codex resumes only its own threads; a record without a provider is a Codex job.
+function isCodexJob(job) {
+  return (job.provider ?? codexProvider.id) === codexProvider.id;
+}
+
 function findLatestResumableTaskJob(jobs) {
   return (
     jobs.find(
       (job) =>
+        isCodexJob(job) &&
         job.jobClass === "task" &&
         job.threadId &&
         job.status !== "queued" &&
@@ -313,8 +320,20 @@ function findLatestResumableTaskJob(jobs) {
   );
 }
 
+// Reads a --timeout-ms value; a missing value gives the default wait.
+function parseWaitTimeout(value) {
+  if (value === undefined || value === null) {
+    return DEFAULT_STATUS_WAIT_TIMEOUT_MS;
+  }
+  const timeoutMs = Number(String(value).trim());
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("--timeout-ms must be a positive number of milliseconds.");
+  }
+  return timeoutMs;
+}
+
 async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
-  const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
+  const timeoutMs = parseWaitTimeout(options.timeoutMs);
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   const deadline = Date.now() + timeoutMs;
   await reconcileJobLiveness(cwd);
@@ -339,14 +358,18 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const sessionId = getCurrentClaudeSessionId();
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
-  const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
+  const activeTask = visibleJobs.find((job) => isCodexJob(job) && job.jobClass === "task" && isActiveJobStatus(job.status));
   if (activeTask) {
     throw new Error(`Task ${activeTask.id} is still running. Use /agent:status before continuing it.`);
   }
 
   const trackedTask = findLatestResumableTaskJob(visibleJobs);
   if (trackedTask) {
-    return { id: trackedTask.threadId };
+    return {
+      id: trackedTask.threadId,
+      worktreePath: trackedTask.worktreePath ?? null,
+      worktreeBranch: trackedTask.worktreeBranch ?? null
+    };
   }
 
   if (sessionId) {
@@ -461,7 +484,27 @@ async function executeReviewRun(request) {
 }
 
 
+// A worktree created for this run is removed when the run fails before Codex starts a thread in
+// it, because nothing was done there.
 async function executeTaskRun(request) {
+  let threadStarted = false;
+  const onProgress = (event) => {
+    if (event && typeof event === "object" && event.threadId) {
+      threadStarted = true;
+    }
+    request.onProgress?.(event);
+  };
+  try {
+    return await runTaskRequest({ ...request, onProgress });
+  } catch (error) {
+    if (request.newWorktree && request.worktreePath && !threadStarted) {
+      throw discardLaunchWorktree(resolveWorkspaceRoot(request.cwd), request, error);
+    }
+    throw error;
+  }
+}
+
+async function runTaskRequest(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
   ensureCodexAvailable(request.cwd);
 
@@ -471,6 +514,8 @@ async function executeTaskRun(request) {
   });
 
   let resumeThreadId = request.resumeThreadId ?? null;
+  let worktreePath = request.worktreePath ?? null;
+  let worktreeBranch = request.worktreeBranch ?? null;
   if (request.resumeLast) {
     const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
       excludeJobId: request.jobId
@@ -479,6 +524,11 @@ async function executeTaskRun(request) {
       throw new Error("No previous Codex task thread was found for this repository.");
     }
     resumeThreadId = latestThread.id;
+    // The resumed thread continues in the worktree its job ran in.
+    if (!worktreePath && latestThread.worktreePath) {
+      worktreePath = latestThread.worktreePath;
+      worktreeBranch = latestThread.worktreeBranch ?? null;
+    }
   }
 
   if (!request.prompt && !resumeThreadId) {
@@ -494,7 +544,7 @@ async function executeTaskRun(request) {
     sandbox: request.write ? getConfig(workspaceRoot).writeSandbox ?? "workspace-write" : "read-only",
     onProgress: request.onProgress,
     outputSchema: request.outputSchema ?? null,
-    threadCwd: request.worktreePath ?? null,
+    threadCwd: worktreePath,
     messageInbox: request.jobId
       ? {
           take: () => takeJobMessages(workspaceRoot, request.jobId),
@@ -517,14 +567,14 @@ async function executeTaskRun(request) {
       title: taskMetadata.title,
       jobId: request.jobId ?? null,
       write: Boolean(request.write),
-      worktreePath: request.worktreePath ?? null,
-      worktreeBranch: request.worktreeBranch ?? null
+      worktreePath,
+      worktreeBranch
     }
   );
   const payload = {
     status: result.status,
     jobId: request.jobId ?? null,
-    ...(request.worktreePath ? { worktreePath: request.worktreePath, worktreeBranch: request.worktreeBranch } : {}),
+    ...(worktreePath ? { worktreePath, worktreeBranch } : {}),
     threadId: result.threadId,
     rawOutput,
     ...(result.status !== 0 && failureMessage ? { failureMessage } : {}),
@@ -616,7 +666,21 @@ function attachWorktree(job) {
   return { ...job, worktreePath, worktreeBranch };
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, resumeThreadId = null, jobId, outputSchema = null, worktreePath = null, worktreeBranch = null }) {
+// Removes the worktree a failed launch created and returns the launch's error (null when there
+// is none), extended with the reason when the worktree cannot be removed.
+function discardLaunchWorktree(workspaceRoot, { worktreePath, worktreeBranch }, error) {
+  try {
+    removeWorktree(workspaceRoot, worktreePath, worktreeBranch);
+    return error;
+  } catch (cleanupError) {
+    const message = error == null ? "" : `${error instanceof Error ? error.message : String(error)} `;
+    return new Error(`${message}The worktree ${worktreePath} (branch ${worktreeBranch}) could not be removed: ${cleanupError.message}`);
+  }
+}
+
+// newWorktree marks a worktree created for this request, which a failed start removes; a
+// follow-up turn in an earlier job's worktree leaves it in place.
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, resumeThreadId = null, jobId, outputSchema = null, worktreePath = null, worktreeBranch = null, newWorktree = false }) {
   return {
     cwd,
     model,
@@ -628,7 +692,8 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, resum
     jobId,
     outputSchema,
     worktreePath,
-    worktreeBranch
+    worktreeBranch,
+    newWorktree: Boolean(worktreePath && newWorktree)
   };
 }
 
@@ -645,12 +710,13 @@ async function executeTransfer(cwd, options = {}) {
   const sourcePath = resolveClaudeSessionPath(cwd, {
     source: options.source
   });
-  const importSource = stageClaudeSessionForImport(sourcePath);
+  let importSource = null;
   let result;
   try {
+    importSource = stageClaudeSessionForImport(sourcePath);
     result = await importExternalAgentSession(cwd, { sourcePath: importSource.path });
   } finally {
-    importSource.cleanup();
+    importSource?.cleanup();
   }
   const payload = {
     threadId: result.threadId,
@@ -665,13 +731,13 @@ async function executeTransfer(cwd, options = {}) {
   };
 }
 
-function readTaskPrompt(cwd, options, positionals) {
+async function readTaskPrompt(cwd, options, positionals) {
   if (options["prompt-file"]) {
     return fs.readFileSync(path.resolve(cwd, options["prompt-file"]), "utf8");
   }
 
   const positionalPrompt = positionals.join(" ");
-  return positionalPrompt || readStdinIfPiped();
+  return positionalPrompt || (await readStdinIfPiped());
 }
 
 function requireTaskRequest(prompt, resumeLast) {
@@ -699,14 +765,18 @@ async function handleReviewCommand(argv, config) {
 
   config.validateRequest?.(target, focusText);
   const metadata = buildReviewJobMetadata(config.reviewName, target);
-  const job = createCompanionJob({
-    prefix: "review",
-    kind: metadata.kind,
-    title: metadata.title,
-    workspaceRoot,
-    jobClass: "review",
-    summary: metadata.summary
-  });
+  // Reviews run in single-use threads that Codex does not keep, so no resume command applies.
+  const job = {
+    ...createCompanionJob({
+      prefix: "review",
+      kind: metadata.kind,
+      title: metadata.title,
+      workspaceRoot,
+      jobClass: "review",
+      summary: metadata.summary
+    }),
+    ephemeralThread: true
+  };
   await runForegroundCommand(
     job,
     (progress) =>
@@ -807,16 +877,33 @@ function renderSendResult(result, label) {
 
 // Another provider's follow-up turn is started by that provider's companion as a new
 // background task on the same thread.
-function startTurnWithProviderCompanion(cwd, provider, job, text) {
-  const result = spawnSync(
+export function startTurnWithProviderCompanion(cwd, provider, job, text, deps = { spawnSyncImpl: spawnSync }) {
+  const spawnSyncImpl = deps.spawnSyncImpl ?? spawnSync;
+  const label = provider.label;
+  const result = spawnSyncImpl(
     process.execPath,
     [provider.companionScript, "task", "--background", "--json", "--cwd", cwd, "--resume-thread", job.threadId, ...(job.write ? ["--write"] : []), "--", text],
-    { cwd, env: process.env, encoding: "utf8", windowsHide: true }
+    { cwd, env: process.env, encoding: "utf8", windowsHide: true, timeout: DEFAULT_SEND_TIMEOUT_MS }
   );
-  if (result.status !== 0) {
-    throw new Error(String(result.stderr || result.error?.message || `${provider.label} could not start the turn.`).trim());
+  if (result.error?.code === "ETIMEDOUT" || result.signal) {
+    throw new Error(`${label} did not start the turn within ${Math.round(DEFAULT_SEND_TIMEOUT_MS / 1000)} s.`);
   }
-  const newJobId = JSON.parse(result.stdout).jobId;
+  if (result.error) {
+    throw new Error(`${label} could not start the turn: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    throw new Error(String(result.stderr || `${label} could not start the turn.`).trim());
+  }
+  let launched;
+  try {
+    launched = JSON.parse(result.stdout);
+  } catch {
+    throw new Error(`${label} started the turn but printed output that is not JSON: ${firstMeaningfulLine(result.stdout, "")}`);
+  }
+  const newJobId = launched?.jobId;
+  if (typeof newJobId !== "string" || !newJobId.trim()) {
+    throw new Error(`${label} printed no job id for the new turn.`);
+  }
   return { status: "started", jobId: job.id, newJobId, threadId: job.threadId };
 }
 
@@ -830,14 +917,17 @@ function startTurnOnFinishedJob(cwd, workspaceRoot, job, text) {
   }
   ensureCodexAvailable(cwd);
   const write = Boolean(job.write);
-  const newJob = buildTaskJob(workspaceRoot, buildTaskRunMetadata({ prompt: text, resumeLast: true }), write);
+  // The new turn runs in the worktree of the job it continues.
+  const worktree = job.worktreePath ? { worktreePath: job.worktreePath, worktreeBranch: job.worktreeBranch ?? null } : {};
+  const newJob = { ...buildTaskJob(workspaceRoot, buildTaskRunMetadata({ prompt: text, resumeLast: true }), write), ...worktree };
   const request = buildTaskRequest({
     cwd,
     prompt: text,
     write,
     resumeLast: false,
     resumeThreadId: job.threadId,
-    jobId: newJob.id
+    jobId: newJob.id,
+    ...worktree
   });
   enqueueBackgroundTask(cwd, newJob, request, { workerScript: COMPANION_SCRIPT });
   return { status: "started", jobId: job.id, newJobId: newJob.id, threadId: job.threadId };
@@ -894,14 +984,11 @@ async function handleSend(argv) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const [reference, ...words] = positionals.filter((value, index) => !(index === 1 && value === "--"));
-  const text = words.join(" ").trim() || readStdinIfPiped().trim();
+  const text = words.join(" ").trim() || (await readStdinIfPiped()).trim();
   if (!reference || !text) {
     throw new Error("Provide a job id and a message: send <job-id> <message>.");
   }
-  const timeoutMs = options["timeout-ms"] === undefined ? DEFAULT_SEND_TIMEOUT_MS : Number(options["timeout-ms"]);
-  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
-    throw new Error("--timeout-ms must be a number of milliseconds.");
-  }
+  const timeoutMs = options["timeout-ms"] === undefined ? DEFAULT_SEND_TIMEOUT_MS : parseWaitTimeout(options["timeout-ms"]);
 
   await reconcileJobLiveness(cwd);
   const job = listJobs(workspaceRoot).find((candidate) => candidate.id === reference);
@@ -973,7 +1060,8 @@ function readTaskManifest(cwd, file) {
 
 // Starts one background task per manifest entry. Command-line --model, --effort, --write, and
 // --worktree apply to entries that do not set them.
-function launchManifestTasks(cwd, workspaceRoot, options, positionals, defaults) {
+export function launchManifestTasks(cwd, workspaceRoot, options, positionals, defaults, deps = { enqueue: enqueueBackgroundTask }) {
+  const enqueue = deps.enqueue ?? enqueueBackgroundTask;
   const conflicting = ["prompt-file", "resume-last", "resume", "resume-thread", "fresh", "from-last-review", "output-schema"].filter(
     (name) => options[name] !== undefined && options[name] !== false
   );
@@ -988,11 +1076,12 @@ function launchManifestTasks(cwd, workspaceRoot, options, positionals, defaults)
   const launched = [];
   const failed = [];
   for (const entry of entries) {
+    let job = null;
     try {
       const write = entry.write ?? Boolean(options.write);
       const metadata = { ...buildTaskRunMetadata({ prompt: entry.prompt }), title: `Codex Task: ${entry.label}` };
       const baseJob = buildTaskJob(workspaceRoot, metadata, write);
-      const job = entry.worktree ?? options.worktree ? attachWorktree(baseJob) : baseJob;
+      job = entry.worktree ?? options.worktree ? attachWorktree(baseJob) : baseJob;
       const request = buildTaskRequest({
         cwd,
         model: entry.model ?? defaults.model,
@@ -1002,11 +1091,13 @@ function launchManifestTasks(cwd, workspaceRoot, options, positionals, defaults)
         resumeLast: false,
         jobId: job.id,
         worktreePath: job.worktreePath ?? null,
-        worktreeBranch: job.worktreeBranch ?? null
+        worktreeBranch: job.worktreeBranch ?? null,
+        newWorktree: true
       });
-      enqueueBackgroundTask(cwd, job, request, { workerScript: COMPANION_SCRIPT });
+      enqueue(cwd, job, request, { workerScript: COMPANION_SCRIPT });
       launched.push({ label: entry.label, jobId: job.id, ...(job.worktreePath ? { worktreePath: job.worktreePath } : {}) });
-    } catch (error) {
+    } catch (caught) {
+      const error = job?.worktreePath ? discardLaunchWorktree(workspaceRoot, job, caught) : caught;
       failed.push({ label: entry.label, error: error instanceof Error ? error.message : String(error) });
     }
   }
@@ -1043,7 +1134,7 @@ async function handleTask(argv) {
     launchManifestTasks(cwd, workspaceRoot, options, positionals, { model, effort });
     return;
   }
-  const requestText = readTaskPrompt(cwd, options, positionals);
+  const requestText = await readTaskPrompt(cwd, options, positionals);
   const prompt = options["from-last-review"] ? buildReviewHandoffPrompt(workspaceRoot, requestText) : requestText;
   const outputSchema = options["output-schema"] ? readOutputSchema(path.resolve(cwd, options["output-schema"])) : null;
 
@@ -1063,47 +1154,100 @@ async function handleTask(argv) {
     ensureCodexAvailable(cwd);
     requireTaskRequest(prompt, resumeLast || Boolean(resumeThreadId));
 
+    // A resumed thread continues in its job's worktree, which the new job records, so a later
+    // follow-up on the new job runs there too. A thread that is not found yet is resolved by the
+    // worker, which reports the failure.
+    const resumed = resumeLast ? await resolveLatestTrackedTaskThread(workspaceRoot) : null;
     const baseJob = buildTaskJob(workspaceRoot, taskMetadata, write);
-    const job = options.worktree ? attachWorktree(baseJob) : baseJob;
+    const job = resumed?.worktreePath
+      ? { ...baseJob, worktreePath: resumed.worktreePath, worktreeBranch: resumed.worktreeBranch ?? null }
+      : options.worktree
+        ? attachWorktree(baseJob)
+        : baseJob;
+    // Only a worktree this launch created is removed when the launch fails; an inherited one
+    // holds the earlier job's work.
+    const createdWorktree = Boolean(job.worktreePath) && !resumed?.worktreePath;
     const request = buildTaskRequest({
       cwd,
       model,
       effort,
       prompt,
       write,
-      resumeLast,
-      resumeThreadId,
+      resumeLast: resumeLast && !resumed,
+      resumeThreadId: resumed?.id ?? resumeThreadId,
       jobId: job.id,
       outputSchema,
       worktreePath: job.worktreePath ?? null,
-      worktreeBranch: job.worktreeBranch ?? null
+      worktreeBranch: job.worktreeBranch ?? null,
+      newWorktree: !resumed?.worktreePath
     });
-    const { payload } = enqueueBackgroundTask(cwd, job, request, { workerScript: COMPANION_SCRIPT });
-    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+    let launch;
+    try {
+      launch = enqueueBackgroundTask(cwd, job, request, { workerScript: COMPANION_SCRIPT });
+    } catch (error) {
+      throw createdWorktree ? discardLaunchWorktree(workspaceRoot, job, error) : error;
+    }
+    outputCommandResult(launch.payload, renderQueuedTaskLaunch(launch.payload), options.json);
     return;
   }
 
+  // The request and the thread to resume are checked before a worktree is created.
+  requireTaskRequest(prompt, resumeLast || Boolean(resumeThreadId));
+  ensureCodexAvailable(cwd);
+  let resumed = null;
+  if (resumeLast) {
+    resumed = await resolveLatestTrackedTaskThread(workspaceRoot);
+    if (!resumed) {
+      throw new Error("No previous Codex task thread was found for this repository.");
+    }
+  }
+
+  // A resumed thread continues in its job's worktree; --worktree creates one only otherwise.
   const baseJob = buildTaskJob(workspaceRoot, taskMetadata, write);
-  const job = options.worktree ? attachWorktree(baseJob) : baseJob;
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeTaskRun({
-        cwd,
-        model,
-        effort,
-        prompt,
-        write,
-        resumeLast,
-        resumeThreadId,
-        jobId: job.id,
-        outputSchema,
-        worktreePath: job.worktreePath ?? null,
-        worktreeBranch: job.worktreeBranch ?? null,
-        onProgress: progress
-      }),
-    { json: options.json }
-  );
+  const job = resumed?.worktreePath
+    ? { ...baseJob, worktreePath: resumed.worktreePath, worktreeBranch: resumed.worktreeBranch ?? null }
+    : options.worktree
+      ? attachWorktree(baseJob)
+      : baseJob;
+  const newWorktree = Boolean(job.worktreePath) && !resumed?.worktreePath;
+  // A run that fails before Codex starts a thread removes the worktree created for it.
+  const discardUnusedWorktree = (error) => {
+    if (!newWorktree || readStoredJob(workspaceRoot, job.id)?.threadId) {
+      return error;
+    }
+    return discardLaunchWorktree(workspaceRoot, job, error);
+  };
+  let execution;
+  try {
+    execution = await runForegroundCommand(
+      job,
+      (progress) =>
+        executeTaskRun({
+          cwd,
+          model,
+          effort,
+          prompt,
+          write,
+          resumeLast: false,
+          resumeThreadId: resumed?.id ?? resumeThreadId,
+          jobId: job.id,
+          outputSchema,
+          worktreePath: job.worktreePath ?? null,
+          worktreeBranch: job.worktreeBranch ?? null,
+          newWorktree,
+          onProgress: progress
+        }),
+      { json: options.json }
+    );
+  } catch (error) {
+    throw discardUnusedWorktree(error);
+  }
+  if (execution.exitStatus !== 0 && !execution.threadId) {
+    const cleanupError = discardUnusedWorktree(null);
+    if (cleanupError) {
+      throw cleanupError;
+    }
+  }
 }
 
 async function handleTransfer(argv) {
@@ -1209,6 +1353,7 @@ async function handleResult(argv) {
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
+  parseWaitTimeout(options["timeout-ms"]);
   if (options.wait) {
     if (!reference) {
       throw new Error("`result --wait` requires a job id.");
@@ -1305,12 +1450,33 @@ async function handleCancel(argv) {
   await reconcileJobLiveness(cwd);
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
+  const { payload, nextJob } = await cancelJob(workspaceRoot, job, existing);
+  outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+}
+
+/**
+ * Cancels a job: marks it cancelled, asks its provider to interrupt the turn, stops its
+ * processes, and records it as cancelled. `existing` is the job's stored record read before the
+ * call; the record is read again after the cancel marker is written. Returns the command payload
+ * and the job as reported.
+ */
+export async function cancelJob(workspaceRoot, job, existing, deps = {}) {
+  const {
+    interruptTurn = (cwd, ids) => providerForJob(job).interruptTurn(cwd, ids),
+    terminate = terminateJobProcesses,
+    readStoredJob: readStored = (root, jobId) => readStoredJob(root, jobId, { ignoreCancelMarker: true }),
+    isAlive = isProcessAlive,
+    sleep: wait = sleep
+  } = deps;
   markJobCancelled(workspaceRoot, job.id);
-  const threadId = existing.threadId ?? job.threadId ?? null;
-  const turnId = existing.turnId ?? job.turnId ?? null;
+  // A worker publishes its pid and then checks the marker, so the record read after the marker
+  // holds the pid of every worker that can still start a turn.
+  const current = readStored(workspaceRoot, job.id) ?? existing;
+  const threadId = current.threadId ?? job.threadId ?? null;
+  const turnId = current.turnId ?? job.turnId ?? null;
 
   const provider = providerForJob(job);
-  const interrupt = await provider.interruptTurn(cwd, { threadId, turnId });
+  const interrupt = await interruptTurn(workspaceRoot, { threadId, turnId });
   if (interrupt.attempted) {
     appendLogLine(
       job.logFile,
@@ -1322,17 +1488,17 @@ async function handleCancel(argv) {
 
   // An interrupted worker normally records the stopped turn and exits on its own; it is
   // stopped by force only if it is still running after the wait.
-  const workerPid = existing.pid ?? job.pid ?? null;
+  const workerPid = current.pid ?? job.pid ?? null;
   if (interrupt.interrupted && Number.isInteger(workerPid)) {
     const deadline = Date.now() + INTERRUPT_EXIT_WAIT_MS;
-    while (isProcessAlive(workerPid) && Date.now() < deadline) {
-      await sleep(100);
+    while (isAlive(workerPid) && Date.now() < deadline) {
+      await wait(100);
     }
-    if (isProcessAlive(workerPid)) {
+    if (isAlive(workerPid)) {
       appendLogLine(job.logFile, `The worker was still running ${INTERRUPT_EXIT_WAIT_MS / 1000} s after the interrupt.`);
     }
   }
-  const [termination] = terminateJobProcesses([{ ...job, ...existing }]);
+  const [termination] = terminate([{ ...job, ...current }]);
   if (termination?.outcome === "pid-reused") {
     appendLogLine(job.logFile, `Process ${termination.pid} no longer belongs to this job; it was not stopped.`);
   } else if (termination?.outcome === "failed") {
@@ -1350,11 +1516,22 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
+  // Only the cancellation fields are replaced, in one read-modify-write, so a result the worker
+  // wrote before that read is kept. The step is not locked: a result written between the read
+  // and the replace can be lost. The listed job fills in fields the record does not have.
+  upsertJob(
+    workspaceRoot,
+    {
+      id: job.id,
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      completedAt,
+      cancelledAt: completedAt,
+      errorMessage: "Cancelled by user."
+    },
+    { defaults: job }
+  );
 
   const payload = {
     jobId: job.id,
@@ -1363,8 +1540,7 @@ async function handleCancel(argv) {
     turnInterruptAttempted: interrupt.attempted,
     turnInterrupted: interrupt.interrupted
   };
-
-  outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+  return { payload, nextJob };
 }
 
 async function main() {
@@ -1429,8 +1605,27 @@ async function runSubcommand(subcommand, argv) {
   }
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
-});
+// The CLI runs only when this file is the process entry point, so tests can import its steps.
+function isEntryPoint() {
+  const entry = process.argv[1];
+  if (!entry) {
+    return false;
+  }
+  let resolved;
+  try {
+    resolved = fs.realpathSync(entry);
+  } catch {
+    return false;
+  }
+  return process.platform === "win32"
+    ? resolved.toLowerCase() === COMPANION_SCRIPT.toLowerCase()
+    : resolved === COMPANION_SCRIPT;
+}
+
+if (isEntryPoint()) {
+  main().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+  });
+}

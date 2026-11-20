@@ -88,17 +88,32 @@ export async function waitUntil(predicate, { timeoutMs = 10000, intervalMs = 100
   );
 }
 
-function killChild(child) {
+// Stops the child and every process it started. On POSIX the child leads its own process group,
+// so the group signal also reaches descendants that inherited its pipes.
+function killChildTree(child) {
   if (process.platform === "win32") {
     spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-  } else {
+    return;
+  }
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
     child.kill("SIGKILL");
   }
 }
 
+// How long a timed-out call waits for the child's pipes to close after the stop.
+const CLOSE_AFTER_KILL_MS = 5000;
+
 export function spawnJson(command, args, { timeoutMs = 30000, env, cwd, input } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(command, args, {
+      cwd,
+      env,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: process.platform !== "win32"
+    });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -113,11 +128,19 @@ export function spawnJson(command, args, { timeoutMs = 30000, env, cwd, input } 
     });
     child.stdin.on("error", () => {});
     child.stdin.end(input ?? "");
+    const detail = () => `; stderr: ${stderr}; stdout: ${stdout}`;
+    let closeTimer = null;
     const timer = setTimeout(() => {
       timedOut = true;
-      killChild(child);
+      killChildTree(child);
+      // A descendant outside the stopped tree can still hold the pipes open; the call then ends
+      // without waiting for them.
+      closeTimer = setTimeout(() => {
+        child.stdout.destroy();
+        child.stderr.destroy();
+        reject(new Error(`${command} timed out after ${timeoutMs} ms and its output did not close${detail()}`));
+      }, CLOSE_AFTER_KILL_MS);
     }, timeoutMs);
-    const detail = () => `; stderr: ${stderr}; stdout: ${stdout}`;
     child.on("error", (error) => {
       startError = error;
       clearTimeout(timer);
@@ -125,6 +148,7 @@ export function spawnJson(command, args, { timeoutMs = 30000, env, cwd, input } 
     });
     child.on("close", (code, signal) => {
       clearTimeout(timer);
+      clearTimeout(closeTimer);
       if (startError) {
         return;
       }

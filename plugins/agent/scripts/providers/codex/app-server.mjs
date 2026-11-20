@@ -17,6 +17,12 @@ const PLUGIN_MANIFEST_URL = new URL("../../../.claude-plugin/plugin.json", impor
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
 
 const NON_INTERACTIVE_DENIAL_REASON = "Non-interactive Codex runner: no operator to approve.";
+const DECLINED_ELICITATION_MODES = new Set(["form", "openai/form", "openaiForm", "url"]);
+// After the app server exits, its stdout can still hold lines it wrote before exiting. The client
+// settles once stdout has closed, or after this long when a descendant keeps the pipe open.
+const STDOUT_DRAIN_GRACE_MS = 2000;
+// How long close() waits for the app server to exit after it was asked to stop.
+const STOP_EXIT_WAIT_MS = 5000;
 
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
@@ -142,9 +148,11 @@ export class AppServerClientBase {
     try {
       message = JSON.parse(line);
     } catch (error) {
-      this.handleExit(createProtocolError(`Failed to parse codex app-server JSONL: ${error.message}`, { line }));
-      // A stream that is not JSONL cannot be resynchronised, so the transport is ended too.
-      this.close().catch(() => {});
+      this.failStream(createProtocolError(`Failed to parse codex app-server JSONL: ${error.message}`, { line }));
+      return;
+    }
+    if (message === null || typeof message !== "object" || Array.isArray(message)) {
+      this.failStream(createProtocolError("codex app-server sent a line that is not a JSON-RPC message.", { line }));
       return;
     }
 
@@ -188,6 +196,12 @@ export class AppServerClientBase {
   // approvals take a plain `"decline"` enum with no room for a reason, and
   // `PermissionsRequestApprovalResponse` has no refusal variant at all, so
   // granting nothing for the turn is its fail-closed answer.
+  // A stream that is not JSONL cannot be resynchronised, so the transport is ended too.
+  failStream(error) {
+    this.handleExit(error);
+    this.close().catch(() => {});
+  }
+
   handleServerRequest(message) {
     switch (message.method) {
       case "execCommandApproval":
@@ -208,15 +222,15 @@ export class AppServerClientBase {
         return;
 
       // MCP servers (e.g. ChatGPT connectors surfaced as `codex_apps`) ask for the
-      // operator's consent through an elicitation. A request whose `mode` is `form` or
-      // `openai/form` expects structured content back, which this runner cannot supply,
-      // so it is declined. Every other request is accepted with `content: null`: that
-      // includes `url` mode, the `openaiForm` spelling, and a request with no `mode`.
-      // They are accepted because declining them blocks the MCP tool call that raised
-      // them, and a delegated run has no operator who could answer instead.
+      // operator's consent through an elicitation, and this runner answers on the user's
+      // behalf. A request in a form mode (`form`, `openai/form`, `openaiForm`) expects
+      // structured content back, and a `url` request expects someone to open the URL;
+      // this runner can do neither, so those are declined. A request with no `mode` or an
+      // unknown one is accepted with `content: null`, because declining it blocks the MCP
+      // tool call that raised it, and a delegated run has no operator who could answer.
       case "mcpServer/elicitation/request": {
         const mode = message.params?.mode;
-        if (mode === "form" || mode === "openai/form") {
+        if (DECLINED_ELICITATION_MODES.has(mode)) {
           this.sendMessage({ id: message.id, result: { action: "decline" } });
           return;
         }
@@ -260,19 +274,36 @@ export class SpawnedCodexAppServerClient extends AppServerClientBase {
   constructor(cwd, options = {}) {
     super(cwd, options);
     this.transport = "direct";
+    // Why close() could not stop the app server, or null.
+    this.stopError = null;
+    this.processExitPromise = new Promise((resolve) => {
+      this.resolveProcessExit = resolve;
+    });
   }
 
   async initialize() {
     const env = this.options.env ?? process.env;
     const spawnPlan = resolveCommand("codex", ["app-server"], env);
-    this.proc = spawn(spawnPlan.file, spawnPlan.args, {
-      cwd: this.cwd,
-      env,
-      stdio: ["pipe", "pipe", "pipe"],
-      ...spawnPlan.options,
-      windowsHide: true
-    });
+    this.attachProcess(
+      spawn(spawnPlan.file, spawnPlan.args, {
+        cwd: this.cwd,
+        env,
+        stdio: ["pipe", "pipe", "pipe"],
+        ...spawnPlan.options,
+        windowsHide: true
+      })
+    );
 
+    this.serverInfo = await this.request("initialize", {
+      clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
+      capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
+    });
+    this.notify("initialized", {});
+  }
+
+  /** Takes ownership of an app-server child process: reads its output and follows its exit. */
+  attachProcess(proc) {
+    this.proc = proc;
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
 
@@ -292,6 +323,13 @@ export class SpawnedCodexAppServerClient extends AppServerClientBase {
     });
 
     this.proc.on("exit", (code, signal) => {
+      this.resolveProcessExit();
+      this.exitDrainTimer = setTimeout(() => this.handleProcessExit(code, signal), STDOUT_DRAIN_GRACE_MS);
+      this.exitDrainTimer.unref?.();
+    });
+
+    // "close" follows the end of stdout, so every line written before the exit has been read.
+    this.proc.on("close", (code, signal) => {
       this.handleProcessExit(code, signal);
     });
 
@@ -299,16 +337,12 @@ export class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.readline.on("line", (line) => {
       this.handleLine(line);
     });
-
-    this.serverInfo = await this.request("initialize", {
-      clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
-      capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
-    });
-    this.notify("initialized", {});
   }
 
   // An exit that follows close() is the one close() asked for, so it carries no error.
   handleProcessExit(code, signal) {
+    clearTimeout(this.exitDrainTimer);
+    this.resolveProcessExit();
     const stderr = this.stderr.trim();
     const detail =
       code === 0 || this.closeStarted
@@ -319,15 +353,33 @@ export class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.handleExit(detail);
   }
 
+  // Resolves true once the app server has exited, or false after `milliseconds`.
+  waitForProcessExit(milliseconds) {
+    let timer;
+    return Promise.race([
+      this.processExitPromise.then(() => true),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), milliseconds);
+        timer.unref?.();
+      })
+    ]).finally(() => clearTimeout(timer));
+  }
+
+  /**
+   * Ends the app server: closes its input, and stops it when it is still running 50 ms later.
+   * Returns once it has exited, or once a stop that failed has been recorded in `stopError`
+   * and on stderr. A client that a stdin error already settled still stops its process.
+   */
   async close() {
-    if (this.closeStarted) {
-      await this.exitPromise;
-      return;
+    if (!this.closePromise) {
+      this.closeStarted = true;
+      this.closed = true;
+      this.closePromise = this.stopProcess();
     }
+    await this.closePromise;
+  }
 
-    this.closeStarted = true;
-    this.closed = true;
-
+  async stopProcess() {
     if (this.readline) {
       this.readline.close();
     }
@@ -341,33 +393,49 @@ export class SpawnedCodexAppServerClient extends AppServerClientBase {
 
     const isRunning = () => proc.pid !== undefined && proc.exitCode === null && proc.signalCode === null;
     if (isRunning()) {
-      proc.stdin.end();
-      setTimeout(() => {
-        if (!isRunning()) {
-          return;
-        }
-        if (process.platform === "win32") {
-          // When codex is a batch file the direct child is cmd.exe, so stop the
-          // whole tree to reach the process it started.
-          try {
-            terminateProcessTree(proc.pid);
-          } catch {
-            // Best-effort cleanup inside an unref'd timer: errors are swallowed
-            // so they cannot crash the host process during shutdown.
-          }
-          return;
-        }
-        proc.kill("SIGTERM");
-        // A process that ignores SIGTERM is killed 2 s later.
-        setTimeout(() => {
-          if (isRunning()) {
-            proc.kill("SIGKILL");
-          }
-        }, 2000).unref?.();
-      }, 50).unref?.();
+      try {
+        proc.stdin.end();
+      } catch {
+        // A stdin that already failed cannot be ended; the process is stopped below.
+      }
+      if (!(await this.waitForProcessExit(50)) && isRunning() && !(await this.forceStop(proc, isRunning))) {
+        this.handleExit(null);
+        return;
+      }
     }
 
     await this.exitPromise;
+  }
+
+  recordStopFailure(proc, error) {
+    this.stopError = error;
+    process.stderr.write(`codex app-server process ${proc.pid} could not be stopped: ${error.message}\n`);
+  }
+
+  // Returns true once the process has exited, false when it could not be stopped.
+  async forceStop(proc, isRunning) {
+    if (process.platform === "win32") {
+      // When codex is a batch file the direct child is cmd.exe, so the whole tree is stopped to
+      // reach the process it started.
+      const terminate = this.options.terminateProcessTree ?? terminateProcessTree;
+      try {
+        terminate(proc.pid);
+      } catch (error) {
+        this.recordStopFailure(proc, error instanceof Error ? error : new Error(String(error)));
+        return false;
+      }
+    } else {
+      proc.kill("SIGTERM");
+      // A process that ignores SIGTERM is killed 2 s later.
+      if (!(await this.waitForProcessExit(2000)) && isRunning()) {
+        proc.kill("SIGKILL");
+      }
+    }
+    if (await this.waitForProcessExit(STOP_EXIT_WAIT_MS)) {
+      return true;
+    }
+    this.recordStopFailure(proc, new Error(`it was still running ${STOP_EXIT_WAIT_MS / 1000} s after it was stopped`));
+    return false;
   }
 
   sendMessage(message) {

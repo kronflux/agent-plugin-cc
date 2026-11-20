@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
@@ -90,6 +90,43 @@ test("a failed review leaves no prompt file behind", () => {
   assert.equal(decision.decision, "block");
   assert.match(decision.reason, /The stop-time Codex review failed/);
   assert.deepEqual(leftoverPromptFiles(), []);
+});
+
+// Loaded with --import into the hook: a write to the prompt file stores a few bytes and then
+// fails, as when the disk fills after the file was created.
+const PROMPT_WRITE_FAILS_PRELOAD = [
+  'import fs from "node:fs";',
+  "const isPromptFile = (target) => typeof target === \"string\" && target.includes(\"agent-stop-review-\");",
+  "const promptFds = new Set();",
+  "const { openSync, writeFileSync } = fs;",
+  "fs.openSync = function (target, ...rest) {",
+  "  const fd = openSync.call(this, target, ...rest);",
+  "  if (isPromptFile(target)) promptFds.add(fd);",
+  "  return fd;",
+  "};",
+  "fs.writeFileSync = function (target, data, options) {",
+  "  if (!isPromptFile(target) && !promptFds.has(target)) return writeFileSync.call(this, target, data, options);",
+  "  if (promptFds.has(target)) fs.writeSync(target, \"partial\");",
+  "  else writeFileSync.call(this, target, \"partial\", options);",
+  "  throw Object.assign(new Error(\"no space left on device\"), { code: \"ENOSPC\" });",
+  "};"
+].join("\n");
+
+test("a prompt file whose write fails is removed", (t) => {
+  const gate = setupGate("review-ok");
+  const preload = path.join(makeTempDir(t), "prompt-write-fails.mjs");
+  fs.writeFileSync(preload, PROMPT_WRITE_FAILS_PRELOAD);
+  const tempDir = makeTempDir(t);
+
+  const result = run(process.execPath, ["--import", pathToFileURL(preload).href, STOP_HOOK], {
+    cwd: gate.repo,
+    env: { ...buildEnv(gate.binDir), TEMP: tempDir, TMP: tempDir, TMPDIR: tempDir },
+    input: JSON.stringify({ cwd: gate.repo, session_id: "sess-gate", last_assistant_message: "Done." })
+  });
+
+  assert.equal(result.status, 1, result.stdout);
+  assert.match(result.stderr, /no space left on device/);
+  assert.deepEqual(fs.readdirSync(tempDir), [], "the partial prompt file remains");
 });
 
 test("a forged end marker in the Claude response stays inside the quoted block", () => {

@@ -78,12 +78,40 @@ export function resolveStateDir(cwd) {
   return path.join(stateRoot, stateDirName(cwd));
 }
 
-// A process started without CLAUDE_PLUGIN_DATA writes under the temp-directory root, so
-// reads also look there. The configured root comes first and wins for a duplicate job id.
-function candidateStateDirs(cwd) {
+let unprivateRootWarned = false;
+
+// On POSIX the fallback root sits in the shared temp directory, so it is read only when it is
+// missing or is a private folder of the caller; otherwise it is skipped with one warning.
+function fallbackRootReadable({ platform = process.platform, lstat = fs.lstatSync, getuid = process.getuid } = {}) {
+  if (platform === "win32") {
+    return true;
+  }
+  try {
+    assertPrivateStateRoot(FALLBACK_STATE_ROOT_DIR, { lstat, getuid });
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return true;
+    }
+    if (!unprivateRootWarned) {
+      unprivateRootWarned = true;
+      const message = error instanceof Error ? error.message : String(error);
+      process.stderr.write(`warning: ${message}; its jobs are not read\n`);
+    }
+    return false;
+  }
+}
+
+/**
+ * Returns the state folders that reads look in. A process started without CLAUDE_PLUGIN_DATA
+ * writes under the temp-directory root, so reads also look there. The configured root comes
+ * first and wins for a duplicate job id. `deps` replaces the platform and file checks in tests.
+ */
+export function candidateStateDirs(cwd, deps = {}) {
   const primary = resolveStateDir(cwd);
   const fallback = path.join(FALLBACK_STATE_ROOT_DIR, stateDirName(cwd));
-  return primary === fallback ? [primary] : [primary, fallback];
+  const dirs = primary === fallback ? [primary] : [primary, fallback];
+  return fallbackRootReadable(deps) ? dirs : dirs.filter((dir) => dir !== fallback);
 }
 
 export function resolveJobsDir(cwd) {
@@ -188,39 +216,6 @@ function readJsonFile(filePath) {
       }
       sleepSync(20);
     }
-  }
-}
-
-// Record writers that read, compare and replace a job record hold `<job>.json.lock` for that
-// step, so a conditional rewrite cannot overwrite a record written in between. A holder keeps
-// the lock for one read and one rename; a lock still present after every retry is taken to be
-// left by a process that died while holding it, and is replaced once.
-const LOCK_RETRY_COUNT = 50;
-const LOCK_RETRY_DELAY_MS = 20;
-
-function withJobLock(jobFile, body) {
-  const lockFile = `${jobFile}.lock`;
-  ensurePrivateDir(path.dirname(jobFile));
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      fs.closeSync(fs.openSync(lockFile, "wx", PRIVATE_FILE_MODE));
-      break;
-    } catch (error) {
-      if (error?.code !== "EEXIST") {
-        throw error;
-      }
-      if (attempt === LOCK_RETRY_COUNT - 1) {
-        fs.rmSync(lockFile, { force: true });
-      } else if (attempt >= LOCK_RETRY_COUNT) {
-        throw new Error(`Could not lock the job record ${jobFile}; another process holds ${lockFile}.`);
-      }
-      sleepSync(LOCK_RETRY_DELAY_MS);
-    }
-  }
-  try {
-    return body();
-  } finally {
-    fs.rmSync(lockFile, { force: true });
   }
 }
 
@@ -351,13 +346,16 @@ export function resolveJobLogFile(cwd, jobId) {
   return path.join(resolveJobsDir(cwd), `${jobId}.log`);
 }
 
-/** Reads the full record of a job file, including request and result fields. */
-export function readJobFile(jobFile) {
+/**
+ * Reads the full record of a job file, including request and result fields. With
+ * `ignoreCancelMarker`, the record is returned as stored, with the pid a worker published.
+ */
+export function readJobFile(jobFile, { ignoreCancelMarker = false } = {}) {
   const record = readJsonFile(jobFile);
   if (!record) {
     throw new Error(`Job file not found: ${jobFile}`);
   }
-  return applyCancelMarker(record, jobFile);
+  return ignoreCancelMarker ? record : applyCancelMarker(record, jobFile);
 }
 
 /** Replaces a job's record. Writes for a removed job are ignored. */
@@ -367,10 +365,8 @@ export function writeJobFile(cwd, jobId, payload) {
   if (isRemoved(jobFile)) {
     return jobFile;
   }
-  withJobLock(jobFile, () => {
-    const timestamp = nowIso();
-    storeRecord(jobFile, applyCancelMarker({ createdAt: timestamp, ...payload, updatedAt: timestamp }, jobFile));
-  });
+  const timestamp = nowIso();
+  storeRecord(jobFile, applyCancelMarker({ createdAt: timestamp, ...payload, updatedAt: timestamp }, jobFile));
   return jobFile;
 }
 
@@ -378,7 +374,8 @@ export function writeJobFile(cwd, jobId, payload) {
  * Reads and deletes a job's request, which holds its prompt. Returns null when absent. A record
  * written before requests had their own file holds the prompt itself: it is returned, and the
  * record is rewritten without it unless another writer replaced the record in the meantime.
- * `beforeReplace` runs between the first read and the rewrite.
+ * `beforeReplace` runs between the first read and the rewrite. The check and the rewrite are not
+ * locked, so a record written between the second read and the replace can be lost.
  */
 export function takeJobRequest(cwd, jobId, { beforeReplace } = {}) {
   const jobFile = resolveJobFile(cwd, jobId);
@@ -393,13 +390,11 @@ export function takeJobRequest(cwd, jobId, { beforeReplace } = {}) {
     return null;
   }
   beforeReplace?.();
-  withJobLock(jobFile, () => {
-    const current = readJsonFile(jobFile);
-    if (current && current.updatedAt === record.updatedAt && current.request !== undefined) {
-      const { request: _legacyRequest, ...stripped } = current;
-      writeJsonAtomic(jobFile, stripped);
-    }
-  });
+  const current = readJsonFile(jobFile);
+  if (current && current.updatedAt === record.updatedAt && current.request !== undefined) {
+    const { request: _legacyRequest, ...stripped } = current;
+    writeJsonAtomic(jobFile, stripped);
+  }
   return record.request;
 }
 
@@ -476,7 +471,9 @@ export function readJobMessageOutcome(cwd, jobId, messageId) {
 
 /**
  * Merges `jobPatch` into the job's record, creating it when absent. With `onlyIf`, the patch
- * is applied only when the current record satisfies it; otherwise null is returned.
+ * is applied only when the current record satisfies it; otherwise null is returned. Fields of
+ * `defaults` fill in fields the stored record does not have. The read and the atomic replace are
+ * not locked, so a record another process writes between them can be lost.
  */
 export function upsertJob(cwd, jobPatch, options = {}) {
   migrateLegacyState(cwd);
@@ -484,24 +481,20 @@ export function upsertJob(cwd, jobPatch, options = {}) {
   if (isRemoved(jobFile)) {
     return null;
   }
-  const outcome = withJobLock(jobFile, () => {
-    const existing = readJsonFile(jobFile);
-    if (options.onlyIf && !options.onlyIf(existing ? applyCancelMarker(existing, jobFile) : null)) {
-      return null;
-    }
-    const timestamp = nowIso();
-    const next = existing
-      ? { ...existing, ...jobPatch, updatedAt: timestamp }
-      : { createdAt: timestamp, updatedAt: timestamp, ...jobPatch };
-    return { stored: storeRecord(jobFile, applyCancelMarker(next, jobFile)), created: !existing };
-  });
-  if (!outcome) {
+  const existing = readJsonFile(jobFile);
+  if (options.onlyIf && !options.onlyIf(existing ? applyCancelMarker(existing, jobFile) : null)) {
     return null;
   }
-  if (outcome.created) {
+  const timestamp = nowIso();
+  const defaults = options.defaults ?? {};
+  const next = existing
+    ? { ...defaults, ...existing, ...jobPatch, updatedAt: timestamp }
+    : { createdAt: timestamp, ...defaults, updatedAt: timestamp, ...jobPatch };
+  const stored = storeRecord(jobFile, applyCancelMarker(next, jobFile));
+  if (!existing) {
     pruneFinishedJobs(cwd);
   }
-  return outcome.stored;
+  return stored;
 }
 
 /** Lists job summaries from every state root, without request and result fields. */

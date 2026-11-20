@@ -3,7 +3,13 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { collectReviewContext, resolveReviewTarget } from "../plugins/agent/scripts/lib/git.mjs";
+import {
+  collectReviewContext,
+  createWorktree,
+  getCurrentBranch,
+  removeWorktree,
+  resolveReviewTarget
+} from "../plugins/agent/scripts/lib/git.mjs";
 import { makeCommittedRepo, makeTempDir, run } from "./helpers.mjs";
 
 const SYMLINK_SKIP_REASON = "symlinks need Developer Mode or admin on Windows";
@@ -287,4 +293,248 @@ test("collectReviewContext keeps untracked file content in lightweight working t
   assert.doesNotMatch(context.content, /TRACKED_MARKER_[AB]/);
   assert.match(context.content, /## Untracked Files/);
   assert.match(context.content, /UNTRACKED_RISK_MARKER/);
+});
+
+test("git runs git.exe directly, not a git.cmd found earlier on PATH", { skip: process.platform !== "win32" && "Windows command resolution" }, (t) => {
+  const cwd = makeRepoWithApp(t);
+  const fakeDir = makeTempDir(t);
+  const marker = path.join(fakeDir, "fake-git-ran.txt");
+  fs.writeFileSync(path.join(fakeDir, "git.cmd"), `@echo off\r\necho fake> "${marker}"\r\necho fake-branch\r\n`);
+  const pathKey = Object.keys(process.env).find((key) => key.toUpperCase() === "PATH") ?? "PATH";
+  const savedPath = process.env[pathKey];
+  process.env[pathKey] = `${fakeDir};${savedPath}`;
+  let branch;
+  try {
+    branch = getCurrentBranch(cwd);
+  } finally {
+    process.env[pathKey] = savedPath;
+  }
+
+  assert.equal(fs.existsSync(marker), false, "git ran through cmd.exe and a git.cmd");
+  assert.equal(branch, "main");
+});
+
+test("a worktree whose checkout hook fails leaves no folder or branch behind", (t) => {
+  const cwd = makeRepoWithApp(t);
+  const hook = path.join(cwd, ".git", "hooks", "post-checkout");
+  fs.writeFileSync(hook, "#!/bin/sh\necho checkout refused >&2\nexit 1\n", { mode: 0o755 });
+  const worktreePath = path.join(makeTempDir(t), "worktrees", "task-hook");
+
+  assert.throws(() => createWorktree(cwd, worktreePath, "agent/task-hook"), /checkout refused/);
+
+  assert.equal(fs.existsSync(worktreePath), false, "the worktree folder remains");
+  assert.equal(git(cwd, ["branch", "--list", "agent/task-hook"]).stdout.trim(), "", "the branch remains");
+  const worktrees = git(cwd, ["worktree", "list", "--porcelain"]).stdout.split(/\r?\n/).filter((line) => line.startsWith("worktree "));
+  assert.equal(worktrees.length, 1);
+});
+
+function registeredWorktrees(cwd) {
+  return git(cwd, ["worktree", "list", "--porcelain"])
+    .stdout.split(/\r?\n/)
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => line.slice("worktree ".length));
+}
+
+function failPostCheckout(cwd) {
+  fs.writeFileSync(path.join(cwd, ".git", "hooks", "post-checkout"), "#!/bin/sh\necho checkout refused >&2\nexit 1\n", {
+    mode: 0o755
+  });
+}
+
+test("a failed worktree keeps the registration of another worktree whose folder is away", (t) => {
+  const cwd = makeRepoWithApp(t);
+  const parent = makeTempDir(t);
+  const other = path.join(parent, "other");
+  git(cwd, ["worktree", "add", "-b", "agent/other", other, "HEAD"]);
+  failPostCheckout(cwd);
+  const away = path.join(parent, "other-away");
+  fs.renameSync(other, away);
+
+  try {
+    assert.throws(() => createWorktree(cwd, path.join(parent, "task-hook"), "agent/task-hook"), /checkout refused/);
+    assert.equal(registeredWorktrees(cwd).length, 2, "the other worktree's registration was pruned");
+  } finally {
+    fs.renameSync(away, other);
+  }
+  assert.equal(git(cwd, ["branch", "--list", "agent/task-hook"]).stdout.trim(), "");
+});
+
+test("a worktree whose checkout hook fails in an existing empty folder leaves the folder empty and unregistered", (t) => {
+  const cwd = makeRepoWithApp(t);
+  failPostCheckout(cwd);
+  const worktreePath = path.join(makeTempDir(t), "task-empty");
+  fs.mkdirSync(worktreePath);
+
+  assert.throws(() => createWorktree(cwd, worktreePath, "agent/task-empty"), /checkout refused/);
+
+  assert.equal(registeredWorktrees(cwd).length, 1, "the failed checkout is still registered");
+  assert.equal(git(cwd, ["branch", "--list", "agent/task-empty"]).stdout.trim(), "", "the branch remains");
+  assert.deepEqual(fs.readdirSync(worktreePath), [], "the existing folder was not left empty");
+});
+
+test("a failed worktree in an existing private folder keeps the folder's mode", { skip: process.platform === "win32" && "POSIX modes" }, (t) => {
+  const cwd = makeRepoWithApp(t);
+  failPostCheckout(cwd);
+  const worktreePath = path.join(makeTempDir(t), "task-private");
+  fs.mkdirSync(worktreePath);
+  fs.chmodSync(worktreePath, 0o700);
+  const previousUmask = process.umask(0o022);
+  t.after(() => process.umask(previousUmask));
+
+  assert.throws(() => createWorktree(cwd, worktreePath, "agent/task-private"), /checkout refused/);
+
+  assert.deepEqual(fs.readdirSync(worktreePath), []);
+  assert.equal((fs.statSync(worktreePath).mode & 0o7777).toString(8), "700");
+});
+
+test("a failed worktree whose folder mode cannot be restored reports the git error and removes the branch", (t) => {
+  const cwd = makeRepoWithApp(t);
+  failPostCheckout(cwd);
+  const worktreePath = path.join(makeTempDir(t), "task-chmod");
+  fs.mkdirSync(worktreePath);
+  const chmodSync = fs.chmodSync;
+  fs.chmodSync = (target, ...rest) => {
+    if (path.resolve(String(target)) === path.resolve(worktreePath)) {
+      throw Object.assign(new Error("injected chmod failure"), { code: "EPERM" });
+    }
+    return chmodSync(target, ...rest);
+  };
+  let thrown = null;
+  try {
+    createWorktree(cwd, worktreePath, "agent/task-chmod");
+  } catch (error) {
+    thrown = error;
+  } finally {
+    fs.chmodSync = chmodSync;
+  }
+
+  assert.ok(thrown instanceof Error, "the failed checkout did not throw");
+  assert.match(thrown.message, /checkout refused/);
+  assert.doesNotMatch(thrown.message, /injected chmod failure|could not be removed/);
+  assert.equal(git(cwd, ["branch", "--list", "agent/task-chmod"]).stdout.trim(), "", "the branch remains");
+  assert.equal(registeredWorktrees(cwd).length, 1, "the failed checkout is still registered");
+});
+
+test("a worktree target that is another registered worktree is left alone", (t) => {
+  const cwd = makeRepoWithApp(t);
+  const other = path.join(makeTempDir(t), "other");
+  git(cwd, ["worktree", "add", "-b", "agent/other", other, "HEAD"]);
+
+  assert.throws(() => createWorktree(cwd, other, "agent/task-taken"), /already exists/);
+
+  assert.equal(registeredWorktrees(cwd).length, 2);
+  assert.equal(fs.existsSync(path.join(other, "app.js")), true);
+});
+
+test("removing a worktree that is already gone keeps another worktree whose folder is away", (t) => {
+  const cwd = makeRepoWithApp(t);
+  const parent = makeTempDir(t);
+  const other = path.join(parent, "other");
+  const gone = path.join(parent, "gone");
+  git(cwd, ["worktree", "add", "-b", "agent/other", other, "HEAD"]);
+  git(cwd, ["worktree", "add", "-b", "agent/gone", gone, "HEAD"]);
+  git(cwd, ["worktree", "remove", "--force", gone]);
+  const away = path.join(parent, "other-away");
+  fs.renameSync(other, away);
+
+  try {
+    removeWorktree(cwd, gone, "agent/gone");
+    assert.equal(registeredWorktrees(cwd).length, 2, "the other worktree's registration was pruned");
+  } finally {
+    fs.renameSync(away, other);
+  }
+  assert.equal(git(cwd, ["branch", "--list", "agent/gone"]).stdout.trim(), "");
+});
+
+test("removing a locked worktree whose folder is gone drops only its registration and branch", (t) => {
+  const cwd = makeRepoWithApp(t);
+  const parent = makeTempDir(t);
+  const target = path.join(parent, "locked");
+  git(cwd, ["worktree", "add", "-b", "agent/locked", target, "HEAD"]);
+  git(cwd, ["worktree", "lock", target]);
+  fs.rmSync(target, { recursive: true, force: true });
+
+  removeWorktree(cwd, target, "agent/locked");
+
+  assert.equal(registeredWorktrees(cwd).length, 1, "the locked worktree is still registered");
+  assert.equal(git(cwd, ["branch", "--list", "agent/locked"]).stdout.trim(), "");
+});
+
+test("a worktree that cannot be created keeps a branch that existed before", (t) => {
+  const cwd = makeRepoWithApp(t);
+  git(cwd, ["branch", "agent/task-taken"]);
+  const worktreePath = path.join(makeTempDir(t), "worktrees", "task-taken");
+
+  assert.throws(() => createWorktree(cwd, worktreePath, "agent/task-taken"), /already exists/);
+
+  assert.equal(git(cwd, ["branch", "--list", "agent/task-taken"]).stdout.trim(), "agent/task-taken");
+  assert.equal(fs.existsSync(worktreePath), false);
+});
+
+test("an untracked file that holds a code fence stays inside its block", (t) => {
+  const cwd = makeRepoWithApp(t);
+  fs.writeFileSync(path.join(cwd, "notes.md"), "before\n```\nUNTRACKED_FENCE_MARKER\n```\nafter\n");
+
+  const context = collectReviewContext(cwd, resolveReviewTarget(cwd, {}));
+
+  assert.match(context.content, /### notes\.md\n````\nbefore\n```\nUNTRACKED_FENCE_MARKER\n```\nafter\n````/);
+});
+
+// The file is swapped between the check and the open: lstat reports a different file than the
+// one the descriptor opens, as when a regular file is replaced by a link to an outside file.
+test("an untracked file replaced between the check and the open is skipped", (t) => {
+  const cwd = makeRepoWithApp(t);
+  const outside = path.join(makeTempDir(t), "secret.txt");
+  fs.writeFileSync(outside, "decoy\n");
+  const swapped = path.join(cwd, "swapped.txt");
+  fs.writeFileSync(swapped, "SWAPPED_SECRET_MARKER\n");
+  const lstatSync = fs.lstatSync;
+  fs.lstatSync = (target, ...rest) =>
+    path.resolve(String(target)) === swapped ? lstatSync(outside, ...rest) : lstatSync(target, ...rest);
+  let context;
+  try {
+    context = collectReviewContext(cwd, resolveReviewTarget(cwd, {}));
+  } finally {
+    fs.lstatSync = lstatSync;
+  }
+
+  assert.doesNotMatch(context.content, /SWAPPED_SECRET_MARKER/);
+  assert.match(context.content, /### swapped\.txt\n\(skipped: unreadable file\)/);
+});
+
+// After git lists sub/secret.txt, the folder sub is replaced by a junction (a symlink on POSIX)
+// to an outside folder that holds a file of the same name. The path, the lstat and the open then
+// all reach the outside file, so only its real path shows that it lies outside the repository.
+test("an untracked file reached through an ancestor link to an outside folder is skipped", (t) => {
+  const cwd = makeRepoWithApp(t);
+  const outside = makeTempDir(t);
+  fs.writeFileSync(path.join(outside, "secret.txt"), "ANCESTOR_SECRET_MARKER\n");
+  const sub = path.join(cwd, "sub");
+  fs.mkdirSync(sub);
+  const listed = path.join(sub, "secret.txt");
+  fs.writeFileSync(listed, "inside\n");
+  const away = path.join(cwd, "sub-away");
+  const lstatSync = fs.lstatSync;
+  let swapped = false;
+  fs.lstatSync = (target, ...rest) => {
+    if (!swapped && path.resolve(String(target)) === listed) {
+      swapped = true;
+      fs.renameSync(sub, away);
+      fs.symlinkSync(outside, sub, "junction");
+    }
+    return lstatSync(target, ...rest);
+  };
+  let context;
+  try {
+    context = collectReviewContext(cwd, resolveReviewTarget(cwd, { scope: "working-tree" }));
+  } finally {
+    fs.lstatSync = lstatSync;
+    if (swapped) {
+      fs.rmSync(sub, { force: true });
+    }
+  }
+
+  assert.equal(swapped, true, "the untracked file was never checked");
+  assert.doesNotMatch(context.content, /ANCESTOR_SECRET_MARKER/);
+  assert.match(context.content, /### sub\/secret\.txt\n\(skipped: unreadable file\)/);
 });

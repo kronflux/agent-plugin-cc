@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { readJobFile, resolveJobFile } from "../plugins/agent/scripts/lib/state.mjs";
+import { startTurnWithProviderCompanion } from "../plugins/agent/scripts/codex-companion.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
@@ -20,6 +21,10 @@ function makeRepo(behavior) {
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
   return { repo, binDir, env: buildEnv(binDir) };
+}
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function fakeState(binDir) {
@@ -57,7 +62,9 @@ test("send steers the running turn and reports it only after Codex confirms the 
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, new RegExp(`Codex received the message in the running turn of ${jobId}`));
-  const [steer] = fakeState(ctx.binDir).steers;
+  const steers = fakeState(ctx.binDir).steers ?? [];
+  assert.equal(steers.length, 1);
+  const [steer] = steers;
   assert.equal(steer.expectedTurnId, turnId);
   assert.equal(steer.text, "stop and summarize");
   assert.match(steer.clientUserMessageId, /^msg-/);
@@ -79,6 +86,16 @@ test("send keeps the message as typed when it arrives as one argument string", a
 
 test("send reports an accepted message that Codex has not confirmed yet", async () => {
   const ctx = makeRepo("steer-no-item");
+  const { jobId } = await startRunningTask(ctx);
+
+  const result = run("node", [SCRIPT, "send", "--timeout-ms", "1500", jobId, "check", "this"], { cwd: ctx.repo, env: ctx.env });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /accepted the message .* had not confirmed it after 2 s/);
+});
+
+test("a user message with another client id does not confirm a queued message", async () => {
+  const ctx = makeRepo("steer-foreign-client-id");
   const { jobId } = await startRunningTask(ctx);
 
   const result = run("node", [SCRIPT, "send", "--timeout-ms", "1500", jobId, "check", "this"], { cwd: ctx.repo, env: ctx.env });
@@ -154,7 +171,7 @@ test("result --wait exits 75 while the job runs and prints the result once it fi
 
   const early = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "500"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(early.status, 75, early.stderr);
-  assert.match(early.stdout, new RegExp(`Job ${jobId} is still running after 1 s\. Run the same command again`));
+  assert.match(early.stdout, new RegExp(`Job ${escapeRegExp(jobId)} is still running after 1 s\\. Run the same command again`));
 
   const done = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "20000"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(done.status, 0, done.stderr);
@@ -193,6 +210,26 @@ test("send starts a new turn with a message the turn ended without applying", as
   assert.notEqual(turn.turnId, turnId);
 });
 
+test("a provider hand-off reports a timeout, text output and a missing job id", () => {
+  const provider = { id: "other", label: "Other", companionScript: "other-companion.mjs" };
+  const job = { id: "task-finished", threadId: "conversation-1", write: false };
+  const cases = [
+    [{ error: { code: "ETIMEDOUT", message: "spawnSync node ETIMEDOUT" }, status: null, signal: "SIGTERM" }, /^Other did not start the turn within 60 s\.$/],
+    [{ status: 0, stdout: "hello\nworld\n", stderr: "" }, /^Other started the turn but printed output that is not JSON: hello$/],
+    [{ status: 0, stdout: "{}", stderr: "" }, /^Other printed no job id for the new turn\.$/]
+  ];
+  for (const [outcome, message] of cases) {
+    const calls = [];
+    const spawnSyncImpl = (...args) => {
+      calls.push(args);
+      return outcome;
+    };
+    assert.throws(() => startTurnWithProviderCompanion(ROOT, provider, job, "continue", { spawnSyncImpl }), { message });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][2].timeout, 60000);
+  }
+});
+
 test("cancel names a job that has already finished", () => {
   const ctx = makeRepo();
   const done = run("node", [SCRIPT, "task", "--json", "quick"], { cwd: ctx.repo, env: ctx.env });
@@ -202,5 +239,16 @@ test("cancel names a job that has already finished", () => {
   const cancelled = run("node", [SCRIPT, "cancel", jobId], { cwd: ctx.repo, env: ctx.env });
 
   assert.notEqual(cancelled.status, 0);
-  assert.match(cancelled.stderr, new RegExp(`Job ${jobId} has already completed, so there is nothing to cancel\.`));
+  assert.match(cancelled.stderr, new RegExp(`Job ${escapeRegExp(jobId)} has already completed, so there is nothing to cancel\\.`));
 });
+
+for (const value of ["0", "abc"]) {
+  test(`send --timeout-ms ${value} is rejected`, () => {
+    const ctx = makeRepo();
+
+    const result = run("node", [SCRIPT, "send", "--timeout-ms", value, "task-missing", "hello"], { cwd: ctx.repo, env: ctx.env });
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /--timeout-ms must be a positive number of milliseconds\./);
+  });
+}

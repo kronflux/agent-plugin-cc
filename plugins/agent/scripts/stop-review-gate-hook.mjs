@@ -129,9 +129,16 @@ function runStopReview(cwd, input = {}) {
   };
   // The prompt goes through a file because a long message does not fit in a command line.
   const promptFile = path.join(os.tmpdir(), `agent-stop-review-${randomBytes(8).toString("hex")}.md`);
+  // "wx" refuses a file or symlink that already holds the name in the shared temp folder, and
+  // such a file is left alone. A file this call created is removed even when the write fails.
+  const fd = fs.openSync(promptFile, "wx", 0o600);
   let result;
   try {
-    fs.writeFileSync(promptFile, prompt, { encoding: "utf8", mode: 0o600 });
+    try {
+      fs.writeFileSync(fd, prompt, "utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
     result = spawnSync(
       process.execPath,
       [scriptPath, "task", "--json", "--output-schema", VERDICT_SCHEMA, "--prompt-file", promptFile],
@@ -200,8 +207,8 @@ function writeRounds(file, blocks) {
   fs.writeFileSync(file, `${JSON.stringify({ blocks })}\n`, "utf8");
 }
 
-function main() {
-  const input = readHookInputJson();
+async function main() {
+  const input = await readHookInputJson();
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
@@ -247,10 +254,8 @@ function main() {
   });
 }
 
-try {
-  main();
-} catch (error) {
+main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`${message} ${DISABLE_HINT}\n`);
   process.exitCode = 1;
-}
+});

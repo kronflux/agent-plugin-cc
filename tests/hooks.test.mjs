@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import { makeTempDir, run } from "./helpers.mjs";
@@ -55,47 +56,20 @@ test("a changed value is appended so the latest export wins", () => {
   ]);
 });
 
-test("stdin reads retry EAGAIN until the full payload arrives", () => {
-  const payload = Buffer.from(JSON.stringify({ hook_event_name: "Stop", session_id: "s" }));
-  const steps = ["EAGAIN", payload.subarray(0, 10), "EAGAIN", "EAGAIN", payload.subarray(10), 0];
-  const waits = [];
+test("stdin data that arrives with pauses is read in full", async () => {
+  const payload = JSON.stringify({ hook_event_name: "Stop", session_id: "s" });
+  const stdin = new PassThrough();
+  const reading = readStdinIfPiped({ stdin, firstByteTimeoutMs: 1000, totalTimeoutMs: 5000 });
+  stdin.write(payload.slice(0, 10));
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  stdin.end(payload.slice(10));
 
-  const text = readStdinIfPiped({
-    stdin: { isTTY: false },
-    wait: (milliseconds) => waits.push(milliseconds),
-    readSync(_fd, buffer) {
-      const step = steps.shift();
-      if (step === "EAGAIN") {
-        throw Object.assign(new Error("resource temporarily unavailable"), { code: "EAGAIN" });
-      }
-      if (step === 0) {
-        return 0;
-      }
-      const count = Math.min(step.length, buffer.length);
-      step.copy(buffer, 0, 0, count);
-      if (count < step.length) {
-        steps.unshift(step.subarray(count));
-      }
-      return count;
-    }
-  });
-
-  assert.equal(text, payload.toString());
-  assert.equal(waits.length, 3);
+  assert.equal(await reading, payload);
 });
 
-test("a non-blocking stdin with no writer reads as empty after the first-byte timeout", () => {
-  let clock = 0;
-  const text = readStdinIfPiped({
-    stdin: { isTTY: false },
-    firstByteTimeoutMs: 100,
-    now: () => clock,
-    wait: (milliseconds) => {
-      clock += milliseconds;
-    },
-    readSync() {
-      throw Object.assign(new Error("resource temporarily unavailable"), { code: "EAGAIN" });
-    }
-  });
+test("a piped stdin with no writer reads as empty after the first-byte timeout", { timeout: 5000 }, async () => {
+  const startedAt = Date.now();
+  const text = await readStdinIfPiped({ stdin: new PassThrough(), firstByteTimeoutMs: 100 });
   assert.equal(text, "");
+  assert.ok(Date.now() - startedAt < 2000);
 });

@@ -266,3 +266,36 @@ test("a batch-file argument with a space and a trailing backslash reaches the ba
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), input);
 });
+
+// Copies an environment without NoDefaultCurrentDirectoryInExePath in any spelling.
+function envWithoutCurrentDirectoryGuard(env) {
+  return Object.fromEntries(Object.entries(env).filter(([key]) => key.toUpperCase() !== "NODEFAULTCURRENTDIRECTORYINEXEPATH"));
+}
+
+test("a batch file that calls bare node does not run a node.cmd from the working folder", windowsOnly, () => {
+  const shimDir = makeTempDir();
+  const plantDir = makeTempDir();
+  fs.writeFileSync(path.join(shimDir, "real.cjs"), 'process.stdout.write("real node");\n');
+  fs.writeFileSync(path.join(shimDir, "node-shim.cmd"), '@echo off\r\nnode "%~dp0real.cjs" %*\r\n');
+  const marker = path.join(plantDir, "planted-ran.txt");
+  fs.writeFileSync(path.join(plantDir, "node.cmd"), `@echo off\r\necho planted> "${marker}"\r\n`);
+  const env = envWithoutCurrentDirectoryGuard(process.env);
+  const pathKey = Object.keys(env).find((key) => key.toUpperCase() === "PATH") ?? "PATH";
+  env[pathKey] = `${shimDir};${path.dirname(process.execPath)};${env[pathKey] ?? ""}`;
+
+  const result = runCommand("node-shim", [], { cwd: plantDir, env });
+
+  assert.equal(fs.existsSync(marker), false, "the planted node.cmd ran");
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "real node");
+});
+
+test("a batch-file plan sets NoDefaultCurrentDirectoryInExePath and keeps the rest of the environment", windowsOnly, () => {
+  const dir = makeTempDir();
+  fs.writeFileSync(path.join(dir, "codex.cmd"), "");
+  const plan = resolveCommand("codex", [], { PATH: dir, PATHEXT: ".EXE;.CMD", nodefaultcurrentdirectoryinexepath: "", KEEP: "yes" }, "win32");
+  assert.equal(plan.options.env.NoDefaultCurrentDirectoryInExePath, "1");
+  assert.equal(plan.options.env.nodefaultcurrentdirectoryinexepath, undefined);
+  assert.equal(plan.options.env.KEEP, "yes");
+  assert.equal(plan.options.env.PATH, dir);
+});

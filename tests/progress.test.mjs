@@ -251,3 +251,26 @@ test("a runner that omits its ids keeps the stored thread and turn ids", async (
   assert.equal(stored.threadId, "t1");
   assert.equal(stored.turnId, "u1");
 });
+
+test("a run that ends with a failing exit status stores its message as errorMessage", async (t) => {
+  const { root, job } = queueJob(t, "task-exit-failure");
+
+  await runTrackedJob(job, async () => ({
+    exitStatus: 1,
+    payload: { status: 1, failureMessage: "Codex rejected the request." },
+    rendered: "failed\n",
+    summary: "Codex Task failed"
+  }));
+
+  const stored = readStored(root, job.id);
+  assert.equal(stored.status, "failed");
+  assert.equal(stored.errorMessage, "Codex rejected the request.");
+});
+
+test("a failing run without a failure message stores its summary as errorMessage", async (t) => {
+  const { root, job } = queueJob(t, "task-exit-summary");
+
+  await runTrackedJob(job, async () => ({ exitStatus: 2, payload: { status: 2 }, rendered: "failed\n", summary: "Review failed" }));
+
+  assert.equal(readStored(root, job.id).errorMessage, "Review failed");
+});

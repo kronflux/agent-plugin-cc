@@ -67,7 +67,7 @@ async function handleSessionEnd(input) {
 }
 
 async function main() {
-  const input = readHookInputJson();
+  const input = await readHookInputJson();
   const eventName = process.argv[2] ?? input.hook_event_name ?? "";
 
   if (eventName === "SessionStart") {

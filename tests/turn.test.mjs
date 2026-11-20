@@ -7,9 +7,8 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { isProcessAlive } from "../plugins/agent/scripts/lib/process.mjs";
 import { readTurnResultFromRollout } from "../plugins/agent/scripts/providers/codex/rollout.mjs";
-import { readJobFile, resolveJobFile, writeJobFile } from "../plugins/agent/scripts/lib/state.mjs";
+import { writeJobFile } from "../plugins/agent/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
@@ -25,22 +24,14 @@ function makeRepo(behavior) {
   return { repo, env: buildEnv(binDir) };
 }
 
-async function waitUntil(predicate, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (predicate()) {
-      return true;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  return false;
-}
-
+// Writes a rollout file with one line per record. A string record is written as it is, so a
+// test can add a line that is not JSON.
 function writeRollout(codexHome, threadId, records) {
   const dir = path.join(codexHome, "sessions", "2026", "10", "02");
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `rollout-2026-10-02T10-00-00-${threadId}.jsonl`);
-  fs.writeFileSync(file, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+  const lines = records.map((record) => (typeof record === "string" ? record : JSON.stringify(record)));
+  fs.writeFileSync(file, `${lines.join("\n")}\n`);
 }
 
 test("a turn that stops sending events ends with the output it produced", () => {
@@ -58,24 +49,6 @@ test("a turn that stops sending events ends with the output it produced", () => 
   assert.match(payload.failureMessage, /sent no events for 2 s/);
 });
 
-test("cancel stops a worker whose turn ignores the interrupt", async () => {
-  const { repo, env } = makeRepo("interrupt-ignored");
-  const launched = run("node", [SCRIPT, "task", "--background", "--json", "long job"], { cwd: repo, env });
-  assert.equal(launched.status, 0, launched.stderr);
-  const { jobId } = JSON.parse(launched.stdout);
-  const jobFile = resolveJobFile(repo, jobId);
-  assert.ok(await waitUntil(() => Boolean(readJobFile(jobFile).turnId), 15000), "the turn did not start");
-  const workerPid = readJobFile(jobFile).pid;
-
-  const started = Date.now();
-  const cancelled = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
-
-  assert.equal(cancelled.status, 0, cancelled.stderr);
-  assert.ok(Date.now() - started < 15000, `cancel took ${Date.now() - started} ms`);
-  assert.ok(await waitUntil(() => !isProcessAlive(workerPid), 5000), "the worker kept running");
-  assert.match(fs.readFileSync(readJobFile(jobFile).logFile, "utf8"), /still running 10 s after the interrupt/);
-});
-
 test("readTurnResultFromRollout reads only the requested turn", () => {
   const codexHome = makeTempDir();
   writeRollout(codexHome, "thr-1", [
@@ -90,8 +63,10 @@ test("readTurnResultFromRollout reads only the requested turn", () => {
     { ...readTurnResultFromRollout("thr-1", "turn-a", { codexHome }), file: undefined },
     { text: "Answer A", complete: true, file: undefined }
   );
-  assert.equal(readTurnResultFromRollout("thr-1", "turn-b", { codexHome }).text, "Half of B");
-  assert.equal(readTurnResultFromRollout("thr-1", "turn-b", { codexHome }).complete, false);
+  const turnB = readTurnResultFromRollout("thr-1", "turn-b", { codexHome });
+  assert.ok(turnB, "turn-b was not found in the rollout");
+  assert.equal(turnB.text, "Half of B");
+  assert.equal(turnB.complete, false);
   assert.equal(readTurnResultFromRollout("thr-1", "turn-c", { codexHome }), null);
   assert.equal(readTurnResultFromRollout("thr-1", null, { codexHome }), null);
 });

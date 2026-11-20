@@ -4,19 +4,31 @@
 
 export const KNOWN_REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
+// The most model list pages read; a server that keeps naming new pages is not followed further.
+const MAX_MODEL_LIST_PAGES = 50;
+
+// Reads every page of the model list. Paging stops at a cursor already seen and after
+// MAX_MODEL_LIST_PAGES pages. A page without a data array adds no models.
 async function listModels(client) {
   const models = [];
+  const seenCursors = new Set();
   let cursor = null;
-  do {
+  for (let pages = 0; pages < MAX_MODEL_LIST_PAGES; pages += 1) {
     const page = await client.request("model/list", cursor ? { cursor } : {});
     models.push(...(Array.isArray(page?.data) ? page.data : []));
     cursor = page?.nextCursor ?? null;
-  } while (cursor);
+    if (!cursor || seenCursors.has(cursor)) {
+      break;
+    }
+    seenCursors.add(cursor);
+  }
   return models;
 }
 
+// A model whose effort list is not an array lists no efforts, so its effort check is skipped.
 function supportedEfforts(model) {
-  return (model.supportedReasoningEfforts ?? [])
+  const efforts = model?.supportedReasoningEfforts;
+  return (Array.isArray(efforts) ? efforts : [])
     .map((entry) => (typeof entry === "string" ? entry : entry?.reasoningEffort))
     .filter(Boolean);
 }

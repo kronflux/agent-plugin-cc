@@ -4,6 +4,8 @@
 
 - The plugin needs Node.js 22.13 or later.
 - Each Codex command now starts its own app server and stops it when done. The shared per-repository broker is removed, along with its session record and session-end teardown. `cancel` stops the job's worker, which ends its app server, and no longer sends a turn interrupt. `status` and `setup` report the session runtime as direct startup. Shared app servers started by an earlier version stop on their own idle timeout.
+- Cancel keeps output a worker recorded before it stopped. Failed worktree launches remove their worktree and branch. Follow-up turns on a worktree job run in that worktree. `--timeout-ms` must be a positive number.
+- Status and result no longer print a `codex resume` command for a job whose thread is ephemeral, and review jobs no longer print a resume command.
 - On POSIX, if the shared temp state root (`$TMPDIR/agent-plugin-<uid>`) is a symlink or belongs to another user, commands stop with "The plugin state folder <dir> is not a private folder owned by you; set CLAUDE_PLUGIN_DATA."
 - An unreadable legacy `state.json` is now kept, with a warning on stderr.
 

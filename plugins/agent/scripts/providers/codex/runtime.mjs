@@ -491,6 +491,15 @@ function recordItem(state, item, lifecycle, threadId = null) {
 function applyTurnNotification(state, message) {
   switch (message.method) {
     case "thread/started":
+      // A thread that is neither this turn's nor a known subagent keeps only its label, which
+      // names it if a collaboration call later registers it as a subagent.
+      if (message.params.thread.id !== state.threadId && !state.threadIds.has(message.params.thread.id)) {
+        const label = message.params.thread.name ?? message.params.thread.agentNickname ?? message.params.thread.agentRole ?? null;
+        if (label) {
+          state.threadLabels.set(message.params.thread.id, label);
+        }
+        break;
+      }
       registerThread(state, message.params.thread.id, {
         threadName: message.params.thread.name,
         name: message.params.thread.name,
@@ -545,12 +554,13 @@ function applyTurnNotification(state, message) {
         scheduleInferredCompletion(state);
         break;
       }
+      // The turn is completed before the progress write, which can throw.
+      completeTurn(state, message.params.turn);
       emitProgress(
         state.onProgress,
         `Turn ${message.params.turn.status === "completed" ? "completed" : message.params.turn.status}.`,
         "finalizing"
       );
-      completeTurn(state, message.params.turn);
       break;
     default:
       break;
@@ -645,9 +655,11 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       .map((part) => (typeof part?.text === "string" ? part.text : ""))
       .join("")
       .trim();
-    const match =
-      (item.clientId && sentMessages.get(item.clientId)) ||
-      [...sentMessages.values()].find((message) => message.text.trim() === text);
+    // An item with a client id confirms only the message sent under that id; text matching
+    // applies only to items without one.
+    const match = item.clientId
+      ? sentMessages.get(item.clientId)
+      : [...sentMessages.values()].find((message) => message.text.trim() === text);
     if (!match) {
       return;
     }
@@ -677,7 +689,21 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     idleTimer.unref?.();
   }
 
+  // The client keeps reading lines after a handler error, so an error here fails the turn
+  // instead of leaving it waiting for an event that was already handled.
   client.setNotificationHandler((message) => {
+    try {
+      handleTurnNotification(message);
+    } catch (error) {
+      if (!state.completed) {
+        state.completed = true;
+        clearCompletionTimer(state);
+        state.rejectCompletion(error);
+      }
+    }
+  });
+
+  function handleTurnNotification(message) {
     if (!state.turnId) {
       state.bufferedNotifications.push(message);
       return;
@@ -704,7 +730,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       confirmMessage(message.params.item);
     }
     armIdleTimer();
-  });
+  }
 
   try {
     const response = await startRequest();
@@ -734,6 +760,13 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       inboxTimer.unref?.();
     }
 
+    // An app server that exits before the turn completes fails the turn with the exit reason.
+    client.exitPromise?.then(() => {
+      if (!state.completed) {
+        state.completed = true;
+        state.rejectCompletion(client.exitError ?? new Error("codex app-server connection closed before the turn completed."));
+      }
+    });
     return await state.completion;
   } finally {
     clearInterval(inboxTimer);
@@ -799,7 +832,13 @@ function importedThreadIdFromLedger(sourcePath, { contentSha256, importStartedAt
   if (!fs.existsSync(ledgerPath)) {
     return null;
   }
-  const ledger = readJsonFile(ledgerPath);
+  // A ledger that cannot be parsed records no import, so the caller reports the missing thread.
+  let ledger;
+  try {
+    ledger = readJsonFile(ledgerPath);
+  } catch {
+    return null;
+  }
   const source = comparableImportPath(fs.realpathSync(sourcePath));
   const startedAtSeconds = Math.floor(importStartedAtMs / 1000);
   const records = Array.isArray(ledger?.records) ? ledger.records : [];
@@ -1118,48 +1157,6 @@ export async function readCodexRateLimits(cwd) {
   }
 }
 
-export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
-  if (!threadId || !turnId) {
-    return {
-      attempted: false,
-      interrupted: false,
-      transport: null,
-      detail: "missing threadId or turnId"
-    };
-  }
-
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    return {
-      attempted: false,
-      interrupted: false,
-      transport: null,
-      detail: availability.detail
-    };
-  }
-
-  let client = null;
-  try {
-    client = await CodexAppServerClient.connect(cwd);
-    await client.request("turn/interrupt", { threadId, turnId });
-    return {
-      attempted: true,
-      interrupted: true,
-      transport: client.transport,
-      detail: `Interrupted ${turnId} on ${threadId}.`
-    };
-  } catch (error) {
-    return {
-      attempted: true,
-      interrupted: false,
-      transport: client?.transport ?? null,
-      detail: error instanceof Error ? error.message : String(error)
-    };
-  } finally {
-    await client?.close().catch(() => {});
-  }
-}
-
 export async function runAppServerReview(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -1270,6 +1267,12 @@ export async function runAppServerTurn(cwd, options = {}) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/agent:codex-setup`.");
   }
 
+  // The prompt is checked first, so an empty one neither starts nor resumes a thread.
+  const prompt = options.prompt?.trim() || options.defaultPrompt || "";
+  if (!prompt) {
+    throw new Error("A prompt is required for this Codex run.");
+  }
+
   // The app server is the repository's; the thread can run in another directory, such as a worktree.
   const threadCwd = options.threadCwd ?? cwd;
   return withAppServer(cwd, async (client) => {
@@ -1298,11 +1301,6 @@ export async function runAppServerTurn(cwd, options = {}) {
     emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", {
       threadId
     });
-
-    const prompt = options.prompt?.trim() || options.defaultPrompt || "";
-    if (!prompt) {
-      throw new Error("A prompt is required for this Codex run.");
-    }
 
     const turnState = await captureTurn(
       client,

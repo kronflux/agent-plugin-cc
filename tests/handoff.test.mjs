@@ -22,7 +22,11 @@ function makeRepo() {
 }
 
 function lastPrompt(binDir) {
-  return JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8")).lastTurnStart.prompt;
+  const stateFile = path.join(binDir, "fake-codex-state.json");
+  assert.ok(fs.existsSync(stateFile), "the fake Codex recorded no state");
+  const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  assert.ok(state.lastTurnStart, "the fake Codex recorded no turn");
+  return state.lastTurnStart.prompt;
 }
 
 test("task --from-last-review sends the newest review's findings", () => {

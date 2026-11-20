@@ -275,3 +275,34 @@ test("status reads only the tail of a large log", (t) => {
 
   assert.deepEqual(preview, ["TAIL_LINE_2", "TAIL_LINE_3", "TAIL_LINE_4", "TAIL_LINE_5"]);
 });
+
+test("an empty process marker in a record does not let a reused pid be stopped", () => {
+  const stopped = [];
+  const [outcome] = terminateJobProcesses(
+    [{ id: "task-planted", provider: "codex", status: "running", pid: 424243, processMarker: "" }],
+    {
+      readCommandLines: (pids) => new Map(pids.map((pid) => [pid, "notepad.exe --planted"])),
+      terminate: (pid) => {
+        stopped.push(pid);
+        return { delivered: true };
+      }
+    }
+  );
+
+  assert.equal(outcome.outcome, "pid-reused");
+  assert.deepEqual(stopped, []);
+});
+
+test("an empty process marker in a record does not keep a reused pid's job alive", async () => {
+  const workspace = makeTempDir();
+  upsertJob(workspace, { id: "task-empty-marker", provider: "codex", status: "running", pid: 424244, processMarker: "" });
+
+  const reaped = await reconcileJobLiveness(workspace, {
+    isAlive: () => true,
+    readCommandLines: (pids) => new Map(pids.map((pid) => [pid, "notepad.exe --planted"])),
+    interruptTurn: noInterrupt
+  });
+
+  assert.deepEqual(reaped, ["task-empty-marker"]);
+  assert.match(readJobFile(resolveJobFile(workspace, "task-empty-marker")).errorMessage, /belongs to another program/);
+});

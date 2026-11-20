@@ -215,7 +215,7 @@ async function handleTask(argv) {
   if ([resumeLast, fresh, Boolean(resumeThreadId)].filter(Boolean).length > 1) {
     throw new Error("Choose only one of --resume/--resume-last, --resume-thread, and --fresh.");
   }
-  const prompt = (positionals.join(" ") || readStdinIfPiped()).trim();
+  const prompt = (positionals.join(" ") || (await readStdinIfPiped())).trim();
   if (!prompt) {
     throw new Error("Provide a prompt or piped stdin.");
   }

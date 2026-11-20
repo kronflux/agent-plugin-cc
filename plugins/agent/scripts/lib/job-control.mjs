@@ -32,8 +32,10 @@ function queuedSince(job) {
   return -Infinity;
 }
 
+// A record without a marker, or with an empty one, which every command line contains, is
+// checked against its provider's marker.
 function jobProcessMarker(job) {
-  return job.processMarker ?? providerForJob(job).processMarker;
+  return job.processMarker || providerForJob(job).processMarker;
 }
 
 /**
@@ -321,12 +323,12 @@ export function enrichJob(job, options = {}) {
   };
 }
 
-export function readStoredJob(workspaceRoot, jobId) {
+export function readStoredJob(workspaceRoot, jobId, options = {}) {
   const jobFile = resolveJobFile(workspaceRoot, jobId);
   if (!fs.existsSync(jobFile)) {
     return null;
   }
-  return readJobFile(jobFile);
+  return readJobFile(jobFile, options);
 }
 
 function matchJobReference(jobs, reference, predicate = () => true) {

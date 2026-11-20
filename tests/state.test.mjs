@@ -13,7 +13,16 @@ const { listJobs, queueJobMessage, readJobFile, resolveJobFile, resolveJobsDir, 
 
 test("resolveStateDir uses a temp-backed per-workspace directory", (t) => {
   const workspace = makeTempDir(t);
-  const stateDir = resolveStateDir(workspace);
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+  delete process.env.CLAUDE_PLUGIN_DATA;
+  let stateDir;
+  try {
+    stateDir = resolveStateDir(workspace);
+  } finally {
+    if (previousPluginDataDir !== undefined) {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
 
   assert.equal(stateDir.startsWith(os.tmpdir()), true);
   assert.match(path.basename(stateDir), /.+-[a-f0-9]{16}$/);
@@ -81,7 +90,6 @@ test("a legacy prompt reaches the worker and leaves the record", (t) => {
 
   assert.equal(fs.readFileSync(jobFile, "utf8").includes("old prompt"), false);
   assert.equal(readJobFile(jobFile).status, "queued");
-  assert.equal(fs.existsSync(`${jobFile}.lock`), false);
   assert.equal(takeJobRequest(workspace, "task-legacy-take"), null);
 });
 
@@ -97,7 +105,6 @@ test("a newer write during the legacy prompt hand-over is kept", (t) => {
 
   assert.deepEqual(request, { prompt: "old prompt" });
   assert.equal(readJobFile(jobFile).summary, "newer");
-  assert.equal(fs.existsSync(`${jobFile}.lock`), false);
 });
 
 test("a corrupt legacy state file is kept and warned about", (t) => {
@@ -157,4 +164,40 @@ test("a bad message file does not lose messages claimed with it", async (t) => {
     ["first", "third"]
   );
   assert.deepEqual(takeJobMessages(workspace, "task-msg"), []);
+});
+
+test("reads skip a shared fallback state root that is not private to the caller", (t) => {
+  const { candidateStateDirs } = state;
+  assert.equal(typeof candidateStateDirs, "function", "candidateStateDirs is exported");
+  const workspace = makeTempDir(t);
+  const pluginDataDir = makeTempDir(t);
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  const warnings = [];
+  const originalWrite = process.stderr.write;
+  process.stderr.write = (chunk) => {
+    warnings.push(String(chunk));
+    return true;
+  };
+  const stat = (uid) => () => ({ isSymbolicLink: () => false, isDirectory: () => true, uid });
+  const missing = () => {
+    throw Object.assign(new Error("missing"), { code: "ENOENT" });
+  };
+  try {
+    const primary = resolveStateDir(workspace);
+    const foreign = { platform: "linux", lstat: stat(0), getuid: () => 1000 };
+    assert.deepEqual(candidateStateDirs(workspace, foreign), [primary]);
+    assert.deepEqual(candidateStateDirs(workspace, foreign), [primary]);
+    assert.equal(candidateStateDirs(workspace, { platform: "linux", lstat: stat(1000), getuid: () => 1000 }).length, 2);
+    assert.equal(candidateStateDirs(workspace, { platform: "linux", lstat: missing, getuid: () => 1000 }).length, 2);
+  } finally {
+    process.stderr.write = originalWrite;
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
+  assert.equal(warnings.length, 1, warnings.join(""));
+  assert.match(warnings[0], /^warning: .*not a private folder owned by you.*; its jobs are not read\n$/);
 });

@@ -108,7 +108,10 @@ function escapeMarkdownCell(value) {
 
 /** Returns a backtick fence one longer than the longest backtick run in `text`, at least three. */
 export function fenceFor(text) {
-  const longestRun = Math.max(0, ...(String(text ?? "").match(/`+/g) ?? []).map((run) => run.length));
+  let longestRun = 0;
+  for (const run of String(text ?? "").matchAll(/`+/g)) {
+    longestRun = Math.max(longestRun, run[0].length);
+  }
   return "`".repeat(Math.max(3, longestRun + 1));
 }
 

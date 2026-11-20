@@ -18,7 +18,7 @@ const readline = require("node:readline");
 	const BEHAVIOR = ${JSON.stringify(behavior)};
 	const interruptibleTurns = new Map();
 	// Behaviors whose turns stay active for 5 s, so they can be interrupted or steered.
-	const SLOW_TURN_BEHAVIORS = new Set(["interruptible-slow-task", "steer-rejected", "steer-no-item", "steer-turn-ended"]);
+	const SLOW_TURN_BEHAVIORS = new Set(["interruptible-slow-task", "steer-rejected", "steer-no-item", "steer-turn-ended", "steer-foreign-client-id"]);
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
@@ -64,7 +64,9 @@ function withStateLock(fn) {
       lockDepth -= 1;
     }
   }
-  for (let attempt = 0; ; attempt += 1) {
+  // A loaded machine can slow a live holder, so a waiter gives up only after 10 s.
+  const deadline = Date.now() + 10000;
+  for (;;) {
     try {
       fs.writeFileSync(LOCK_PATH, String(process.pid), { flag: "wx" });
       break;
@@ -85,7 +87,7 @@ function withStateLock(fn) {
         fs.rmSync(LOCK_PATH, { force: true });
         continue;
       }
-      if (attempt >= 50) {
+      if (Date.now() >= deadline) {
         throw new Error("fake codex state lock is held by process " + holder);
       }
       sleepSync(20);
@@ -446,17 +448,26 @@ function handleMessage(message) {
         if (BEHAVIOR === "no-model-list") {
           throw new Error("unknown method model/list");
         }
+        state.modelListPages = (state.modelListPages || 0) + 1;
+        saveState(state);
         const efforts = (names) => names.map((reasoningEffort) => ({ reasoningEffort, description: reasoningEffort }));
-        send({
-          id: message.id,
-          result: {
-            data: [
-              { id: "gpt-5.4", model: "gpt-5.4", isDefault: true, supportedReasoningEfforts: efforts(["low", "medium", "high", "xhigh"]) },
-              { id: "gpt-5.6-luna", model: "gpt-5.6-luna", isDefault: false, supportedReasoningEfforts: efforts(["low", "medium", "high"]) }
-            ],
-            nextCursor: null
-          }
-        });
+        const data = [
+          { id: "gpt-5.4", model: "gpt-5.4", isDefault: true, supportedReasoningEfforts: efforts(["low", "medium", "high", "xhigh"]) },
+          { id: "gpt-5.6-luna", model: "gpt-5.6-luna", isDefault: false, supportedReasoningEfforts: efforts(["low", "medium", "high"]) }
+        ];
+        if (BEHAVIOR === "model-list-not-array") {
+          // A schema violation: the effort list is an object, not an array.
+          data[0].supportedReasoningEfforts = { low: true };
+        }
+        // model-list-repeat-cursor always names the same next page; model-list-endless-cursor
+        // names a new one on every page.
+        const nextCursor =
+          BEHAVIOR === "model-list-repeat-cursor"
+            ? "cursor-repeat"
+            : BEHAVIOR === "model-list-endless-cursor"
+              ? "cursor-" + state.modelListPages
+              : null;
+        send({ id: message.id, result: { data, nextCursor } });
         break;
       }
 
@@ -494,6 +505,10 @@ function handleMessage(message) {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
         const thread = ensureThread(state, message.params.threadId);
+        // A resumed thread runs its next turns in the directory the resume names.
+        if (message.params.cwd) {
+          thread.cwd = message.params.cwd;
+        }
         thread.updatedAt = now();
         saveState(state);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
@@ -839,10 +854,26 @@ function handleMessage(message) {
             ]
             : []),
           {
-            completed: { type: "agentMessage", id: "msg_" + turnId, text: payload, phase: "final_answer" }
+            // A message without the final_answer phase leaves turn/completed as the only end.
+            completed: {
+              type: "agentMessage",
+              id: "msg_" + turnId,
+              text: payload,
+              phase: BEHAVIOR === "slow-task-no-final-phase" ? null : "final_answer"
+            }
           }
         ];
 
+	        if (BEHAVIOR === "foreign-thread-start") {
+	          // Another session's thread starts and answers while this turn runs.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({ method: "thread/started", params: { thread: { id: "thr_foreign", name: "other-session" } } });
+	          send({ method: "turn/started", params: { threadId: "thr_foreign", turn: buildTurn("turn_foreign") } });
+	          send({
+	            method: "item/completed",
+	            params: { threadId: "thr_foreign", turnId: "turn_foreign", item: { type: "agentMessage", id: "msg_foreign", text: "Answer from another session.", phase: "final_answer" } }
+	          });
+	        }
 	        if (BEHAVIOR === "stall-after-message") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          send({
@@ -870,7 +901,7 @@ function handleMessage(message) {
 	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
 	          }, 5000);
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
-	        } else if (BEHAVIOR === "slow-task") {
+	        } else if (BEHAVIOR === "slow-task" || BEHAVIOR === "slow-task-no-final-phase") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
@@ -897,7 +928,9 @@ function handleMessage(message) {
 	        saveState(state);
 	        send({ id: message.id, result: { turnId: params.expectedTurnId } });
 	        if (BEHAVIOR !== "steer-no-item") {
-	          const item = { type: "userMessage", id: "user_" + state.steerAttempts, clientId: params.clientUserMessageId || null, content: params.input || [] };
+	          // steer-foreign-client-id answers with the same text under another client's id.
+	          const clientId = BEHAVIOR === "steer-foreign-client-id" ? "other-client" : params.clientUserMessageId || null;
+	          const item = { type: "userMessage", id: "user_" + state.steerAttempts, clientId, content: params.input || [] };
 	          setTimeout(() => {
 	            send({ method: "item/started", params: { threadId: params.threadId, turnId: params.expectedTurnId, item } });
 	            send({ method: "item/completed", params: { threadId: params.threadId, turnId: params.expectedTurnId, item } });

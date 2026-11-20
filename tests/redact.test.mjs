@@ -104,6 +104,20 @@ test("a finished job leaves no request file", () => {
   assert.equal(fs.existsSync(requestFile), false);
 });
 
+test("a stored prompt in an older job record is moved out when its worker starts", () => {
+  const workspace = makeTempDir();
+  const jobFile = resolveJobFile(workspace, "task-old");
+  fs.writeFileSync(jobFile, JSON.stringify({ id: "task-old", status: "completed", request: { prompt: "old prompt" } }));
+  const before = fs.readFileSync(jobFile, "utf8");
+
+  assert.equal(listJobs(workspace).length, 1);
+  assert.equal(fs.readFileSync(jobFile, "utf8"), before);
+
+  assert.deepEqual(takeJobRequest(workspace, "task-old"), { prompt: "old prompt" });
+  assert.equal(fs.readFileSync(jobFile, "utf8").includes("old prompt"), false);
+  assert.equal(fs.existsSync(jobFile.replace(/.json$/, ".request.json")), false);
+});
+
 test("a background task leaves its prompt nowhere in the job records", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

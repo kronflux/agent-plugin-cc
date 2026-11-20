@@ -141,6 +141,14 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
 
 const CANCELLED_BEFORE_START = "Cancelled before the turn started.";
 
+function failureMessageOf(execution) {
+  const message = execution.payload?.failureMessage;
+  if (typeof message === "string" && message.trim()) {
+    return message.trim();
+  }
+  return typeof execution.summary === "string" && execution.summary.trim() ? execution.summary.trim() : null;
+}
+
 /**
  * Runs a job and records its outcome. The running record publishes this process's id; then
  * `options.onStarted` runs, and a job cancelled by then returns a cancelled result without
@@ -183,8 +191,11 @@ export async function runTrackedJob(job, runner, options = {}) {
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
     const stored = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
+    // A failed run keeps its message in errorMessage, the field a thrown failure fills too.
+    const failureMessage = completionStatus === "failed" ? failureMessageOf(execution) : null;
     writeJobFile(job.workspaceRoot, job.id, {
       ...stored,
+      ...(failureMessage ? { errorMessage: failureMessage } : {}),
       status: completionStatus,
       threadId: execution.threadId ?? stored.threadId ?? null,
       turnId: execution.turnId ?? stored.turnId ?? null,

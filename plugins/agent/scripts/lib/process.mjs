@@ -58,6 +58,11 @@ function quoteForCmd(value) {
  * argument array, and a batch file (such as the `.cmd` shim of an npm-installed CLI) runs through
  * `%ComSpec%`, because Node refuses to start batch files without one, with delayed expansion
  * turned off so `!` in an argument stays as written. `SHELL` is never read.
+ *
+ * cmd.exe looks for a bare command name such as `node` in the working folder before PATH, so
+ * a repository could plant `node.cmd` for the shim to run. The batch-file plan's `options.env`
+ * therefore sets `NoDefaultCurrentDirectoryInExePath=1`, which turns that lookup off; callers
+ * spread `options` after their own `env`.
  */
 export function resolveCommand(command, args = [], env = process.env, platform = process.platform) {
   if (platform !== "win32") {
@@ -74,8 +79,22 @@ export function resolveCommand(command, args = [], env = process.env, platform =
   return {
     file: readWindowsEnv(env, "COMSPEC") || "cmd.exe",
     args: ["/d", "/v:off", "/s", "/c", `"${commandLine}"`],
-    options: { windowsVerbatimArguments: true }
+    options: { windowsVerbatimArguments: true, env: withoutCurrentDirectoryLookup(env) }
   };
+}
+
+const CURRENT_DIRECTORY_GUARD = "NoDefaultCurrentDirectoryInExePath";
+
+function withoutCurrentDirectoryLookup(env) {
+  /** @type {NodeJS.ProcessEnv} */
+  const childEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toUpperCase() !== CURRENT_DIRECTORY_GUARD.toUpperCase()) {
+      childEnv[key] = value;
+    }
+  }
+  childEnv[CURRENT_DIRECTORY_GUARD] = "1";
+  return childEnv;
 }
 
 // `shell: false` spawns `command` as given, never through cmd.exe, for callers whose

@@ -5,10 +5,11 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { initGitRepo, makeTempDir, run, spawnJson } from "./helpers.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
+const TRANSFER_MODULE = path.join(ROOT, "plugins", "agent", "scripts", "providers", "codex", "claude-session-transfer.mjs");
 
 // os.homedir() reads USERPROFILE on Windows and HOME elsewhere, so both point at the test home.
 function setup(behavior, { claudeConfigDir = null } = {}) {
@@ -150,4 +151,58 @@ test("transfer rejects sources outside the Claude projects directory", () => {
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /only from .*\.claude.*projects/);
+});
+
+// Lists every entry under a folder as paths relative to it, sorted.
+function listTree(dir) {
+  if (!fs.existsSync(dir)) {
+    return [];
+  }
+  return fs.readdirSync(dir, { recursive: true }).map(String).sort();
+}
+
+test("a transfer that fails while staging leaves no staging folder", async (t) => {
+  const home = makeTempDir(t);
+  const scratch = makeTempDir(t);
+  // A folder cannot be copied as a file, so the staging copy fails after its folder exists.
+  const source = path.join(scratch, "session.jsonl");
+  fs.mkdirSync(source);
+  const script = path.join(scratch, "stage.mjs");
+  fs.writeFileSync(
+    script,
+    [
+      'import { pathToFileURL } from "node:url";',
+      "const [modulePath, sourcePath] = process.argv.slice(2);",
+      "const { stageClaudeSessionForImport } = await import(pathToFileURL(modulePath).href);",
+      "let error = null;",
+      "try {",
+      "  stageClaudeSessionForImport(sourcePath);",
+      "} catch (caught) {",
+      "  error = caught.message;",
+      "}",
+      "console.log(JSON.stringify({ error }));"
+    ].join("\n")
+  );
+  const before = listTree(home);
+
+  const { code, json } = await spawnJson(process.execPath, [script, TRANSFER_MODULE, source], {
+    env: { ...process.env, HOME: home, USERPROFILE: home }
+  });
+
+  assert.equal(code, 0);
+  assert.ok(json.error, "staging a folder did not fail");
+  assert.deepEqual(listTree(home), before);
+});
+
+test("a corrupt import ledger yields the clear message", () => {
+  const { repo, projectDir, env } = setup("external-import-fails");
+  const sourcePath = path.join(projectDir, "session.jsonl");
+  writeSession(sourcePath, [{ type: "user", cwd: repo, message: { role: "user", content: "Keep this request." } }]);
+  fs.mkdirSync(env.CODEX_HOME, { recursive: true });
+  fs.writeFileSync(path.join(env.CODEX_HOME, "external_agent_session_imports.json"), "{not json", "utf8");
+
+  const result = run("node", [SCRIPT, "transfer", "--source", sourcePath], { cwd: repo, env });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /did not record an imported thread/);
 });

@@ -87,22 +87,25 @@ export function stageClaudeSessionForImport(sourcePath) {
   const claudeDir = path.dirname(projects);
   const createdDirs = [claudeDir, projects].filter((dir) => !fs.existsSync(dir));
   const stagingDir = path.join(projects, `${STAGING_DIR_PREFIX}${crypto.randomBytes(6).toString("hex")}`);
-  fs.mkdirSync(stagingDir, { recursive: true, mode: 0o700 });
-  const stagedPath = path.join(stagingDir, path.basename(sourcePath));
-  fs.copyFileSync(sourcePath, stagedPath);
-
-  return {
-    path: stagedPath,
-    staged: true,
-    cleanup() {
-      fs.rmSync(stagingDir, { recursive: true, force: true });
-      for (const dir of createdDirs.reverse()) {
-        try {
-          fs.rmdirSync(dir);
-        } catch {
-          // The directory is not empty or is already gone.
-        }
+  const cleanup = () => {
+    fs.rmSync(stagingDir, { recursive: true, force: true });
+    for (const dir of [...createdDirs].reverse()) {
+      try {
+        fs.rmdirSync(dir);
+      } catch {
+        // The directory is not empty or is already gone.
       }
     }
   };
+  const stagedPath = path.join(stagingDir, path.basename(sourcePath));
+  // A failed copy removes the staging directory and the directories created for it.
+  try {
+    fs.mkdirSync(stagingDir, { recursive: true, mode: 0o700 });
+    fs.copyFileSync(sourcePath, stagedPath);
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+
+  return { path: stagedPath, staged: true, cleanup };
 }

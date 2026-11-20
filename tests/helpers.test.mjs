@@ -52,13 +52,62 @@ test("spawnJson rejects with stderr when stdout is not JSON", async () => {
   );
 });
 
-test("spawnJson rejects on timeout and stops the child", async (t) => {
+// True while a process with this id exists.
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+// On a loaded machine the child can be stopped before it writes its pid file; the test then
+// checks only that the call timed out.
+test("spawnJson rejects on timeout and stops the child", { timeout: 60000 }, async (t) => {
   const dir = makeTempDir(t);
   const pidFile = path.join(dir, "pid.txt");
   const script = `require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(()=>{},1000)`;
-  await assert.rejects(spawnJson(process.execPath, ["-e", script], { timeoutMs: 1000 }), /timed out/);
-  const pid = Number(fs.readFileSync(pidFile, "utf8"));
-  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  await assert.rejects(spawnJson(process.execPath, ["-e", script], { timeoutMs: 3000 }), /timed out/);
+  if (fs.existsSync(pidFile)) {
+    const pid = Number(fs.readFileSync(pidFile, "utf8"));
+    await waitUntil(() => !processExists(pid), { timeoutMs: 15000, describe: "the timed-out child to exit" });
+  }
+});
+
+test("spawnJson stops a timed-out child's descendants that hold its output", { timeout: 60000 }, async (t) => {
+  const dir = makeTempDir(t);
+  const pidFile = path.join(dir, "grandchild.txt");
+  // The grandchild inherits the child's stdout and stderr and would keep them open.
+  const script = [
+    'const { spawn } = require("node:child_process");',
+    'const grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "inherit" });',
+    `require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(grandchild.pid));`,
+    "setInterval(() => {}, 1000);"
+  ].join("\n");
+  let grandchildPid = null;
+  t.after(() => {
+    if (grandchildPid && processExists(grandchildPid)) {
+      process.kill(grandchildPid, "SIGKILL");
+    }
+  });
+
+  const outcome = await Promise.race([
+    spawnJson(process.execPath, ["-e", script], { timeoutMs: 4000 }).then(
+      () => "resolved",
+      (error) => error
+    ),
+    new Promise((resolve) => setTimeout(() => resolve("still waiting 30 s later"), 30000).unref())
+  ]);
+  if (fs.existsSync(pidFile)) {
+    grandchildPid = Number(fs.readFileSync(pidFile, "utf8"));
+  }
+
+  assert.ok(outcome instanceof Error, `spawnJson ${String(outcome)}`);
+  assert.match(outcome.message, /timed out/);
+  if (grandchildPid) {
+    await waitUntil(() => !processExists(grandchildPid), { timeoutMs: 15000, describe: "the grandchild to exit" });
+  }
 });
 
 test("makeTempDir removes its folder when the test ends", async (t) => {

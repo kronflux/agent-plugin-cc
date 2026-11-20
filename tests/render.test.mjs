@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  fenceFor,
   renderJobStatusReport,
   renderNativeReviewResult,
   renderReviewResult,
@@ -195,4 +196,9 @@ test("status and result print no resume command for an ephemeral thread", () => 
   const durable = { ...job, ephemeralThread: undefined };
   assert.match(renderJobStatusReport(durable), /Resume in Codex: codex resume thr_eph/);
   assert.match(renderStoredJobResult(durable, { ...durable, rendered: "Done.\n" }), /Resume in Codex: codex resume thr_eph/);
+});
+
+test("fenceFor handles text with very many backtick runs", () => {
+  assert.equal(fenceFor("` x ".repeat(200000)), "```");
+  assert.equal(fenceFor(`${"` x ".repeat(200000)}`.concat("`````")), "``````");
 });

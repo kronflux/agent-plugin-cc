@@ -19,75 +19,82 @@ export function isProbablyText(buffer) {
   return true;
 }
 
-const STDIN_CHUNK_SIZE = 64 * 1024;
-const STDIN_RETRY_MAX_DELAY_MS = 200;
-// A non-blocking pipe that has not received anything yet cannot be told apart from a writer
-// that never writes, so input that has not started within this time is read as empty.
+// A pipe that has not received anything yet cannot be told apart from a writer that never
+// writes, so input that has not started within this time is read as empty.
 const STDIN_FIRST_BYTE_TIMEOUT_MS = 5000;
-// A writer that sends part of its input and then stalls without closing the pipe ends the read
-// at this deadline, counted from the start of the read; what arrived until then is returned.
+// A writer that stalls without closing the pipe, or that never stops writing, ends the read at
+// this deadline, counted from the start of the read; what arrived until then is returned.
 const STDIN_TOTAL_TIMEOUT_MS = 30000;
-const TRANSIENT_READ_CODES = new Set(["EAGAIN", "EWOULDBLOCK"]);
-
-function sleepSync(milliseconds) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
-}
 
 /**
- * Reads all of stdin unless it is a terminal. When stdin is a non-blocking pipe, a read can
- * fail with EAGAIN before data is available; such reads are retried with backoff instead of
- * failing, until the first-byte or the total deadline passes.
+ * Resolves to all of stdin, or to an empty string at once when stdin is a terminal or already
+ * closed. A stream that closes or is destroyed without an end resolves to what arrived. The read is
+ * asynchronous, so the first-byte and total deadlines end it on every platform, including a
+ * Windows pipe whose writer stalls. A read ended by a deadline resolves to what arrived and
+ * destroys stdin, so the open pipe does not keep the process alive.
  */
 export function readStdinIfPiped(options = {}) {
   const stdin = options.stdin ?? process.stdin;
-  const readSync = options.readSync ?? fs.readSync;
-  const wait = options.wait ?? sleepSync;
-  const now = options.now ?? Date.now;
   const firstByteTimeoutMs = options.firstByteTimeoutMs ?? STDIN_FIRST_BYTE_TIMEOUT_MS;
   const totalTimeoutMs = options.totalTimeoutMs ?? STDIN_TOTAL_TIMEOUT_MS;
-  if (stdin.isTTY) {
-    return "";
+  if (stdin.isTTY || stdin.readableEnded || stdin.destroyed) {
+    return Promise.resolve("");
   }
 
-  // One scratch buffer serves every read; each chunk is copied out before the next read.
-  const buffer = Buffer.allocUnsafe(STDIN_CHUNK_SIZE);
-  const chunks = [];
-  const startedAt = now();
-  let delay = 5;
-  for (;;) {
-    let bytesRead;
-    try {
-      bytesRead = readSync(0, buffer, 0, buffer.length, null);
-    } catch (error) {
-      if (error?.code === "EOF") {
-        break;
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let settled = false;
+    let firstByteTimer = null;
+    let totalTimer = null;
+
+    const finish = ({ error = null, timedOut = false } = {}) => {
+      if (settled) {
+        return;
       }
-      if (!TRANSIENT_READ_CODES.has(error?.code)) {
-        throw error;
+      settled = true;
+      clearTimeout(firstByteTimer);
+      clearTimeout(totalTimer);
+      stdin.off("data", onData);
+      stdin.off("end", onEnd);
+      stdin.off("close", onClose);
+      stdin.off("error", onError);
+      if (timedOut || error) {
+        // An error the closing pipe reports after the read ended is not the read's error.
+        stdin.on("error", () => {});
+        stdin.destroy();
       }
-      const elapsed = now() - startedAt;
-      if (elapsed >= totalTimeoutMs || (chunks.length === 0 && elapsed >= firstByteTimeoutMs)) {
-        break;
+      if (error) {
+        reject(error);
+        return;
       }
-      wait(delay);
-      delay = Math.min(delay * 2, STDIN_RETRY_MAX_DELAY_MS);
-      continue;
-    }
-    if (bytesRead === 0) {
-      break;
-    }
-    chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
-    delay = 5;
-  }
-  return Buffer.concat(chunks).toString("utf8");
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    };
+    const onData = (chunk) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      clearTimeout(firstByteTimer);
+    };
+    const onEnd = () => finish();
+    const onClose = () => finish();
+    // A closed pipe can report end of input as an EOF error.
+    const onError = (error) => finish(error?.code === "EOF" ? {} : { error });
+
+    firstByteTimer = setTimeout(() => finish({ timedOut: true }), firstByteTimeoutMs);
+    totalTimer = setTimeout(() => finish({ timedOut: true }), totalTimeoutMs);
+    stdin.on("data", onData);
+    stdin.on("end", onEnd);
+    stdin.on("close", onClose);
+    stdin.on("error", onError);
+    stdin.resume();
+  });
 }
 
 /**
- * Reads a hook's JSON input from stdin. Empty input is an empty object; input that does not
- * parse throws an error that says the hook input is not valid JSON.
+ * Resolves to a hook's JSON input from stdin. Empty input is an empty object; input that does
+ * not parse, including input cut short by a deadline, rejects with an error that says the hook
+ * input is not valid JSON.
  */
-export function readHookInputJson(options = {}) {
-  const raw = readStdinIfPiped(options).trim();
+export async function readHookInputJson(options = {}) {
+  const raw = (await readStdinIfPiped(options)).trim();
   if (!raw) {
     return {};
   }

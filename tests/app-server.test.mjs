@@ -1,5 +1,7 @@
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
@@ -23,7 +25,7 @@ class CapturingClient extends AppServerClientBase {
   }
 }
 
-test("handleServerRequest accepts MCP elicitation requests instead of rejecting them", () => {
+test("an elicitation request with no mode is accepted with empty content", () => {
   const client = new CapturingClient();
   client.handleServerRequest({
     id: 7,
@@ -44,8 +46,8 @@ test("handleServerRequest still rejects unknown server requests with -32601", ()
   assert.equal(client.sent[0].error.code, -32601);
 });
 
-test("form-mode elicitation requests are declined instead of accepted with empty content", () => {
-  for (const mode of ["form", "openai/form"]) {
+for (const mode of ["form", "openai/form", "openaiForm", "url"]) {
+  test(`an elicitation request in ${mode} mode is declined`, () => {
     const client = new CapturingClient();
     client.handleServerRequest({
       id: 9,
@@ -53,15 +55,17 @@ test("form-mode elicitation requests are declined instead of accepted with empty
       params: { threadId: "t1", mode }
     });
     assert.deepEqual(client.sent, [{ id: 9, result: { action: "decline" } }]);
-  }
+  });
+}
 
-  const urlClient = new CapturingClient();
-  urlClient.handleServerRequest({
+test("an elicitation request with an unknown mode is accepted with empty content", () => {
+  const client = new CapturingClient();
+  client.handleServerRequest({
     id: 10,
     method: "mcpServer/elicitation/request",
-    params: { threadId: "t1", mode: "url" }
+    params: { threadId: "t1", mode: "some-future-mode" }
   });
-  assert.deepEqual(urlClient.sent, [{ id: 10, result: { action: "accept", content: null, _meta: null } }]);
+  assert.deepEqual(client.sent, [{ id: 10, result: { action: "accept", content: null, _meta: null } }]);
 });
 
 // The non-interactive runner has no operator, so every approval request must be
@@ -275,3 +279,119 @@ test(
     assert.deepEqual(client.proc.kills, ["SIGTERM", "SIGKILL"]);
   }
 );
+
+for (const line of ["null", "42", '"text"', "[]"]) {
+  test(`a line that parses to ${line} is a protocol error that closes the client`, async () => {
+    const client = new CapturingClient();
+    const pending = client.request("thread/list", {});
+    assert.doesNotThrow(() => client.handleLine(line));
+    assert.equal(client.closed, true);
+    await assert.rejects(pending, /codex app-server sent a line that is not a JSON-RPC message/);
+  });
+}
+
+/**
+ * A child-process stand-in with real stdout and stderr streams, for attachProcess. Messages the
+ * client writes to stdin are recorded in `written`.
+ */
+function makeStreamProcess() {
+  const proc = new EventEmitter();
+  proc.pid = 999998;
+  proc.exitCode = null;
+  proc.signalCode = null;
+  proc.stdout = new PassThrough();
+  proc.stderr = new PassThrough();
+  proc.written = [];
+  proc.stdin = new EventEmitter();
+  proc.stdin.write = (line) => {
+    proc.written.push(JSON.parse(line));
+    return true;
+  };
+  proc.stdin.end = () => {};
+  proc.kill = () => true;
+  return proc;
+}
+
+test("a stdin error rejects pending requests instead of crashing", async () => {
+  const client = new SpawnedCodexAppServerClient(process.cwd());
+  const proc = makeStreamProcess();
+  client.attachProcess(proc);
+  const pending = client.request("thread/list", {});
+
+  assert.doesNotThrow(() => proc.stdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" })));
+
+  await assert.rejects(pending, /codex app-server stdin failed: write EPIPE/);
+  assert.equal(client.closed, true);
+});
+
+test("a response written just before the app server exits is still delivered", async () => {
+  const client = new SpawnedCodexAppServerClient(process.cwd());
+  const proc = makeStreamProcess();
+  client.attachProcess(proc);
+  const pending = client.request("thread/list", {});
+  const id = proc.written[0].id;
+
+  // The exit event can arrive before stdout has been read to its end.
+  proc.exitCode = 0;
+  proc.emit("exit", 0, null);
+  proc.stdout.end(`${JSON.stringify({ id, result: { data: ["last"] } })}\n`);
+  await new Promise((resolve) => proc.stdout.once("end", resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  proc.emit("close", 0, null);
+
+  assert.deepEqual(await pending, { data: ["last"] });
+});
+
+test("close after a stdin error still waits for the app server to exit", { timeout: 15000 }, async (t) => {
+  const client = new SpawnedCodexAppServerClient(process.cwd(), { terminateProcessTree: () => ({ delivered: true }) });
+  const proc = makeStreamProcess();
+  let ended = false;
+  proc.stdin.end = () => {
+    ended = true;
+    // The app server exits a little later, once it sees its input end.
+    setTimeout(() => {
+      proc.exitCode = 0;
+      proc.emit("exit", 0, null);
+      proc.stdout.end();
+      proc.stderr.end();
+      setImmediate(() => proc.emit("close", 0, null));
+    }, 200);
+  };
+  client.attachProcess(proc);
+  const keepAlive = setInterval(() => {}, 1000);
+  t.after(() => clearInterval(keepAlive));
+  proc.stdin.emit("error", new Error("write EPIPE"));
+  assert.equal(client.closed, true);
+
+  await client.close();
+
+  assert.equal(ended, true);
+  assert.equal(proc.exitCode, 0, "close returned before the app server exited");
+});
+
+test("a failed tree stop on close is reported, not swallowed", { timeout: 15000, skip: process.platform !== "win32" && "Windows stops the tree with taskkill" }, async (t) => {
+  const client = new SpawnedCodexAppServerClient(process.cwd(), {
+    terminateProcessTree: () => {
+      throw new Error("taskkill refused");
+    }
+  });
+  const proc = makeStreamProcess();
+  client.attachProcess(proc);
+  const warnings = [];
+  const originalWrite = process.stderr.write;
+  process.stderr.write = (chunk) => {
+    warnings.push(String(chunk));
+    return true;
+  };
+  const keepAlive = setInterval(() => {}, 1000);
+  t.after(() => {
+    clearInterval(keepAlive);
+    process.stderr.write = originalWrite;
+  });
+
+  await client.close();
+  process.stderr.write = originalWrite;
+
+  assert.match(client.stopError?.message ?? "", /taskkill refused/);
+  assert.match(warnings.join(""), /codex app-server process 999998 could not be stopped: taskkill refused/);
+});
