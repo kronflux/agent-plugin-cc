@@ -482,6 +482,310 @@ CREATE TABLE job_notes (
 ) STRICT;
 `;
 
+// The council tables of every collection layer: runs, rounds, seats, seat rounds, attempts,
+// observations, stops, stop cancellations and verdicts, with the triggers that refuse duplicate,
+// rewritten and deleted rows. Job ids are plain text with no foreign key to jobs.
+const SCHEMA_COUNCIL = `
+CREATE TABLE council_runs (
+  id TEXT PRIMARY KEY NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('review','decision')),
+  session_id TEXT,
+  cwd TEXT NOT NULL,
+  brief_sha256 TEXT NOT NULL CHECK (length(brief_sha256)=64),
+  options_json TEXT NOT NULL CHECK (json_valid(options_json)),
+  timeout_ms INTEGER NOT NULL CHECK (timeout_ms>0),
+  seat_count INTEGER NOT NULL CHECK (seat_count BETWEEN 2 AND 5),
+  turn_cap INTEGER NOT NULL CHECK (turn_cap=2*seat_count+6),
+  created_at INTEGER NOT NULL,
+  clock INTEGER NOT NULL CHECK (clock>=created_at),
+  failed_at INTEGER,
+  input_rev INTEGER NOT NULL DEFAULT 0 CHECK (input_rev>=0),
+  verdict_rev INTEGER NOT NULL DEFAULT 0 CHECK (verdict_rev>=0),
+  merge_sha256 TEXT,
+  merge_rev INTEGER,
+  report_sha256 TEXT,
+  report_outcome TEXT CHECK (report_outcome IN ('council','failed')),
+  report_input_rev INTEGER,
+  report_verdict_rev INTEGER,
+  CHECK ((merge_sha256 IS NULL)=(merge_rev IS NULL)),
+  CHECK (merge_rev IS NULL OR merge_rev<=input_rev),
+  CHECK ((report_sha256 IS NULL)=(report_outcome IS NULL)),
+  CHECK ((report_sha256 IS NULL)=(report_input_rev IS NULL)),
+  CHECK ((report_sha256 IS NULL)=(report_verdict_rev IS NULL)),
+  CHECK (report_input_rev IS NULL OR
+         (report_input_rev<=input_rev AND report_verdict_rev<=verdict_rev)),
+  CHECK (report_outcome IS NOT 'failed' OR failed_at IS NOT NULL)
+) STRICT;
+
+CREATE TABLE council_rounds (
+  run_id TEXT NOT NULL REFERENCES council_runs(id),
+  round INTEGER NOT NULL CHECK (round IN (1,2)),
+  started_at INTEGER NOT NULL,
+  quorum_at INTEGER,
+  cutoff_at INTEGER,
+  closed_at INTEGER,
+  quorum INTEGER CHECK (quorum IN (0,1)),
+  map_sha256 TEXT,
+  PRIMARY KEY (run_id,round),
+  CHECK ((quorum_at IS NULL)=(cutoff_at IS NULL)),
+  CHECK (quorum_at IS NULL OR quorum_at>=started_at),
+  CHECK (cutoff_at IS NULL OR cutoff_at=quorum_at+180000),
+  CHECK ((closed_at IS NULL)=(quorum IS NULL)),
+  CHECK (closed_at IS NULL OR closed_at>=started_at),
+  CHECK (closed_at IS NULL OR quorum_at IS NULL OR closed_at>=quorum_at),
+  CHECK ((round=2)=(map_sha256 IS NOT NULL))
+) STRICT;
+
+CREATE TABLE council_seats (
+  run_id TEXT NOT NULL REFERENCES council_runs(id),
+  seat TEXT NOT NULL CHECK (seat GLOB 's[1-9]'),
+  family TEXT NOT NULL,
+  provider TEXT,
+  model TEXT,
+  lens TEXT NOT NULL CHECK (length(lens)>0),
+  label TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (run_id,seat),
+  CHECK ((family='claude')=(provider IS NULL)),
+  CHECK ((provider IS NULL)=(label IS NULL))
+) STRICT;
+CREATE UNIQUE INDEX council_seat_label
+  ON council_seats(label) WHERE label IS NOT NULL;
+
+CREATE TABLE council_seat_rounds (
+  run_id TEXT NOT NULL,
+  round INTEGER NOT NULL,
+  seat TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN
+    ('issuing','running','valid','invalid','timed-out','error',
+     'missing-cli','quota-exhausted')),
+  current_id TEXT,
+  answer_sha256 TEXT CHECK (answer_sha256 IS NULL OR
+    (length(answer_sha256)=64 AND answer_sha256 NOT GLOB '*[^0-9a-f]*')),
+  errors_sha256 TEXT CHECK (errors_sha256 IS NULL OR
+    (length(errors_sha256)=64 AND errors_sha256 NOT GLOB '*[^0-9a-f]*')),
+  reason TEXT CHECK (reason IS NULL OR length(reason)>0),
+  final_at INTEGER,
+  PRIMARY KEY (run_id,round,seat),
+  FOREIGN KEY (run_id,round) REFERENCES council_rounds(run_id,round),
+  FOREIGN KEY (run_id,seat) REFERENCES council_seats(run_id,seat),
+  FOREIGN KEY (run_id,round,seat,current_id)
+    REFERENCES council_attempts(run_id,round,seat,id)
+    DEFERRABLE INITIALLY DEFERRED,
+  CHECK ((current_id IS NULL)=(state='missing-cli')),
+  CHECK ((final_at IS NULL)=(state IN ('issuing','running'))),
+  CHECK ((answer_sha256 IS NOT NULL)=(state='valid')),
+  CHECK (errors_sha256 IS NULL OR state='invalid'),
+  CHECK ((reason IS NOT NULL)=(state NOT IN ('issuing','running','valid')))
+) STRICT;
+
+CREATE TABLE council_attempts (
+  id TEXT PRIMARY KEY NOT NULL CHECK
+    (length(id)=32 AND id NOT GLOB '*[^0-9a-f]*'),
+  run_id TEXT NOT NULL,
+  round INTEGER NOT NULL CHECK (round IN (1,2)),
+  seat TEXT NOT NULL,
+  charge TEXT NOT NULL DEFAULT 'turn' CHECK (charge IN ('turn','repair','retry')),
+  replaces_id TEXT UNIQUE,
+  kind TEXT NOT NULL CHECK (kind IN ('create','continue','prompt')),
+  created_at INTEGER NOT NULL,
+  issue_by INTEGER NOT NULL CHECK (issue_by>created_at),
+  prompt_sha256 TEXT NOT NULL CHECK
+    (length(prompt_sha256)=64 AND prompt_sha256 NOT GLOB '*[^0-9a-f]*'),
+  retry_prompt_sha256 TEXT CHECK (retry_prompt_sha256 IS NULL OR
+    (length(retry_prompt_sha256)=64 AND retry_prompt_sha256 NOT GLOB '*[^0-9a-f]*')),
+  predecessor_id TEXT,
+  job_id TEXT UNIQUE,
+  issued_at INTEGER,
+  force_reason TEXT,
+  refusal TEXT CHECK (refusal IS NULL OR length(refusal)>0),
+  retired_at INTEGER,
+  UNIQUE (run_id,round,seat,id),
+  UNIQUE (run_id,round,seat,charge),
+  FOREIGN KEY (run_id,round,seat) REFERENCES council_seat_rounds(run_id,round,seat),
+  FOREIGN KEY (run_id,round,seat,replaces_id)
+    REFERENCES council_attempts(run_id,round,seat,id),
+  CHECK ((charge='turn')=(replaces_id IS NULL)),
+  CHECK (replaces_id IS NULL OR replaces_id<>id),
+  CHECK ((kind='continue')=(predecessor_id IS NOT NULL)),
+  CHECK (charge<>'turn' OR kind='prompt' OR
+         kind=CASE round WHEN 1 THEN 'create' ELSE 'continue' END),
+  CHECK (kind<>'prompt' OR (job_id IS NULL AND issued_at IS created_at)),
+  CHECK (kind='prompt' OR ((issued_at IS NULL)=(job_id IS NULL))),
+  CHECK (issued_at IS NULL OR (issued_at>=created_at AND issued_at<issue_by)),
+  CHECK (refusal IS NULL OR (issued_at IS NULL AND kind<>'prompt')),
+  CHECK (retired_at IS NULL OR retired_at>=coalesce(issued_at,created_at)),
+  CHECK (force_reason IS NULL OR
+         (kind='continue' AND job_id IS NOT NULL AND length(force_reason)>0))
+) STRICT;
+
+CREATE TABLE council_observations (
+  attempt_id TEXT PRIMARY KEY NOT NULL REFERENCES council_attempts(id),
+  observed_at INTEGER NOT NULL,
+  event_at INTEGER,
+  after_close INTEGER NOT NULL DEFAULT 0 CHECK (after_close IN (0,1)),
+  outcome TEXT NOT NULL CHECK (outcome IN
+    ('valid','invalid','late','cancelled','quota','failure','missing')),
+  answer_sha256 TEXT CHECK (answer_sha256 IS NULL OR
+    (length(answer_sha256)=64 AND answer_sha256 NOT GLOB '*[^0-9a-f]*')),
+  errors_sha256 TEXT CHECK (errors_sha256 IS NULL OR
+    (length(errors_sha256)=64 AND errors_sha256 NOT GLOB '*[^0-9a-f]*')),
+  reason TEXT CHECK (reason IS NULL OR length(reason)>0),
+  transient INTEGER NOT NULL DEFAULT 0 CHECK (transient IN (0,1)),
+  replacement_required INTEGER NOT NULL DEFAULT 0 CHECK (replacement_required IN (0,1)),
+  replacement_sha256 TEXT CHECK (replacement_sha256 IS NULL OR
+    (length(replacement_sha256)=64 AND replacement_sha256 NOT GLOB '*[^0-9a-f]*')),
+  CHECK ((event_at IS NULL)=(outcome='missing')),
+  CHECK ((answer_sha256 IS NOT NULL)=(outcome='valid')),
+  CHECK (errors_sha256 IS NULL OR outcome='invalid'),
+  CHECK ((reason IS NULL)=(outcome='valid')),
+  CHECK (transient=0 OR outcome='failure'),
+  CHECK (replacement_required=0 OR outcome='invalid' OR transient=1),
+  CHECK ((replacement_sha256 IS NOT NULL)=(replacement_required=1))
+) STRICT;
+
+CREATE TABLE council_stops (
+  job_id TEXT PRIMARY KEY NOT NULL REFERENCES council_attempts(job_id),
+  requested_at INTEGER NOT NULL,
+  cause TEXT NOT NULL CHECK (cause IN ('queue','deadline','quorum-cutoff')),
+  dispatched_at INTEGER,
+  acknowledged_at INTEGER,
+  CHECK (acknowledged_at IS NULL OR acknowledged_at>=requested_at),
+  CHECK (dispatched_at IS NULL OR
+         (acknowledged_at IS NOT NULL AND dispatched_at=acknowledged_at))
+) STRICT;
+CREATE INDEX council_pending_stops ON council_stops(requested_at,job_id)
+  WHERE acknowledged_at IS NULL;
+
+CREATE TABLE council_stop_cancels (
+  job_id TEXT PRIMARY KEY NOT NULL REFERENCES council_stops(job_id),
+  committed_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE council_verdicts (
+  run_id TEXT NOT NULL REFERENCES council_runs(id),
+  target_kind TEXT NOT NULL CHECK (target_kind IN ('cluster','claim')),
+  target TEXT NOT NULL,
+  cluster_id TEXT,
+  merge_sha256 TEXT,
+  input_rev INTEGER,
+  brief_sha256 TEXT,
+  verdict TEXT NOT NULL CHECK (verdict IN ('verified','rejected','not-checked')),
+  reason TEXT,
+  strongest INTEGER CHECK (strongest IS NULL OR strongest>=1),
+  strongest_sha256 TEXT,
+  recorded_at INTEGER NOT NULL,
+  PRIMARY KEY (run_id,target_kind,target),
+  CHECK ((target_kind='cluster')=
+         (cluster_id IS NOT NULL AND merge_sha256 IS NOT NULL AND input_rev IS NOT NULL)),
+  CHECK ((target_kind='claim')=(brief_sha256 IS NOT NULL)),
+  CHECK (target_kind='cluster' OR
+         (cluster_id IS NULL AND merge_sha256 IS NULL AND input_rev IS NULL)),
+  CHECK (target_kind<>'claim' OR target GLOB 'a[1-9]*'),
+  CHECK (verdict<>'rejected' OR (reason IS NOT NULL AND length(reason)>0)),
+  CHECK ((strongest IS NULL)=(strongest_sha256 IS NULL)),
+  CHECK (strongest IS NULL OR (verdict='verified' AND target_kind='cluster'))
+) STRICT;
+
+CREATE TRIGGER council_run_insert BEFORE INSERT ON council_runs
+WHEN EXISTS (SELECT 1 FROM council_runs WHERE id=NEW.id)
+BEGIN SELECT RAISE(ABORT,'council run already exists'); END;
+CREATE TRIGGER council_run_delete BEFORE DELETE ON council_runs
+BEGIN SELECT RAISE(ABORT,'council run cannot be deleted'); END;
+CREATE TRIGGER council_clock_forward BEFORE UPDATE ON council_runs
+WHEN NEW.id IS NOT OLD.id OR NEW.clock<OLD.clock
+  OR NEW.input_rev<OLD.input_rev OR NEW.verdict_rev<OLD.verdict_rev
+  OR (OLD.failed_at IS NOT NULL AND NEW.failed_at IS NOT OLD.failed_at)
+BEGIN SELECT RAISE(ABORT,'council run identity or revision changed'); END;
+
+CREATE TRIGGER council_round_insert BEFORE INSERT ON council_rounds
+WHEN EXISTS (SELECT 1 FROM council_rounds
+             WHERE run_id=NEW.run_id AND round=NEW.round)
+BEGIN SELECT RAISE(ABORT,'council round already exists'); END;
+CREATE TRIGGER council_round_delete BEFORE DELETE ON council_rounds
+BEGIN SELECT RAISE(ABORT,'council round cannot be deleted'); END;
+CREATE TRIGGER council_round_fixed BEFORE UPDATE ON council_rounds
+WHEN NEW.run_id IS NOT OLD.run_id OR NEW.round IS NOT OLD.round
+  OR NEW.started_at IS NOT OLD.started_at OR NEW.map_sha256 IS NOT OLD.map_sha256
+  OR OLD.closed_at IS NOT NULL
+  OR (OLD.cutoff_at IS NOT NULL AND
+      (NEW.cutoff_at IS NOT OLD.cutoff_at OR NEW.quorum_at IS NOT OLD.quorum_at))
+BEGIN SELECT RAISE(ABORT,'council round start, map, seal or close is fixed'); END;
+
+CREATE TRIGGER council_seat_insert BEFORE INSERT ON council_seats
+WHEN EXISTS (SELECT 1 FROM council_seats
+             WHERE (run_id=NEW.run_id AND seat=NEW.seat) OR label=NEW.label)
+BEGIN SELECT RAISE(ABORT,'council seat or label already exists'); END;
+CREATE TRIGGER council_seat_update BEFORE UPDATE ON council_seats
+BEGIN SELECT RAISE(ABORT,'council seat is immutable'); END;
+CREATE TRIGGER council_seat_delete BEFORE DELETE ON council_seats
+BEGIN SELECT RAISE(ABORT,'council seat cannot be deleted'); END;
+
+CREATE TRIGGER council_seat_round_insert BEFORE INSERT ON council_seat_rounds
+WHEN EXISTS (SELECT 1 FROM council_seat_rounds
+             WHERE run_id=NEW.run_id AND round=NEW.round AND seat=NEW.seat)
+BEGIN SELECT RAISE(ABORT,'council seat round already exists'); END;
+CREATE TRIGGER council_seat_round_update BEFORE UPDATE ON council_seat_rounds
+WHEN OLD.final_at IS NOT NULL OR NEW.run_id IS NOT OLD.run_id
+  OR NEW.round IS NOT OLD.round OR NEW.seat IS NOT OLD.seat
+BEGIN SELECT RAISE(ABORT,'council seat round identity or final state is fixed'); END;
+CREATE TRIGGER council_seat_round_delete BEFORE DELETE ON council_seat_rounds
+BEGIN SELECT RAISE(ABORT,'council seat round cannot be deleted'); END;
+
+CREATE TRIGGER council_attempt_insert BEFORE INSERT ON council_attempts
+WHEN EXISTS (
+  SELECT 1 FROM council_attempts
+  WHERE id=NEW.id OR job_id=NEW.job_id OR replaces_id=NEW.replaces_id
+    OR (run_id=NEW.run_id AND round=NEW.round AND seat=NEW.seat AND charge=NEW.charge)
+)
+BEGIN SELECT RAISE(ABORT,'council attempt identity or slot already exists'); END;
+CREATE TRIGGER council_attempt_update BEFORE UPDATE ON council_attempts
+WHEN NEW.id IS NOT OLD.id OR NEW.run_id IS NOT OLD.run_id
+  OR NEW.round IS NOT OLD.round OR NEW.seat IS NOT OLD.seat
+  OR NEW.charge IS NOT OLD.charge OR NEW.replaces_id IS NOT OLD.replaces_id
+  OR NEW.kind IS NOT OLD.kind OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.issue_by IS NOT OLD.issue_by OR NEW.prompt_sha256 IS NOT OLD.prompt_sha256
+  OR NEW.retry_prompt_sha256 IS NOT OLD.retry_prompt_sha256
+  OR NEW.predecessor_id IS NOT OLD.predecessor_id OR OLD.retired_at IS NOT NULL
+  OR ((OLD.issued_at IS NOT NULL OR OLD.refusal IS NOT NULL) AND
+      (NEW.job_id IS NOT OLD.job_id OR NEW.issued_at IS NOT OLD.issued_at
+       OR NEW.force_reason IS NOT OLD.force_reason OR NEW.refusal IS NOT OLD.refusal))
+  OR EXISTS (SELECT 1 FROM council_attempts WHERE job_id=NEW.job_id AND id<>OLD.id)
+BEGIN SELECT RAISE(ABORT,'council attempt identity or binding is fixed'); END;
+CREATE TRIGGER council_attempt_delete BEFORE DELETE ON council_attempts
+BEGIN SELECT RAISE(ABORT,'council attempt cannot be deleted'); END;
+
+CREATE TRIGGER council_observation_insert BEFORE INSERT ON council_observations
+WHEN EXISTS (SELECT 1 FROM council_observations WHERE attempt_id=NEW.attempt_id)
+BEGIN SELECT RAISE(ABORT,'council observation already exists'); END;
+CREATE TRIGGER council_observation_update BEFORE UPDATE ON council_observations
+BEGIN SELECT RAISE(ABORT,'council observation is immutable'); END;
+CREATE TRIGGER council_observation_delete BEFORE DELETE ON council_observations
+BEGIN SELECT RAISE(ABORT,'council observation cannot be deleted'); END;
+
+CREATE TRIGGER council_stop_insert BEFORE INSERT ON council_stops
+WHEN EXISTS (SELECT 1 FROM council_stops WHERE job_id=NEW.job_id)
+BEGIN SELECT RAISE(ABORT,'council stop already exists'); END;
+CREATE TRIGGER council_stop_update BEFORE UPDATE ON council_stops
+WHEN NEW.job_id IS NOT OLD.job_id OR NEW.requested_at IS NOT OLD.requested_at
+  OR NEW.cause IS NOT OLD.cause OR OLD.acknowledged_at IS NOT NULL
+BEGIN SELECT RAISE(ABORT,'council stop identity or acknowledgement is fixed'); END;
+CREATE TRIGGER council_stop_delete BEFORE DELETE ON council_stops
+BEGIN SELECT RAISE(ABORT,'council stop cannot be deleted'); END;
+
+CREATE TRIGGER council_stop_cancel_insert BEFORE INSERT ON council_stop_cancels
+WHEN EXISTS (SELECT 1 FROM council_stop_cancels WHERE job_id=NEW.job_id)
+  OR NOT EXISTS (
+    SELECT 1 FROM council_stops
+    WHERE job_id=NEW.job_id AND dispatched_at=NEW.committed_at
+  )
+BEGIN SELECT RAISE(ABORT,'council cancellation needs its exact dispatch'); END;
+CREATE TRIGGER council_stop_cancel_update BEFORE UPDATE ON council_stop_cancels
+BEGIN SELECT RAISE(ABORT,'council cancellation is immutable'); END;
+CREATE TRIGGER council_stop_cancel_delete BEFORE DELETE ON council_stop_cancels
+BEGIN SELECT RAISE(ABORT,'council cancellation cannot be deleted'); END;
+`;
+
 /**
  * The schema migrations in order, one entry per schema version. `openStore` applies every entry
  * above the stored `user_version` in one transaction. A new version appends an entry.
@@ -511,6 +815,12 @@ export const MIGRATIONS = Object.freeze([
       // release on that exit; a later scan then credits the provider's own exit, never its owner's
       // death. Null when the worker saw no such exit and for rows written before this version.
       db.exec("ALTER TABLE jobs ADD COLUMN provider_exit_seen_at INTEGER");
+    }
+  }),
+  Object.freeze({
+    version: 4,
+    apply(db) {
+      db.exec(SCHEMA_COUNCIL);
     }
   })
 ]);
