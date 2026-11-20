@@ -54,7 +54,7 @@ test("task --from-last-review without a finished review fails before Codex start
   const result = run("node", [SCRIPT, "task", "--from-last-review"], { cwd: repo, env });
 
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /No finished Codex review with output was found/);
+  assert.match(result.stderr, /No finished review with output was found/);
   const stateFile = path.join(binDir, "fake-codex-state.json");
   const state = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, "utf8")) : {};
   assert.equal(state.lastTurnStart, undefined);

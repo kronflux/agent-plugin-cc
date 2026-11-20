@@ -1,6 +1,6 @@
 # Prompt Blocks
 
-Use these blocks selectively when composing Codex or GPT-5.4 prompts.
+Use these blocks selectively when composing Codex prompts.
 Wrap each block in the XML tag shown in its heading.
 
 ## Core Wrapper
@@ -44,12 +44,12 @@ Do not include long scene-setting or repeated recap.
 
 ### `default_follow_through_policy`
 
-Use when Codex should act without asking routine questions.
+Use when Codex should act on its own; a delegated run cannot ask questions.
 
 ```xml
 <default_follow_through_policy>
 Default to the most reasonable low-risk interpretation and keep going.
-Only stop to ask questions when a missing detail changes correctness, safety, or an irreversible action.
+You cannot ask questions during this run. If a missing detail changes correctness, safety, or an irreversible action, stop and return the blocking question as your final answer.
 </default_follow_through_policy>
 ```
 
@@ -152,7 +152,7 @@ Prefer breadth first, then go deeper only where the evidence changes the recomme
 
 ### `dig_deeper_nudge`
 
-Use for review and adversarial inspection.
+Use for review and critical inspection.
 
 ```xml
 <dig_deeper_nudge>

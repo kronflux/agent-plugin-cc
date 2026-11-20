@@ -15,7 +15,7 @@ import { isJobResultDelivered, listJobs } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const POLL_MS = readPositiveInt(process.env.CODEX_COMPANION_MONITOR_POLL_MS, 2000);
-// A command that waits for the job, such as the rescue agent's result --wait, gets this long
+// A command that waits for the job, such as the delegate agent's result --wait, gets this long
 // to print the result before the job is announced.
 const DELIVERY_GRACE_MS = readPositiveInt(process.env.CODEX_COMPANION_MONITOR_GRACE_MS, 5000);
 const ACTIVE_STATUSES = new Set(["queued", "running"]);

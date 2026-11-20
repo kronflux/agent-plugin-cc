@@ -153,8 +153,13 @@ test("when no entry is marked default the newest visible Sol model is used", (t)
   assert.equal(latestJob(ctx).modelSource, "family-fallback");
 });
 
+// A catalog timeout short enough that a test of the timeout path keeps a wide margin for slow
+// process starts on a loaded machine.
+const SHORT_CATALOG_TIMEOUT = { CODEX_COMPANION_CATALOG_TIMEOUT_MS: "1500" };
+
 test("a model/list that does not answer falls back within the catalog timeout", { timeout: 60000 }, (t) => {
-  const ctx = makeRepo(t, "model-list-hangs");
+  const repo = makeRepo(t, "model-list-hangs");
+  const ctx = { ...repo, env: { ...repo.env, ...SHORT_CATALOG_TIMEOUT } };
   const started = Date.now();
   const result = companion(ctx, ["task", "x"], { timeout: 40000 });
   const elapsed = Date.now() - started;
@@ -458,7 +463,8 @@ function stopRecordedProcesses(ctx, key) {
 }
 
 test("a catalog app server that never answers initialize is stopped and the task ends", { timeout: 60000 }, (t) => {
-  const ctx = makeRepo(t, "catalog-initialize-hangs");
+  const repo = makeRepo(t, "catalog-initialize-hangs");
+  const ctx = { ...repo, env: { ...repo.env, ...SHORT_CATALOG_TIMEOUT } };
   const started = Date.now();
   const result = companion(ctx, ["task", "x"], { timeout: 30000 });
   const elapsed = Date.now() - started;
@@ -570,6 +576,14 @@ test("setup --model default clears the setting whatever --effort says", (t) => {
   const report = setupJson(ctx, ["--model", "default", "--effort", "high"]);
   assert.deepEqual(getConfig(ctx.repo).models, { codex: null });
   assert.deepEqual(report.delegation, { model: "m-default", effort: "low", modelSource: "catalog-default", effortSource: "catalog-default" });
+});
+
+test("setup --model configured says the Codex configuration chooses the model", (t) => {
+  const ctx = makeRepo(t);
+  const result = companion(ctx, ["setup", "--model", "configured"]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Delegations now use the model set in the Codex configuration in /);
+  assert.doesNotMatch(result.stdout, /model configured/);
 });
 
 test("setup warns that a model it could not check was stored unchecked", (t) => {

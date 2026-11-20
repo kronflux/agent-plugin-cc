@@ -499,19 +499,6 @@ test("review with instructions runs a peer schema-bound turn", (t) => {
   assert.equal(state.lastReviewStart, undefined);
 });
 
-test("adversarial-review forwards to review with the critical stance", (t) => {
-  const ctx = makeDirtyCodexRepo(t);
-  const result = run("node", [CODEX, "adversarial-review"], { cwd: ctx.repo, env: ctx.env });
-  assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Missing empty-state guard/);
-  assert.ok(readCodexState(ctx.binDir).lastTurnStart.prompt.includes(CRITICAL_MARKER));
-  // The command file passes its arguments as one quoted string.
-  const quoted = run("node", [CODEX, "adversarial-review", "--base main"], { cwd: ctx.repo, env: ctx.env });
-  assert.equal(quoted.status, 0, quoted.stderr);
-  assert.match(quoted.stdout, /against main/);
-  assert.ok(readCodexState(ctx.binDir).lastTurnStart.prompt.includes(CRITICAL_MARKER));
-});
-
 test("a schema-bound review thread is persistent and a native one is ephemeral", (t) => {
   const ctx = makeDirtyCodexRepo(t);
   const bound = run("node", [CODEX, "review", "--stance", "critical"], { cwd: ctx.repo, env: ctx.env });

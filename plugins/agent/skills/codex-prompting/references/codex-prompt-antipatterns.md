@@ -1,6 +1,6 @@
 # Codex Prompt Anti-Patterns
 
-Avoid these when prompting Codex or GPT-5.4.
+Avoid these when prompting Codex.
 
 ## Vague task framing
 
@@ -78,7 +78,7 @@ Review this diff, fix the bug you find, update the docs, and suggest a roadmap.
 ```
 
 Better:
-- Run review first.
+- Run a review prompt first, as its own task.
 - Run a separate fix prompt if needed.
 - Use a third run for docs or roadmap work.
 

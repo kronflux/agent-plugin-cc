@@ -114,6 +114,7 @@ test("setup shows the app server user agent when known", () => {
     appServer: "codex_cli_rs/0.160.0 (Windows 10.0.26200; x86_64)",
     sessionRuntime: { label: "direct startup" },
     reviewGateEnabled: false,
+    delegation: { model: "m-default", effort: "low", modelSource: "catalog-default", effortSource: "catalog-default" },
     actionsTaken: [],
     nextSteps: []
   };

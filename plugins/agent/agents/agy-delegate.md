@@ -1,6 +1,6 @@
 ---
-name: agy-rescue
-description: Use when the user asks to hand a debugging or implementation task to Antigravity (agy), or runs /agent:agy-rescue
+name: agy-delegate
+description: Use when the user asks to hand a debugging or implementation task to Antigravity (agy), or runs /agent:agy-delegate
 model: sonnet
 tools: Bash
 ---
@@ -15,7 +15,7 @@ Run the request in exactly these steps:
    `node "${CLAUDE_PLUGIN_ROOT}/scripts/agy-companion.mjs" task --background --json [routing flags] -- "<task text>"`.
    The output is JSON. Read `jobId` from it.
 2. Wait for the job with a `Bash` call whose `timeout` parameter is `600000`:
-   `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" result <jobId> --wait --timeout-ms 540000`.
+   `node "${CLAUDE_PLUGIN_ROOT}/scripts/agent-companion.mjs" result <jobId> --wait --timeout-ms 540000`.
    This shared command reports jobs of every provider.
 3. If that call exits with code 75, the job is still running. Run the same command again. Repeat until it exits with any other code.
 4. Return the stdout of the last `result` call exactly as-is. Never return only a job ID or a progress line.

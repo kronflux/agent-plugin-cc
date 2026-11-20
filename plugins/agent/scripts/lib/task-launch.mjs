@@ -98,11 +98,9 @@ function trimmedOrUndefined(value) {
 
 /**
  * Reads and checks every manifest entry before any job starts. An entry's model and effort are
- * trimmed strings, or undefined when the entry does not set them. `checkEntry(read, raw)`, when
- * given, runs on each entry as it is read, with the entry as written in the file, and returns
- * the entry to keep, so its error comes in entry order with the shape errors.
+ * trimmed strings, or undefined when the entry does not set them.
  */
-export function readTaskManifest(cwd, file, checkEntry = null) {
+export function readTaskManifest(cwd, file) {
   let entries;
   try {
     entries = JSON.parse(fs.readFileSync(path.resolve(cwd, file), "utf8"));
@@ -144,7 +142,7 @@ export function readTaskManifest(cwd, file, checkEntry = null) {
       write: entry.write,
       worktree: entry.worktree
     };
-    return checkEntry ? checkEntry(read, entry) : read;
+    return read;
   });
 }
 

@@ -1,5 +1,5 @@
 ---
-description: Send a message to a running Codex task, or continue a finished task's thread with it
+description: Send a message to a running Codex or Antigravity job, or continue a finished job's thread with it
 argument-hint: '<job-id> <message>'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)

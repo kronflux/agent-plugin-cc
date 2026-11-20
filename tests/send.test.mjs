@@ -198,7 +198,7 @@ test("result --wait exits 75 while the job runs and prints the result once it fi
   assert.match(done.stdout, /Handled the requested task/);
 });
 
-test("the rescue agent's task call keeps option-like text after -- as the prompt", () => {
+test("the delegate agent's task call keeps option-like text after -- as the prompt", () => {
   const ctx = makeRepo();
   const launched = run("node", [SCRIPT, "task", "--background", "--json", "--write", "--", "fix --model handling"], {
     cwd: ctx.repo,

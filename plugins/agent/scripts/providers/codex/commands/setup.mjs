@@ -1,7 +1,7 @@
 import process from "node:process";
 
 import { outputResult, parseCommandInput, resolveCommandCwd, resolveCommandWorkspace } from "../../../lib/companion-cli.mjs";
-import { delegationLines, describeDelegation, storeDelegationSetting } from "../../../lib/model-selection.mjs";
+import { describeDelegation, storeDelegationSetting } from "../../../lib/model-selection.mjs";
 import { binaryAvailable } from "../../../lib/process.mjs";
 import { getConfig, setConfig } from "../../../lib/state.mjs";
 import { resolveWorkspaceRoot } from "../../../lib/workspace.mjs";
@@ -50,13 +50,6 @@ export async function buildSetupReport(cwd, actionsTaken = []) {
   };
 }
 
-// The delegation lines follow the review gate line in the checks list.
-function renderReport(report) {
-  const rendered = renderSetupReport(report);
-  const lines = delegationLines(report.delegation, { chosenBy: codexProvider.label }).join("\n");
-  return rendered.replace(/^(- review gate: .*)$/m, (gate) => `${gate}\n${lines}`);
-}
-
 export function checkWriteSandbox(value) {
   const sandbox = String(value).trim();
   if (!WRITE_SANDBOXES.includes(sandbox)) {
@@ -102,7 +95,7 @@ export async function handleSetup(argv) {
   }
 
   const finalReport = await buildSetupReport(cwd, actionsTaken);
-  outputResult(options.json ? finalReport : renderReport(finalReport), options.json);
+  outputResult(options.json ? finalReport : renderSetupReport(finalReport), options.json);
 }
 
 export const run = handleSetup;

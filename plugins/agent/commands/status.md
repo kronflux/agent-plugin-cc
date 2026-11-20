@@ -1,5 +1,5 @@
 ---
-description: Show active and recent agent jobs for this repository, including review-gate status
+description: Show the status of a Codex or Antigravity job, or of every active and recent job in this repository, including review-gate status
 argument-hint: '[job-id] [--wait] [--timeout-ms <ms>] [--all]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)

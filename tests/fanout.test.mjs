@@ -73,6 +73,30 @@ test("a manifest starts one background job per entry", async (t) => {
   await waitForAllCompleted(ctx.repo, 30000);
 });
 
+test("the fleet command without a manifest asks for one by its command form", () => {
+  const ctx = makeRepo();
+  for (const argv of [["--manifest "], ["--manifest"], ["--manifest --write"]]) {
+    const result = run(process.execPath, [SCRIPT, "task", ...argv], { cwd: ctx.repo, env: ctx.env });
+    assert.equal(result.status, 1, JSON.stringify(argv));
+    assert.equal(result.stderr.trim(), "Name a manifest file: /agent:codex-fleet <manifest.json>", JSON.stringify(argv));
+  }
+  assert.deepEqual(listJobs(ctx.repo), []);
+});
+
+test("a manifest path that starts with a dash is accepted in the inline form", (t) => {
+  const ctx = makeRepo();
+  const missing = run(process.execPath, [SCRIPT, "task", "--manifest=-fleet.json"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /-fleet\.json/);
+  assert.doesNotMatch(missing.stderr, /^Name a manifest file/);
+
+  const separate = run(process.execPath, [SCRIPT, "task", "--manifest", "-fleet.json"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(separate.status, 1);
+  assert.match(separate.stderr, /--manifest=-fleet\.json/);
+  assert.match(separate.stderr, /\.\/-fleet\.json/);
+  assert.deepEqual(listJobs(ctx.repo), []);
+});
+
 test("a manifest with a bad entry starts nothing", (t) => {
   const ctx = makeRepo();
   const manifest = path.join(makeTempDir(t), "bad.json");

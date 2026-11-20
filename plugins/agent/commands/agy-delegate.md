@@ -1,11 +1,11 @@
 ---
-description: Delegate investigation, an explicit fix request, or follow-up work to Antigravity through the agy rescue subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model>] [--effort <effort>] [what Antigravity should investigate, solve, or continue]"
-allowed-tools: Bash(node:*), Agent
+description: Delegate investigation, an explicit fix request, or follow-up work to Antigravity (agy) through the Antigravity delegate subagent
+argument-hint: '[--background|--wait] [--resume|--fresh] [--model <id>] [--effort <level>] [what Antigravity should investigate, solve, or continue]'
+allowed-tools: Agent
 ---
 
-Invoke the `agent:agy-rescue` subagent via the `Agent` tool (`subagent_type: "agent:agy-rescue"`), forwarding the raw user request as the prompt.
-`agent:agy-rescue` is a subagent, not a skill. Do not call `Skill(agent:agy-rescue)`.
+Invoke the `agent:agy-delegate` subagent via the `Agent` tool (`subagent_type: "agent:agy-delegate"`), forwarding the raw user request as the prompt.
+`agent:agy-delegate` is a subagent, not a skill. Do not call `Skill(agent:agy-delegate)`.
 The final user-visible response must be Antigravity's output verbatim.
 
 Raw user request:
@@ -13,7 +13,7 @@ $ARGUMENTS
 
 Execution mode:
 
-- Claude Code runs plugin subagents in the background, so run the `agent:agy-rescue` subagent in the background in every case. Its result arrives as the agent's completion notification.
+- Claude Code runs plugin subagents in the background, so run the `agent:agy-delegate` subagent in the background in every case. Its result arrives as the agent's completion notification.
 - If the request includes `--wait`, tell the user in one sentence that the result will arrive when the agent finishes, and start no other work in this turn.
 - `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
 - `--model`, `--effort`, `--resume`, and `--fresh` are runtime flags. Preserve them for the forwarded request, but do not treat them as part of the natural-language task text.

@@ -4,12 +4,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
-import { makeCommittedRepo, makeTempDir, run } from "./helpers.mjs";
+import { run } from "./helpers.mjs";
 import { DEFAULT_PROVIDER_ID, getProvider, listProviders, providerForJob } from "../plugins/agent/scripts/lib/providers.mjs";
-import { writeJobFile } from "../plugins/agent/scripts/lib/state.mjs";
 
 const SCRIPTS = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "agent", "scripts");
-const NEUTRAL = path.join(SCRIPTS, "agent-companion.mjs");
 const CODEX_COMPANION = path.join(SCRIPTS, "codex-companion.mjs");
 const SHARED_FOLDERS = ["lib", "commands"];
 // Folders under lib/ or commands/ whose files may name a provider, each with the reason.
@@ -132,51 +130,12 @@ test("the neutral entry and its commands import no provider module", () => {
   assert.deepEqual(offenders, []);
 });
 
-test("the old codex-companion invocation of a neutral subcommand returns the same output", (t) => {
-  const repo = makeCommittedRepo(t);
-  const pluginData = makeTempDir(t);
-  const env = { ...process.env, CLAUDE_PLUGIN_DATA: pluginData };
-  const jobId = "task-forward-probe";
-  const previousPluginData = process.env.CLAUDE_PLUGIN_DATA;
-  process.env.CLAUDE_PLUGIN_DATA = pluginData;
-  try {
-    writeJobFile(repo, jobId, {
-      id: jobId,
-      provider: "codex",
-      kind: "task",
-      kindLabel: "rescue",
-      title: "Codex Task",
-      workspaceRoot: repo,
-      jobClass: "task",
-      summary: "Probe the forwards",
-      status: "completed",
-      phase: "done",
-      threadId: "thr_forward",
-      turnId: "turn_forward",
-      pid: null,
-      createdAt: "2026-01-01T00:00:00.000Z",
-      startedAt: "2026-01-01T00:00:01.000Z",
-      completedAt: "2026-01-01T00:00:02.000Z",
-      result: { status: 0, rawOutput: "Forward probe answer." },
-      rendered: "Forward probe answer.\n"
-    });
-  } finally {
-    process.env.CLAUDE_PLUGIN_DATA = previousPluginData;
+test("the removed codex-companion forwards fail as unknown subcommands", () => {
+  for (const name of ["status", "result", "send", "cancel", "adversarial-review"]) {
+    const result = run("node", [CODEX_COMPANION, name], { cwd: SCRIPTS });
+    assert.equal(result.status, 1, `${name}: ${result.stdout}`);
+    assert.ok(result.stderr.includes(`Unknown subcommand: ${name}`), `${name}: ${result.stderr}`);
   }
-
-  for (const args of [["status", "--json"], ["status", jobId, "--json"], ["result", jobId, "--json"]]) {
-    const old = run("node", [CODEX_COMPANION, ...args], { cwd: repo, env });
-    const neutral = run("node", [NEUTRAL, ...args], { cwd: repo, env });
-    assert.equal(old.status, 0, `${args.join(" ")}: ${old.stderr}`);
-    assert.equal(neutral.status, old.status, args.join(" "));
-    assert.equal(neutral.stdout, old.stdout, args.join(" "));
-  }
-
-  const oldCancel = run("node", [CODEX_COMPANION, "cancel", jobId, "--json"], { cwd: repo, env });
-  const neutralCancel = run("node", [NEUTRAL, "cancel", jobId, "--json"], { cwd: repo, env });
-  assert.notEqual(oldCancel.status, 0, "cancel of a finished job succeeded");
-  assert.equal(neutralCancel.status, oldCancel.status);
-  assert.equal(neutralCancel.stderr, oldCancel.stderr);
 });
 
 test("the legacy-name allowance covers only the two session variables", () => {

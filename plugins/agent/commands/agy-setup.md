@@ -1,6 +1,6 @@
 ---
-description: Check whether the Antigravity CLI (agy) is installed and signed in
-argument-hint: ''
+description: Check whether the Antigravity CLI (agy) is installed and signed in, and set the delegation model and effort
+argument-hint: '[--model <id>] [--effort <level>] [--write-sandbox workspace-write|danger-full-access]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---

@@ -4,10 +4,6 @@ import fs from "node:fs";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import * as cancelCommand from "./commands/cancel.mjs";
-import * as resultCommand from "./commands/result.mjs";
-import * as sendCommand from "./commands/send.mjs";
-import * as statusCommand from "./commands/status.mjs";
 import * as setupCommand from "./providers/codex/commands/setup.mjs";
 import * as reviewCommand from "./providers/codex/commands/review.mjs";
 import * as taskCommand from "./providers/codex/commands/task.mjs";
@@ -36,26 +32,12 @@ const COMPANION_SCRIPT = fileURLToPath(import.meta.url);
 const SUBCOMMAND_USAGE = {
   setup: setupCommand.usage,
   review: reviewCommand.usage,
-  "adversarial-review": reviewCommand.adversarialUsage,
   task: taskCommand.usage,
   transfer: transferCommand.usage,
   usage: usageCommand.usage
 };
 
-// Subcommands that agent-companion.mjs runs; this script forwards them to the same modules so
-// existing callers keep working. They are not listed in the usage text.
-const FORWARDED_SUBCOMMANDS = {
-  status: statusCommand,
-  result: resultCommand,
-  send: sendCommand,
-  cancel: cancelCommand
-};
-
 function printUsage(subcommand = null) {
-  if (subcommand && Object.hasOwn(FORWARDED_SUBCOMMANDS, subcommand)) {
-    console.log(["Usage:", `  node scripts/codex-companion.mjs ${FORWARDED_SUBCOMMANDS[subcommand].usage}`].join("\n"));
-    return;
-  }
   const names = subcommand && SUBCOMMAND_USAGE[subcommand] ? [subcommand] : Object.keys(SUBCOMMAND_USAGE);
   console.log(["Usage:", ...names.map((name) => `  node scripts/codex-companion.mjs ${SUBCOMMAND_USAGE[name]}`)].join("\n"));
 }
@@ -137,9 +119,6 @@ async function runSubcommand(subcommand, argv) {
     case "review":
       await reviewCommand.run(argv);
       break;
-    case "adversarial-review":
-      await reviewCommand.runAdversarial(argv);
-      break;
     case "task":
       await taskCommand.run(argv);
       break;
@@ -154,12 +133,6 @@ async function runSubcommand(subcommand, argv) {
       break;
     case "task-resume-candidate":
       await taskCommand.runResumeCandidate(argv);
-      break;
-    case "status":
-    case "result":
-    case "send":
-    case "cancel":
-      await FORWARDED_SUBCOMMANDS[subcommand].run(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);

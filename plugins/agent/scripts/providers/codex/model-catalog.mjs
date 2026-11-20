@@ -45,7 +45,13 @@ function supportedEfforts(model) {
 }
 
 // How long one catalog read (a model/list call or a `codex debug models` run) may take.
+// CODEX_COMPANION_CATALOG_TIMEOUT_MS, a positive number of milliseconds, replaces the default.
 export const CATALOG_TIMEOUT_MS = 10000;
+
+function catalogTimeoutMs() {
+  const raw = (process.env.CODEX_COMPANION_CATALOG_TIMEOUT_MS ?? "").trim();
+  return /^[1-9]\d*$/.test(raw) ? Math.min(Number(raw), 2 ** 31 - 1) : CATALOG_TIMEOUT_MS;
+}
 
 /**
  * @typedef {{ id: string, hidden: boolean, isDefault: boolean, efforts: string[],
@@ -101,7 +107,7 @@ function rejectAfter(promise, timeoutMs, message) {
  * list has not been read within `timeoutMs`.
  * @returns {Promise<CatalogModel[]>}
  */
-export async function listCatalogModels(client, { timeoutMs = CATALOG_TIMEOUT_MS } = {}) {
+export async function listCatalogModels(client, { timeoutMs = catalogTimeoutMs() } = {}) {
   const models = await rejectAfter(
     listModels(client),
     timeoutMs,
@@ -158,7 +164,7 @@ function parseDebugModels(stdout) {
  * later, also when the process ignores the stop.
  * @returns {Promise<{ ok: boolean, models: CatalogModel[], detail: string }>}
  */
-export function readDebugModels(cwd, { timeoutMs = CATALOG_TIMEOUT_MS, env = process.env } = {}) {
+export function readDebugModels(cwd, { timeoutMs = catalogTimeoutMs(), env = process.env } = {}) {
   return new Promise((resolve) => {
     const plan = resolveCommand("codex", ["debug", "models"], env);
     const timedOut = `codex debug models did not answer within ${Math.round(timeoutMs / 1000)} s.`;
@@ -293,7 +299,7 @@ export function resolveFamily(word, { debugModels = null, listModels: listed = n
 // app server, its initialize handshake and reading every page. A failure or a timeout leaves the
 // list unavailable. The app server is closed in every case, including one that never answered
 // initialize; close() stops it by its process id when it does not exit on its own.
-async function readListOnce(cwd, timeoutMs = CATALOG_TIMEOUT_MS) {
+async function readListOnce(cwd, timeoutMs = catalogTimeoutMs()) {
   const client = new SpawnedCodexAppServerClient(cwd);
   const reading = (async () => {
     await client.initialize();
@@ -437,32 +443,3 @@ export const codexModelCatalog = Object.freeze({
     return normalized;
   }
 });
-
-/**
- * Throws when `effort` is not supported by the requested model, or by the default model when
- * none is requested. A model the catalog does not list, such as one from a custom provider, is
- * accepted unchecked. When the model list cannot be read within CATALOG_TIMEOUT_MS, the effort
- * is checked against the efforts Codex knows.
- */
-export async function validateModelSelection(client, { model = null, effort = null } = {}) {
-  if (!effort) {
-    return;
-  }
-  let models;
-  try {
-    models = await listCatalogModels(client, { timeoutMs: CATALOG_TIMEOUT_MS });
-  } catch {
-    models = null;
-  }
-  if (!models || models.length === 0) {
-    checkKnownEffort(effort, effort);
-    return;
-  }
-  const selected = model ? models.find((entry) => entry.id === model) : models.find((entry) => entry.isDefault);
-  if (!selected) {
-    return;
-  }
-  if (selected.efforts.length > 0 && !selected.efforts.includes(effort)) {
-    throw new Error(`Model ${selected.id} does not support reasoning effort "${effort}". Use one of: ${selected.efforts.join(", ")}.`);
-  }
-}

@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { isActiveJobStatus } from "../../../commands/status.mjs";
 import {
   enqueueBackgroundTask,
+  normalizeArgv,
   outputCommandResult,
   parseCommandInput,
   resolveCommandCwd,
@@ -160,7 +161,6 @@ async function runTaskRequest(request) {
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
-    modelResolved: request.modelResolved === true,
     // The job record keeps the model and effort the turn runs with: the values turn/start sends,
     // and for a value it does not send, the one Codex reports for the thread.
     onThreadReady: request.jobId
@@ -272,9 +272,9 @@ function selectionFields(selection) {
   };
 }
 
-// A request built from a resolved selection is not checked again by the worker.
+// A task request that sends the model and effort of a resolved selection.
 function resolvedRequest(fields, selection) {
-  return { ...buildTaskRequest({ ...fields, model: selection.model, effort: selection.effort }), modelResolved: true };
+  return buildTaskRequest({ ...fields, model: selection.model, effort: selection.effort });
 }
 
 function printWarnings(selection) {
@@ -343,7 +343,7 @@ ${request}` : ""
     return { prompt, summary };
   }
   throw new Error(
-    "No finished Codex review with output was found for this repository. Run /agent:codex-review or /agent:codex-adversarial-review first."
+    "No finished review with output was found for this repository. Run /agent:codex-review or /agent:agy-review first."
   );
 }
 
@@ -462,15 +462,50 @@ export function launchManifestTasks(cwd, workspaceRoot, options, positionals, de
   }
 }
 
-export async function handleTask(argv) {
-  const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file", "output-schema", "resume-thread", "manifest"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "from-last-review", "worktree"],
-    stopAtFirstPositional: true,
-    aliasMap: {
-      m: "model"
+// /agent:codex-fleet passes its arguments after --manifest, so a missing manifest leaves the
+// option without a value or followed by another flag.
+const MISSING_MANIFEST_MESSAGE = "Name a manifest file: /agent:codex-fleet <manifest.json>";
+
+function parseTaskInput(argv) {
+  let parsed;
+  try {
+    parsed = parseCommandInput(argv, {
+      valueOptions: ["model", "effort", "cwd", "prompt-file", "output-schema", "resume-thread", "manifest"],
+      booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "from-last-review", "worktree"],
+      stopAtFirstPositional: true,
+      aliasMap: {
+        m: "model"
+      }
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === "Missing value for --manifest") {
+      throw new Error(MISSING_MANIFEST_MESSAGE);
     }
-  });
+    throw error;
+  }
+  const manifest = parsed.options.manifest;
+  if (manifest !== undefined) {
+    const text = String(manifest);
+    // The parser takes the next token as the value, so a separate token that starts with a dash
+    // cannot be told from a flag. The inline form states the path unambiguously.
+    const inline = normalizeArgv(argv).some((token) => token.startsWith("--manifest="));
+    if (!text.trim()) {
+      throw new Error(MISSING_MANIFEST_MESSAGE);
+    }
+    if (text.startsWith("--") && !inline) {
+      throw new Error(MISSING_MANIFEST_MESSAGE);
+    }
+    if (text.startsWith("-") && !inline) {
+      throw new Error(
+        `${MISSING_MANIFEST_MESSAGE}. If the path starts with a dash, write --manifest=${text} or ./${text}.`
+      );
+    }
+  }
+  return parsed;
+}
+
+export async function handleTask(argv) {
+  const { options, positionals } = parseTaskInput(argv);
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
@@ -583,7 +618,6 @@ export async function handleTask(argv) {
           cwd,
           model: selection.model,
           effort: selection.effort,
-          modelResolved: true,
           prompt,
           write,
           resumeLast: false,

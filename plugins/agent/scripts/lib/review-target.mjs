@@ -208,7 +208,8 @@ export function resolveReviewTarget(cwd, { target = "auto", paths = [], base, sc
   const root = path.resolve(getRepoRoot(cwd));
   const changedPaths = listChangedPaths(root, changes);
   // A branch comparison with no commits to compare still has work to review while the working
-  // tree has changes, because Codex's built-in reviewer compares the base with the working tree.
+  // tree has changes, because a built-in reviewer that compares the base with the working tree
+  // sees them.
   if (changedPaths.length === 0 && !getWorkingTreeState(root).isDirty) {
     throw new Error(NOTHING_TO_REVIEW_MESSAGE);
   }

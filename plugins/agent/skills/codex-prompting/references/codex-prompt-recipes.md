@@ -1,8 +1,8 @@
 # Codex Prompt Recipes
 
-Use these as starting templates for Codex task prompts or other Codex/GPT-5.4 prompt construction.
+Use these as starting templates for Codex task prompts or other Codex prompt construction.
 Copy the smallest recipe that fits the task, then trim anything you do not need.
-In `agent:codex-rescue`, run diagnosis and fix-oriented recipes in write mode by default unless the user explicitly asked for read-only behavior.
+In `agent:codex-delegate`, run the diagnosis, review and research recipes read-only, without `--write`, unless the user asks for edits. Run the fix recipe with `--write` unless the user asked for read-only behavior.
 
 ## Diagnosis
 
@@ -21,7 +21,7 @@ Return a compact diagnosis with:
 
 <default_follow_through_policy>
 Keep going until you have enough evidence to identify the root cause confidently.
-Only stop to ask questions when a missing detail changes correctness materially.
+You cannot ask questions during this run. If a missing detail changes correctness materially, stop and return the blocking question as your final answer.
 </default_follow_through_policy>
 
 <verification_loop>
@@ -128,7 +128,7 @@ Prefer primary sources.
 
 ```xml
 <task>
-Diagnose why this existing prompt is underperforming and propose the smallest high-leverage changes to improve it for Codex or GPT-5.4.
+Diagnose why this existing prompt is underperforming and propose the smallest high-leverage changes to improve it for Codex.
 </task>
 
 <structured_output_contract>

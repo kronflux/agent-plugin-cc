@@ -1,6 +1,6 @@
 ---
 description: Show the Codex usage limits of the signed-in account
-argument-hint: ""
+argument-hint: '[--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---

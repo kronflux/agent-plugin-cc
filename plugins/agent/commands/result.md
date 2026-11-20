@@ -1,6 +1,6 @@
 ---
-description: Show the stored final output for a finished Codex job in this repository
-argument-hint: '[job-id]'
+description: Show the stored final output of a finished Codex or Antigravity job in this repository
+argument-hint: '[job-id] [--wait] [--timeout-ms <ms>]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---

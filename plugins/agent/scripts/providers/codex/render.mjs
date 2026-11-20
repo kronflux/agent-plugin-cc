@@ -1,5 +1,7 @@
 // Reports for the Codex-only commands: /agent:codex-setup and /agent:codex-usage.
 
+import { delegationLines } from "../../lib/model-selection.mjs";
+
 export function renderSetupReport(report) {
   const lines = [
     "# Codex Setup",
@@ -14,6 +16,7 @@ export function renderSetupReport(report) {
     ...(report.appServer ? [`- app server: ${report.appServer}`] : []),
     `- session runtime: ${report.sessionRuntime.label}`,
     `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
+    ...delegationLines(report.delegation, { chosenBy: "Codex" }),
     ""
   ];
 

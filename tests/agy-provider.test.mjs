@@ -378,6 +378,16 @@ test("result of a background agy task names the saved model it ran on", (t) => {
   assert.equal(result.stdout.match(/^Model: /gm).length, 1, result.stdout);
 });
 
+test("status labels a task job with the current command name", (t) => {
+  const ctx = makeRepo(undefined, t);
+  const result = run("node", [AGY, "task", "hi"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(result.status, 0, result.stderr);
+  const status = run("node", [NEUTRAL, "status", "--all"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, / \| completed \| delegate \| Antigravity Task/);
+  assert.doesNotMatch(status.stdout, /rescue/);
+});
+
 test("agy rejects a --model its model list does not contain", (t) => {
   const ctx = makeRepo(undefined, t);
   const result = run("node", [AGY, "task", "--model", "nope", "hi"], { cwd: ctx.repo, env: ctx.env });

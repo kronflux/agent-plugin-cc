@@ -28,7 +28,7 @@ export const agyProvider = Object.freeze({
   }),
   reviewCommands: Object.freeze({
     review: "/agent:agy-review",
-    adversarialReview: "/agent:agy-review"
+    adversarialReview: "/agent:agy-review --stance critical"
   }),
   modelCatalog: agyModelCatalog,
 

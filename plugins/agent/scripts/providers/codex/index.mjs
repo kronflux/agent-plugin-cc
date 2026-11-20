@@ -28,7 +28,7 @@ export const codexProvider = Object.freeze({
   }),
   reviewCommands: Object.freeze({
     review: "/agent:codex-review",
-    adversarialReview: "/agent:codex-adversarial-review"
+    adversarialReview: "/agent:codex-review --stance critical"
   }),
   modelCatalog: codexModelCatalog,
 

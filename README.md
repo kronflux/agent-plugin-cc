@@ -18,11 +18,11 @@ All commands come from the `agent` plugin. Commands for one agent carry its name
 ## What You Get
 
 - `/agent:codex-review` and `/agent:agy-review` to review your changes or your project, as a peer or as a critical reviewer
-- `/agent:codex-rescue` and `/agent:agy-rescue` to hand a task to Codex or Antigravity
+- `/agent:codex-delegate` and `/agent:agy-delegate` to hand a task to Codex or Antigravity
 - `/agent:codex-transfer` to hand off a Claude Code session to Codex
 - `/agent:status`, `/agent:result`, `/agent:send`, and `/agent:cancel` to manage the background jobs of both agents
 - `/agent:codex-usage` to see how much of your Codex usage limits is left
-- `/agent:codex-fanout` to start several Codex tasks at once from a manifest
+- `/agent:codex-fleet` to start several Codex tasks at once from a manifest
 - `/agent:codex-setup` and `/agent:agy-setup` to check each agent and choose its delegation model and effort
 
 ## Requirements
@@ -83,7 +83,7 @@ If `agy` is installed but not signed in, run `!agy` once and sign in.
 After install, you should see:
 
 - the slash commands listed below
-- the `agent:codex-rescue` and `agent:agy-rescue` subagents in `/agents`
+- the `agent:codex-delegate` and `agent:agy-delegate` subagents in `/agents`
 
 To try the plugin from a local checkout instead of the published marketplace, start Claude Code
 with the plugin directory for one session:
@@ -143,7 +143,7 @@ Examples:
 /agent:codex-review --background --stance critical look for race conditions and question the chosen approach
 ```
 
-This command is read-only and does not fix code. To have Codex fix what a review found, run `/agent:codex-rescue --from-last-review`.
+This command is read-only and does not fix code. To have Codex fix what a review found, run `/agent:codex-delegate --from-last-review`.
 
 It also takes `--model` and `--effort`, which follow the [model policy](#models-and-effort).
 
@@ -156,9 +156,9 @@ Runs the same review with Antigravity. It takes the same flags as `/agent:codex-
 /agent:agy-review --stance critical --background
 ```
 
-### `/agent:codex-rescue`
+### `/agent:codex-delegate`
 
-Hands a task to Codex through the `agent:codex-rescue` subagent.
+Hands a task to Codex through the `agent:codex-delegate` subagent.
 
 Use it when you want Codex to:
 
@@ -177,14 +177,14 @@ It supports `--background`, `--wait`, `--resume`, `--fresh`, `--worktree`, and `
 Examples:
 
 ```bash
-/agent:codex-rescue investigate why the tests started failing
-/agent:codex-rescue fix the failing test with the smallest safe patch
-/agent:codex-rescue --resume apply the top fix from the last run
-/agent:codex-rescue --model <id> --effort medium investigate the flaky integration test
-/agent:codex-rescue --model configured fix the issue quickly
-/agent:codex-rescue --background investigate the regression
-/agent:codex-rescue --from-last-review skip the style findings
-/agent:codex-rescue --worktree try a rewrite of the cache layer
+/agent:codex-delegate investigate why the tests started failing
+/agent:codex-delegate fix the failing test with the smallest safe patch
+/agent:codex-delegate --resume apply the top fix from the last run
+/agent:codex-delegate --model <id> --effort medium investigate the flaky integration test
+/agent:codex-delegate --model configured fix the issue quickly
+/agent:codex-delegate --background investigate the regression
+/agent:codex-delegate --from-last-review skip the style findings
+/agent:codex-delegate --worktree try a rewrite of the cache layer
 ```
 
 With `--worktree`, Codex works in a new git worktree on the branch `agent/<job-id>`, created from
@@ -206,15 +206,15 @@ Ask Codex to redesign the database connection to be more resilient.
 - write-capable runs use the `workspace-write` sandbox; `/agent:codex-setup --write-sandbox danger-full-access` turns the sandbox off for this repository, and `--write-sandbox workspace-write` turns it back on
 - follow-up requests can continue the latest Codex task in the repo, and they keep that task's model and effort
 
-### `/agent:agy-rescue`
+### `/agent:agy-delegate`
 
-Hands a task to Antigravity through the `agent:agy-rescue` subagent. It works like `/agent:codex-rescue`: the subagent starts the job in the background, waits for it, and returns the result.
+Hands a task to Antigravity through the `agent:agy-delegate` subagent. It works like `/agent:codex-delegate`: the subagent starts the job in the background, waits for it, and returns the result.
 
 It supports `--background`, `--wait`, `--resume`, `--fresh`, `--model`, and `--effort` (the efforts the installed agy lists in `agy --help`, such as `low`, `medium`, and `high`).
 
 ```bash
-/agent:agy-rescue investigate why the build is failing in CI
-/agent:agy-rescue --resume apply the top fix from the last run
+/agent:agy-delegate investigate why the build is failing in CI
+/agent:agy-delegate --resume apply the top fix from the last run
 ```
 
 ### `/agent:codex-transfer`
@@ -274,7 +274,7 @@ Examples:
 /agent:result task-abc123
 ```
 
-### `/agent:codex-fanout`
+### `/agent:codex-fleet`
 
 Starts one background Codex task per entry of a JSON manifest and prints the job IDs.
 
@@ -293,8 +293,8 @@ effort. Give write tasks `worktree: true` so parallel edits do not collide. Use 
 to the repository, or quote a path that contains spaces.
 
 ```bash
-/agent:codex-fanout tasks.json
-/agent:codex-fanout tasks.json --write --worktree
+/agent:codex-fleet tasks.json
+/agent:codex-fleet tasks.json --write --worktree
 ```
 
 ### `/agent:send`
@@ -424,7 +424,7 @@ The hook that starts each Claude Code session exports `AGENT_PLUGIN_SESSION_ID` 
 
 The plugin also drives the Antigravity CLI (`agy`). Its jobs appear in `/agent:status`, and
 `/agent:result`, `/agent:send`, and `/agent:cancel` work on them as on Codex jobs. The commands
-are [`/agent:agy-setup`](#agentagy-setup), [`/agent:agy-rescue`](#agentagy-rescue), and
+are [`/agent:agy-setup`](#agentagy-setup), [`/agent:agy-delegate`](#agentagy-delegate), and
 [`/agent:agy-review`](#agentagy-review).
 
 Each job runs its own `agy` process. Read-only runs use agy's plan mode with terminal
@@ -446,8 +446,8 @@ interrupt a turn, so `/agent:cancel` stops the job's processes. An agy process i
 ### Hand A Problem To Codex Or Antigravity
 
 ```bash
-/agent:codex-rescue investigate why the build is failing in CI
-/agent:agy-rescue investigate why the build is failing in CI
+/agent:codex-delegate investigate why the build is failing in CI
+/agent:agy-delegate investigate why the build is failing in CI
 ```
 
 ### Get A Second Opinion
@@ -467,7 +467,7 @@ interrupt a turn, so `/agent:cancel` stops the job's processes. An agy process i
 
 ```bash
 /agent:codex-review --background --stance critical
-/agent:codex-rescue --background investigate the flaky test
+/agent:codex-delegate --background investigate the flaky test
 ```
 
 Then check in with:

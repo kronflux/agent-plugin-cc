@@ -2,7 +2,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { normalizeArgv, resolveCommandCwd, resolveCommandWorkspace, runForegroundCommand } from "../../../lib/companion-cli.mjs";
+import { resolveCommandCwd, resolveCommandWorkspace, runForegroundCommand } from "../../../lib/companion-cli.mjs";
 import { collectReviewContext } from "../../../lib/git.mjs";
 import { resolveModelSelection } from "../../../lib/model-selection.mjs";
 import { renderNativeReviewResult, renderReviewResult } from "../../../lib/render.mjs";
@@ -32,7 +32,6 @@ const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json"
 const EFFORT_USAGE = `<${KNOWN_REASONING_EFFORTS.join("|")}>`;
 
 export const usage = `review [--target auto|changes|project] [--path <path>]... [--stance peer|critical] [--base <ref>] [--scope auto|working-tree|branch] [--wait|--background] [--model <id|family|default|configured>] [--effort ${EFFORT_USAGE}] [--] [instructions]`;
-export const adversarialUsage = `adversarial-review [--target auto|changes|project] [--path <path>]... [--base <ref>] [--scope auto|working-tree|branch] [--wait] [--model <id|family|default|configured>] [--effort ${EFFORT_USAGE}] [--] [instructions]`;
 
 export function buildNativeReviewTarget(target) {
   if (target.mode === "working-tree") {
@@ -275,9 +274,4 @@ export async function handleReviewCommand(argv) {
 
 export async function run(argv) {
   return handleReviewCommand(argv);
-}
-
-// The adversarial-review subcommand runs the review command with the critical stance.
-export async function runAdversarial(argv) {
-  return handleReviewCommand(["--stance", "critical", ...normalizeArgv(argv)]);
 }

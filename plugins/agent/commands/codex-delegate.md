@@ -1,11 +1,11 @@
 ---
-description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--from-last-review] [--worktree] [--model <id|family|default|configured>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [what Codex should investigate, solve, or continue]"
+description: Delegate investigation, an explicit fix request, or follow-up work to Codex through the Codex delegate subagent
+argument-hint: '[--background|--wait] [--resume|--fresh] [--from-last-review] [--worktree] [--model <id|family|default|configured>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [what Codex should investigate, solve, or continue]'
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
-Invoke the `agent:codex-rescue` subagent via the `Agent` tool (`subagent_type: "agent:codex-rescue"`), forwarding the raw user request as the prompt.
-`agent:codex-rescue` is a subagent, not a skill — do not call `Skill(agent:codex-rescue)` (no such skill) or `Skill(agent:codex-rescue)` (that re-enters this command and hangs the session). The command runs inline so the `Agent` tool stays in scope; forked general-purpose subagents do not expose it.
+Invoke the `agent:codex-delegate` subagent via the `Agent` tool (`subagent_type: "agent:codex-delegate"`), forwarding the raw user request as the prompt.
+`agent:codex-delegate` is a subagent, not a skill — do not call `Skill(agent:codex-delegate)` (no such skill; calling it re-enters this command and hangs the session). The command runs inline so the `Agent` tool stays in scope; forked general-purpose subagents do not expose it.
 The final user-visible response must be Codex's output verbatim.
 
 Raw user request:
@@ -13,7 +13,7 @@ $ARGUMENTS
 
 Execution mode:
 
-- Claude Code runs plugin subagents in the background, so run the `agent:codex-rescue` subagent in the background in every case. Its result arrives as the agent's completion notification.
+- Claude Code runs plugin subagents in the background, so run the `agent:codex-delegate` subagent in the background in every case. Its result arrives as the agent's completion notification.
 - If the request includes `--wait`, tell the user in one sentence that the result will arrive when the agent finishes, and start no other work in this turn.
 - `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
@@ -21,7 +21,7 @@ Execution mode:
 - `--from-last-review` sends the findings of the newest finished review, from `/agent:codex-review` or `/agent:agy-review`, to Codex. The task names that review's agent and job id, for example "the findings of the Antigravity review <job-id>". Preserve it for the forwarded `task` call, but do not treat it as part of the natural-language task text. A request with this flag needs no other text.
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.
 - If the request includes `--fresh`, do not ask whether to continue. The user already chose.
-- Otherwise, before starting Codex, check for a resumable rescue thread from this Claude session by running:
+- Otherwise, before starting Codex, check for a resumable Codex thread from this Claude session by running:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task-resume-candidate --json

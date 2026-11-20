@@ -202,7 +202,12 @@ export async function storeDelegationSetting(provider, workspaceRoot, cwd, optio
   } else if (stored.model && checked.warnings.length > 0) {
     action = `Stored model ${stored.model}${withEffort} for delegations in ${workspaceRoot} without checking it.`;
   } else {
-    action = `Delegations now use ${stored.model ? `model ${stored.model}` : "the default model"}${withEffort} in ${workspaceRoot}.`;
+    const modelText = !stored.model
+      ? "the default model"
+      : stored.model.toLowerCase() === "configured"
+        ? `the model set in the ${provider.label} configuration`
+        : `model ${stored.model}`;
+    action = `Delegations now use ${modelText}${withEffort} in ${workspaceRoot}.`;
   }
   return { action, warnings: checked.warnings };
 }

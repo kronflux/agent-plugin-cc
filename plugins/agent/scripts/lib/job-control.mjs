@@ -146,9 +146,13 @@ function filterJobsForCurrentSession(jobs, options = {}) {
   return jobs.filter((job) => job.sessionId === sessionId);
 }
 
+// Stored kind labels that name a removed command, shown under the current command name. The
+// stored records keep their label.
+const DISPLAY_KIND_LABELS = { rescue: "delegate" };
+
 function getJobTypeLabel(job) {
   if (typeof job.kindLabel === "string" && job.kindLabel) {
-    return job.kindLabel;
+    return DISPLAY_KIND_LABELS[job.kindLabel] ?? job.kindLabel;
   }
   if (job.kind === "adversarial-review") {
     return "adversarial-review";
@@ -157,13 +161,13 @@ function getJobTypeLabel(job) {
     return "review";
   }
   if (job.jobClass === "task") {
-    return "rescue";
+    return "delegate";
   }
   if (job.kind === "review") {
     return "review";
   }
   if (job.kind === "task") {
-    return "rescue";
+    return "delegate";
   }
   return "job";
 }
