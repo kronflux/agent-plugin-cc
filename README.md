@@ -661,13 +661,22 @@ without a quorum ends the council: `council collect` exits 1 with `No quorum: <k
 <f> families. A council needs two valid seats from two families.`, and the report is titled
 `# Failed council` and holds every stored answer.
 
-**One attempt per seat.** In this release each seat gets one attempt per round: there is no repair
-of an invalid answer, no retry after a timeout or a transient error, and no grace period after a
-quorum. Each seat ends a round as `valid`, `invalid`, `timed-out`, `error`, `missing-cli` or
-`quota-exhausted`; a failed provider turn is checked against the provider's usage to tell exhausted
-quota from other failures. The time limit (`--timeout-ms`, 15 minutes by default) applies to each
-job three ways: to start it, to wait in the queue, and to run it, counted from the moment a worker
-claims the job (`claimed_at`). A seat past its limit gets one exact stop request for its job.
+**One repair and one retry per seat.** In each round a seat whose answer is invalid gets one repair
+prompt: the full round prompt, the validation errors and the schema. A seat that fails for a
+passing reason, answers late, stays silent (the Claude seat) or is stopped by the council's own stop
+request gets one retry prompt. Exhausted quota and permanent failures get no retry. The repair and
+the retry are separate, and a seat can use both in either order; after that its next failure is
+final. A provider seat's replacement continues its ended job when that job recorded a thread, and
+otherwise starts a fresh job whose prompt holds the whole round context. The Claude seat's
+replacement is a new prompt among the deliveries. A cancellation that the council did not request
+ends the seat as `error` with no retry. There is no grace period after a quorum. Each seat ends a
+round as `valid`, `invalid`, `timed-out`, `error`, `missing-cli` or `quota-exhausted`; a failed
+provider turn is checked against the provider's usage to tell exhausted quota from other failures.
+The member-turn cap counts ordinary turns only; `repairs` and `retries` count the replacements
+issued and appear in `collect`, `status` and the report. The time limit (`--timeout-ms`, 15 minutes
+by default) applies to each attempt three ways: to start it, to wait in the queue, and to run it,
+counted from the moment a worker claims the job (`claimed_at`). A seat past its limit gets one exact
+stop request for its job.
 
 **The status loop.** The skill repeats `council status <run-id>`, which names one next action:
 `collect`, `crossexam`, `merge`, `verify`, `report`, `report-failure`, `damaged` or `done`, with

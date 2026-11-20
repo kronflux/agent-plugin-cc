@@ -10,7 +10,7 @@ import { reduceRound } from "./reduce.mjs";
  * exact cancellation attribution, 2 adds the quorum cutoff. Commands read it once and pass it to
  * every state function as `layer`; no state function reads it.
  */
-export const COUNCIL_LAYER = 0;
+export const COUNCIL_LAYER = 1;
 
 /** How long a selected stop dispatch, or a foreign cancellation, may stay unsettled. */
 export const STOP_BOUND_MS = 120000;
@@ -623,6 +623,40 @@ export async function acknowledgeStop(store, { jobId, selected, deadline } = {})
   });
 }
 
+/**
+ * The `withinStop` hook of the exact stop request for `jobId` (Layer 1): when the request selected
+ * the job and its council stop is still pending, it records `dispatched_at = acknowledged_at = t`
+ * (t ratcheted from the request's commit time) and, only when the job had no earlier cancel request
+ * and had not ended, the first-cancellation evidence in the same transaction. An acknowledged
+ * stop, an empty selection or a job with no council stop writes nothing.
+ */
+export function stopHook({ jobId } = {}) {
+  return (db, { commitWall, selection }) => {
+    const entry = (selection ?? []).find((item) => item.jobId === jobId);
+    if (!entry) {
+      return;
+    }
+    const stop = plain(
+      db
+        .prepare(
+          `SELECT s.*, a.run_id AS run_id, ru.clock AS run_clock FROM council_stops AS s
+           JOIN council_attempts AS a ON a.job_id = s.job_id JOIN council_runs AS ru ON ru.id = a.run_id
+           WHERE s.job_id = ?`
+        )
+        .get(jobId)
+    );
+    if (!stop || stop.acknowledged_at !== null) {
+      return;
+    }
+    const t = Math.max(stop.run_clock, commitWall);
+    db.prepare("UPDATE council_stops SET dispatched_at = ?, acknowledged_at = ? WHERE job_id = ? AND acknowledged_at IS NULL").run(t, t, jobId);
+    if (!entry.hadCancelRequest && !entry.wasEnded) {
+      db.prepare("INSERT INTO council_stop_cancels (job_id, committed_at) VALUES (?, ?)").run(jobId, t);
+    }
+    writeClock(db, stop.run_id, t);
+  };
+}
+
 function entriesMatch(entries, mapSha256, validSeats) {
   if (!Array.isArray(entries) || entries.length !== validSeats.length) {
     return false;
@@ -810,6 +844,39 @@ function applyWrite(db, view, write, t) {
     case "stop":
       db.prepare("INSERT INTO council_stops (job_id, requested_at, cause) VALUES (?, ?, ?)").run(write.jobId, t, write.cause);
       return;
+    case "replace": {
+      // Retire the old attempt, insert its replacement, then switch the seat's current attempt.
+      const prompt = write.kind === "prompt";
+      db.prepare("UPDATE council_attempts SET retired_at = ? WHERE id = ? AND retired_at IS NULL").run(t, write.replacesId);
+      db.prepare(
+        `INSERT INTO council_attempts (id, run_id, round, seat, charge, replaces_id, kind, created_at, issue_by, prompt_sha256,
+           retry_prompt_sha256, predecessor_id, issued_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        write.attemptId,
+        runId,
+        round,
+        write.seat,
+        write.charge,
+        write.replacesId,
+        write.kind,
+        t,
+        t + view.run.timeout_ms,
+        write.promptSha256,
+        write.retryPromptSha256 ?? null,
+        write.predecessorId ?? null,
+        prompt ? t : null
+      );
+      db.prepare("UPDATE council_seat_rounds SET state = ?, current_id = ? WHERE run_id = ? AND round = ? AND seat = ? AND current_id = ?").run(
+        prompt ? "running" : "issuing",
+        write.attemptId,
+        runId,
+        round,
+        write.seat,
+        write.replacesId
+      );
+      return;
+    }
     case "close":
       db.prepare("UPDATE council_rounds SET closed_at = ?, quorum = ? WHERE run_id = ? AND round = ?").run(t, write.quorum, runId, round);
       db.prepare("UPDATE council_runs SET input_rev = input_rev + 1 WHERE id = ?").run(runId);

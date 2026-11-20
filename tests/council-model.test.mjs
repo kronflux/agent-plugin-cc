@@ -243,7 +243,7 @@ test("B1 to B9 each apply their guard and effect, and fall through when the guar
 });
 
 // A hand-built view of an open round with T=1000 for the pure reducer.
-function handView({ seatRounds, attempts, observations = [], stops = [], jobs = {}, clock = 0 }) {
+function handView({ seatRounds, attempts, observations = [], stops = [], cancels = [], jobs = {}, clock = 0, freshIds = [] }) {
   return {
     run: { id: "run-1", timeout_ms: 1000, clock, seat_count: 3 },
     round: { run_id: "run-1", round: 1, started_at: 0, closed_at: null, quorum: null, quorum_at: null, cutoff_at: null },
@@ -256,9 +256,9 @@ function handView({ seatRounds, attempts, observations = [], stops = [], jobs = 
     attempts,
     observations,
     stops,
-    cancels: [],
+    cancels,
     jobs,
-    freshIds: []
+    freshIds
   };
 }
 
@@ -414,4 +414,166 @@ test("nextDue converts each deadline on its own clock", () => {
     attempts: [prompt("a1", 1000), provider("a2", 1000, "j2"), provider("a3", 1000)]
   });
   assert.equal(nextDue(none, { w, t, layer: 0 }), null);
+});
+
+// Layer 1: a hand-built round where s1 is valid, s3 is an error, and s2 (or s1) is the seat under
+// test. Attempts carry their charge, prompt and prepared retry digest; ids f0..f5 are fresh.
+const FRESH = ["f0", "f1", "f2", "f3", "f4", "f5"];
+const turn = (id, seat, kind, overrides = {}) => ({
+  id,
+  seat,
+  charge: "turn",
+  kind,
+  job_id: null,
+  refusal: null,
+  created_at: 0,
+  issue_by: 1000,
+  prompt_sha256: hex(seat.slice(1)),
+  retry_prompt_sha256: hex("r"),
+  ...overrides
+});
+const endedJob = (columns = {}) => ({ created_at: 0, claimed_at: 10, end_state: "completed", end_at: 50, isTip: 1, cancel_requested_at: null, thread_id: null, ...columns });
+
+function layer1View({ s2 = {}, s2Attempts = [], observation = null, stops = [], cancels = [], job = endedJob(), s1 = null, s1Observation = null } = {}) {
+  const s1Attempt = turn("a1", "s1", "prompt", { issued_at: 0 });
+  const s2Attempt = turn("a2", "s2", "create", { job_id: "j2", ...s2 });
+  return handView({
+    seatRounds: [
+      { seat: "s1", state: s1 ? "running" : "valid", current_id: "a1" },
+      { seat: "s2", state: s1 ? "valid" : "running", current_id: "a2" },
+      { seat: "s3", state: "error", current_id: "a3" }
+    ],
+    attempts: [s1Attempt, s2Attempt, ...s2Attempts, turn("a3", "s3", "create")],
+    observations: [...(observation ? [{ attempt_id: "a2", ...observation }] : []), ...(s1Observation ? [{ attempt_id: "a1", ...s1Observation }] : [])],
+    stops,
+    cancels,
+    jobs: job ? { j2: job } : {},
+    freshIds: FRESH
+  });
+}
+
+const replaceWrite = (seat, charge, kind, promptSha256, overrides = {}) => ({
+  op: "replace",
+  seat,
+  charge,
+  attemptId: FRESH[(Number(seat.slice(1)) - 1) * 2 + (charge === "repair" ? 0 : 1)],
+  kind,
+  predecessorId: null,
+  replacesId: `a${seat.slice(1)}`,
+  promptSha256,
+  retryPromptSha256: hex("r"),
+  ...overrides
+});
+
+const finishOf = (seat, state, reason) => ({ op: "finish", seat, state, reason, answerSha256: null, errorsSha256: null });
+
+test("layer 1 rows L1b and L1c replace once per slot, and the fallback finishes the ordinary candidate", () => {
+  const at = { w: 100, t: 100, layer: 1 };
+  const invalid = { outcome: "invalid", reason: "schema validation failed", errors_sha256: hex("e"), replacement_sha256: hex("p"), transient: 0 };
+  // L1b: an invalid answer with its prepared digest gets one repair; a threadless job is replaced
+  // by a fresh job, an ended job with a thread is continued.
+  assert.deepEqual(reduceRound(layer1View({ observation: invalid }), at).writes, [replaceWrite("s2", "repair", "create", hex("p"))]);
+  assert.deepEqual(reduceRound(layer1View({ observation: invalid, job: endedJob({ thread_id: "thread-2" }) }), at).writes, [
+    replaceWrite("s2", "repair", "continue", hex("p"), { predecessorId: "j2" })
+  ]);
+  // A pruned job row gives a fresh job.
+  assert.deepEqual(reduceRound(layer1View({ observation: invalid, job: null }), at).writes, [replaceWrite("s2", "repair", "create", hex("p"))]);
+  // Layer 0, a used repair slot, or a historical deposit without a digest: the ordinary finish.
+  const invalidFinish = [{ ...finishOf("s2", "invalid", "schema validation failed"), errorsSha256: hex("e") }, { op: "close", quorum: 0 }];
+  assert.deepEqual(reduceRound(layer1View({ observation: invalid }), { ...at, layer: 0 }).writes, invalidFinish);
+  const usedRepair = [turn("a2r", "s2", "create", { charge: "repair", replaces_id: "a0", retired_at: 50 })];
+  assert.deepEqual(reduceRound(layer1View({ observation: invalid, s2Attempts: usedRepair }), at).writes, invalidFinish);
+  assert.deepEqual(reduceRound(layer1View({ observation: { ...invalid, replacement_sha256: null } }), at).writes, invalidFinish);
+  // A used retry slot leaves the repair slot free: either order is allowed.
+  const usedRetry = [turn("a2t", "s2", "create", { charge: "retry", retired_at: 50 })];
+  assert.deepEqual(reduceRound(layer1View({ observation: invalid, s2Attempts: usedRetry }), at).writes, [replaceWrite("s2", "repair", "create", hex("p"))]);
+
+  // L1c: a late output, a transient failure with its digest, and a council-caused cancellation
+  // with first-cancellation evidence get one retry.
+  const late = { outcome: "late", reason: "execution deadline expired", transient: 0, replacement_sha256: null };
+  assert.deepEqual(reduceRound(layer1View({ observation: late }), at).writes, [replaceWrite("s2", "retry", "create", hex("r"))]);
+  // A Layer 0 attempt with no prepared retry object retries with its initial turn prompt.
+  assert.deepEqual(reduceRound(layer1View({ observation: late, s2: { retry_prompt_sha256: null } }), at).writes, [
+    replaceWrite("s2", "retry", "create", hex("2"), { retryPromptSha256: null })
+  ]);
+  const transient = { outcome: "failure", reason: "transient provider failure", transient: 1, replacement_sha256: hex("t") };
+  assert.deepEqual(reduceRound(layer1View({ observation: transient, job: endedJob({ end_state: "failed", thread_id: "thread-2" }) }), at).writes, [
+    replaceWrite("s2", "retry", "continue", hex("t"), { predecessorId: "j2" })
+  ]);
+  assert.deepEqual(reduceRound(layer1View({ observation: transient, s2Attempts: usedRetry }), at).writes, [
+    finishOf("s2", "error", "transient provider failure"),
+    { op: "close", quorum: 0 }
+  ]);
+  // Quota, a permanent failure and a missing job are never retried.
+  for (const [observation, state, reason] of [
+    [{ outcome: "quota", reason: "quota exhausted", transient: 0 }, "quota-exhausted", "quota exhausted"],
+    [{ outcome: "failure", reason: "provider failure", transient: 0 }, "error", "provider failure"],
+    [{ outcome: "missing", reason: "job pruned or missing", transient: 0 }, "error", "job pruned or missing"]
+  ]) {
+    assert.deepEqual(reduceRound(layer1View({ observation }), at).writes, [finishOf("s2", state, reason), { op: "close", quorum: 0 }], observation.outcome);
+  }
+
+  // A Claude prompt: an invalid receipt gets a repair prompt, a silent prompt a retry prompt.
+  const s1Invalid = { outcome: "invalid", reason: "schema validation failed", errors_sha256: hex("e"), replacement_sha256: hex("q"), transient: 0 };
+  assert.deepEqual(reduceRound(layer1View({ s1: true, s1Observation: s1Invalid }), at).writes, [replaceWrite("s1", "repair", "prompt", hex("q"))]);
+  assert.deepEqual(reduceRound(layer1View({ s1: true }), { w: 1000, t: 1000, layer: 1 }).writes, [replaceWrite("s1", "retry", "prompt", hex("r"))]);
+  // The replacement's own issuance deadline is the next wake.
+  assert.deepEqual(reduceRound(layer1View({ s1: true }), { w: 1000, t: 1000, layer: 1 }).nextDue, { delayMs: 1000, axis: "council", source: "s1:issue_by" });
+});
+
+test("layer 1 attribution: L1a, the B7 retry of a threadless live job, and the B8 extension", () => {
+  const at = { w: 100, t: 100, layer: 1 };
+  const cancelled = { outcome: "cancelled", reason: "job cancelled", transient: 0, replacement_sha256: null };
+  const stop = { job_id: "j2", requested_at: 20, cause: "deadline", dispatched_at: 30, acknowledged_at: 30 };
+  const proof = { job_id: "j2", committed_at: 30 };
+  const cancelledJob = endedJob({ end_state: "cancelled" });
+  // L1a: a cancellation with council-first evidence is the stop's timeout and gets the retry;
+  // without the evidence, a council stop row alone is an external cancellation.
+  assert.deepEqual(reduceRound(layer1View({ observation: cancelled, stops: [stop], cancels: [proof], job: cancelledJob }), at).writes, [
+    replaceWrite("s2", "retry", "create", hex("r"))
+  ]);
+  for (const stops of [[stop], []]) {
+    assert.deepEqual(reduceRound(layer1View({ observation: cancelled, stops, job: cancelledJob }), at).writes, [
+      finishOf("s2", "error", "external cancellation"),
+      { op: "close", quorum: 0 }
+    ]);
+  }
+  // With a used retry slot the proven cancellation finishes as the stop's timeout.
+  const usedRetry = [turn("a2t", "s2", "create", { charge: "retry", retired_at: 50 })];
+  assert.deepEqual(reduceRound(layer1View({ observation: cancelled, stops: [stop], cancels: [proof], job: cancelledJob, s2Attempts: usedRetry }), at).writes, [
+    finishOf("s2", "timed-out", "execution deadline expired"),
+    { op: "close", quorum: 0 }
+  ]);
+
+  // B7 at its bound on a still-live job: proven and threadless gives a fresh retry; proven with a
+  // thread finishes timed-out; unproven is an external cancellation that did not settle.
+  const live = { created_at: 0, claimed_at: 10, end_state: null, isTip: 1, cancel_requested_at: 30, thread_id: null };
+  const bound = { w: 120030, t: 120030, layer: 1 };
+  assert.deepEqual(reduceRound(layer1View({ stops: [stop], cancels: [proof], job: live }), { ...bound, w: 120029, t: 120029 }).writes, []);
+  assert.deepEqual(reduceRound(layer1View({ stops: [stop], cancels: [proof], job: live }), bound).writes, [replaceWrite("s2", "retry", "create", hex("r"))]);
+  assert.deepEqual(reduceRound(layer1View({ stops: [stop], cancels: [proof], job: { ...live, thread_id: "thread-2" } }), bound).writes, [
+    finishOf("s2", "timed-out", "execution deadline expired"),
+    { op: "close", quorum: 0 }
+  ]);
+  assert.deepEqual(reduceRound(layer1View({ stops: [stop], job: live }), bound).writes, [
+    finishOf("s2", "error", "external cancellation did not settle"),
+    { op: "close", quorum: 0 }
+  ]);
+  // Layer 0 keeps its rule: a selected council stop at its bound is that stop's timeout.
+  assert.deepEqual(reduceRound(layer1View({ stops: [stop], job: live }), { ...bound, layer: 0 }).writes, [
+    finishOf("s2", "timed-out", "execution deadline expired"),
+    { op: "close", quorum: 0 }
+  ]);
+
+  // B8 extension: a pending council stop without evidence does not hold back the raw bound of an
+  // external cancellation; proven evidence does.
+  const pending = { ...stop, dispatched_at: null, acknowledged_at: null };
+  const foreign = { ...live, cancel_requested_at: 25 };
+  assert.deepEqual(reduceRound(layer1View({ stops: [pending], job: foreign }), { w: 120024, t: 120024, layer: 1 }).writes, []);
+  assert.deepEqual(reduceRound(layer1View({ stops: [pending], job: foreign }), { w: 120025, t: 120025, layer: 1 }).writes, [
+    finishOf("s2", "error", "external cancellation did not settle"),
+    { op: "close", quorum: 0 }
+  ]);
+  assert.deepEqual(nextDue(layer1View({ stops: [pending], job: foreign }), { w: 25, t: 25, layer: 1 }), { delayMs: 120000, axis: "wall", source: "s2:external-cancel" });
+  assert.deepEqual(reduceRound(layer1View({ stops: [pending], job: foreign }), { w: 120025, t: 120025, layer: 0 }).writes, []);
 });

@@ -32,7 +32,15 @@ import { buildSeatJob, readSeatUsage } from "../lib/council/jobs.mjs";
 import { installObject, ObjectDamagedError, publishExport, readObject } from "../lib/council/objects.mjs";
 import { buildBundles } from "../lib/council/anonymise.mjs";
 import { mergeCouncil, serializeMerge, sortedTally } from "../lib/council/merge.mjs";
-import { FAMILIES, familyProvider, planSeats, renderRound1Prompt, renderRound2Prompt } from "../lib/council/prompts.mjs";
+import {
+  FAMILIES,
+  familyProvider,
+  planSeats,
+  renderRepairPrompt,
+  renderRetryPrompt,
+  renderRound1Prompt,
+  renderRound2Prompt
+} from "../lib/council/prompts.mjs";
 import {
   acknowledgeStop,
   BUDGET_MS,
@@ -55,6 +63,7 @@ import {
   reduceRun,
   startRound2,
   STOP_RETRY_MS,
+  stopHook,
   USAGE_READ_MS
 } from "../lib/council/state.mjs";
 import { classifyFailure, classifyJob, validateAnswer, validationContext } from "../lib/council/validate.mjs";
@@ -172,29 +181,39 @@ async function dispatchCreate(store, stateDir, runDir, attempt, ctx) {
     return { dispatched: false, diagnostics: [] };
   }
   let created;
-  try {
-    created = await retried(
-      (opts) => createJob(store, built.fields, { label: built.label, withinCreate: createBindingHook({ attemptId: attempt.id, layer: ctx.layer }) }, opts),
-      ctx.deadline
-    );
-  } catch (error) {
-    if (error instanceof CouncilFenceError || error instanceof StoreError) {
+  let label = built.label ?? null;
+  for (;;) {
+    try {
+      created = await retried(
+        (opts) => createJob(store, built.fields, { label, withinCreate: createBindingHook({ attemptId: attempt.id, layer: ctx.layer }) }, opts),
+        ctx.deadline
+      );
+      break;
+    } catch (error) {
+      if (error instanceof CouncilFenceError || error instanceof StoreError) {
+        return { dispatched: false, diagnostics: [] };
+      }
+      // A fresh replacement tries the seat label once, then once without a label.
+      if (error instanceof LabelInUseError && attempt.charge !== "turn" && label !== null) {
+        label = null;
+        continue;
+      }
+      const reason =
+        error instanceof LabelInUseError
+          ? "label in use"
+          : error instanceof InvalidLabelError
+            ? "invalid label"
+            : error instanceof PromptTooLargeError
+              ? "prompt too large"
+              : "invalid job request";
+      await refuse(store, attempt, reason, ctx);
       return { dispatched: false, diagnostics: [] };
     }
-    const reason =
-      error instanceof LabelInUseError
-        ? "label in use"
-        : error instanceof InvalidLabelError
-          ? "invalid label"
-          : error instanceof PromptTooLargeError
-            ? "prompt too large"
-            : "invalid job request";
-    await refuse(store, attempt, reason, ctx);
-    return { dispatched: false, diagnostics: [] };
   }
   testPoint(POINTS.afterCreate);
   await launchAfterWin(store, stateDir, created.jobId, ctx);
-  return { dispatched: true, jobId: created.jobId, diagnostics: [] };
+  const dropped = label === null && built.label ? [{ seat: attempt.seat, jobId: created.jobId, label: built.label }] : [];
+  return { dispatched: true, jobId: created.jobId, diagnostics: dropped };
 }
 
 // The continuation refusal that the exact predecessor's projection decides before E17 runs, or
@@ -319,8 +338,9 @@ async function dispatchContinue(store, stateDir, runDir, attempt, ctx) {
  * attempt through E17 with the continuation hook (at most one forced call per dispatch), then E38
  * once after a win. Deterministic failures record the contract's refusal; availability and fence
  * losses leave the attempt pending. `deps` is `{ run, seat, layer, deadline }` plus the optional
- * `buildJob`, `launch` and `readRequester`. Resolves to `{ dispatched, jobId?, diagnostics }`,
- * where a continuation that lost its label gives `diagnostics: [{ seat, jobId, label }]`.
+ * `buildJob`, `launch` and `readRequester`. A fresh repair or retry whose seat label is held
+ * retries once without a label. Resolves to `{ dispatched, jobId?, diagnostics }`, where a job
+ * that did not get the seat's label gives `diagnostics: [{ seat, jobId, label }]`.
  */
 export async function dispatchAttempt(store, stateDir, runDir, attempt, deps) {
   if (attempt.kind === "create") {
@@ -360,7 +380,13 @@ export async function dispatchStops(store, run, deps) {
     let outcome;
     try {
       outcome = await retried(
-        (opts) => (deps.requestStop ?? requestStop)(store, { jobIds: [stop.job_id] }, { reason: "cancel", sessionId, cancel: true, afterMs: 4000 }, opts),
+        (opts) =>
+          (deps.requestStop ?? requestStop)(
+            store,
+            { jobIds: [stop.job_id] },
+            { reason: "cancel", sessionId, cancel: true, afterMs: 4000, withinStop: (deps.layer ?? 0) >= 1 ? stopHook({ jobId: stop.job_id }) : null },
+            opts
+          ),
         deps.deadline
       );
     } catch (error) {
@@ -396,6 +422,35 @@ function failureReason(row, cls) {
     return "launch failed";
   }
   return cls === "transient" ? "transient provider failure" : "provider failure";
+}
+
+// The full round base prompt of an attempt's seat round: the prompt of its initial turn attempt.
+function basePromptOf(runDir, snapshot, attempt) {
+  const turn = snapshot.attempts.find((row) => row.round === attempt.round && row.seat === attempt.seat && row.charge === "turn");
+  return readObject(runDir, turn.prompt_sha256, "md").toString("utf8");
+}
+
+/**
+ * At `layer` 1 or more, installs the replacement prompt of a new invalid or transient verdict
+ * before its deposit and returns the verdict with `replacementSha256`: the repair prompt (full
+ * round base prompt, the validation errors, the round schema) for an invalid verdict, the retry
+ * prompt (reissued at the job's end time, with the failure reason) for a transient failure. Any
+ * other verdict, and every verdict at layer 0, is returned unchanged.
+ */
+function withReplacement(runDir, snapshot, attempt, verdict, layer) {
+  if (!(layer >= 1)) {
+    return verdict;
+  }
+  if (verdict.outcome === "invalid") {
+    const errors = verdict.errorsSha256 ? JSON.parse(readObject(runDir, verdict.errorsSha256, "json").toString("utf8")) : [verdict.reason];
+    const text = renderRepairPrompt({ basePrompt: basePromptOf(runDir, snapshot, attempt), errors, schemaText: fs.readFileSync(roundSchemaPath(attempt.round), "utf8") });
+    return { ...verdict, replacementSha256: installObject(runDir, text, "md") };
+  }
+  if (verdict.outcome === "failure" && verdict.transient) {
+    const text = renderRetryPrompt({ issuedAt: verdict.eventAt, basePrompt: basePromptOf(runDir, snapshot, attempt), reason: verdict.reason });
+    return { ...verdict, replacementSha256: installObject(runDir, text, "md") };
+  }
+  return verdict;
 }
 
 // The verdict of a completed, timely job: its structured output checked against the round.
@@ -508,6 +563,7 @@ export async function observeJobs(store, runDir, snapshot, deps) {
         }
       }
     }
+    verdict = withReplacement(runDir, snapshot, attempt, verdict, deps.layer);
     const result = await depositObservation(store, { attemptId: attempt.id, jobId: attempt.job_id, verdict, layer: deps.layer, deadline: deps.deadline });
     if (result.ok) {
       deposited += 1;
@@ -909,7 +965,7 @@ export function roundObject(snapshot, round) {
     validSeats: valid.length,
     validFamilies: familyCount(valid.map((row) => seats.get(row.seat).family)),
     cleanupPending: snapshot.stops.some((stop) => stop.acknowledged_at === null && roundJobs.has(stop.job_id)),
-    memberTurns: charges.turn + charges.repair + charges.retry,
+    memberTurns: charges.turn,
     repairs: charges.repair,
     retries: charges.retry,
     seats: seatRounds.map((row) => ({
@@ -943,6 +999,12 @@ function nodeIo() {
 
 function emit(io, json, payload, text) {
   io.stdout(json ? `${JSON.stringify(payload, null, 2)}\n` : text.endsWith("\n") ? text : `${text}\n`);
+}
+
+// At `layer` 1 or more, the digest of a seat's prepared retry prompt: the full round prompt,
+// reissued at its preparation time; undefined at layer 0.
+function retryPromptOf(runDir, prompt, layer) {
+  return layer >= 1 ? installObject(runDir, renderRetryPrompt({ issuedAt: wallNow(), basePrompt: prompt }), "md") : undefined;
 }
 
 // `council start`: brief and seats, provider check, objects, the seeded run, one executor pass.
@@ -994,6 +1056,7 @@ async function startCouncil(options, repeated, ctx) {
       label: provider ? `${runId}-${seat.seat}` : null,
       attemptId: missingCli ? undefined : randomBytes(16).toString("hex"),
       promptSha256: missingCli ? undefined : installObject(runDir, prompt, "md"),
+      retryPromptSha256: missingCli ? undefined : retryPromptOf(runDir, prompt, ctx.layer),
       missingCli
     };
   });
@@ -1046,6 +1109,7 @@ async function cleanupStops(store, runId, { deadline, cleanupDeadline, ctx }) {
   const now = ctx.advance?.now ?? (() => performance.now());
   const sleep = ctx.advance?.sleep ?? defaultSleep;
   const deps = {
+    layer: ctx.layer,
     deadline,
     now,
     stamps: new Map(),
@@ -1120,8 +1184,9 @@ async function collectCouncil(options, positionals, ctx) {
   }
 }
 
-// The receipt verdict of a reply's bytes, with its objects installed outside any transaction.
-function receiptVerdict(runDir, snapshot, attempt, bytes) {
+// The receipt verdict of a reply's bytes, with its objects (and at layer 1 or more the repair
+// prompt of an invalid reply) installed outside any transaction.
+function receiptVerdict(runDir, snapshot, attempt, bytes, layer) {
   let answer;
   try {
     answer = JSON.parse(bytes.toString("utf8"));
@@ -1139,7 +1204,7 @@ function receiptVerdict(runDir, snapshot, attempt, bytes) {
     return { outcome: "valid", answerSha256 };
   }
   const errorsSha256 = installObject(runDir, `${JSON.stringify(checked.errors)}\n`, "json");
-  return { outcome: "invalid", errorsSha256, reason: "schema validation failed" };
+  return withReplacement(runDir, snapshot, attempt, { outcome: "invalid", errorsSha256, reason: "schema validation failed" }, layer);
 }
 
 // `council submit <run-id> <seat> --intent <id> --file <answer.json>`: the receipt, then reduction.
@@ -1166,7 +1231,7 @@ async function submitCouncil(options, positionals, ctx) {
       throw new CouncilRefusal("unknown-run", unknownRunMessage(runId));
     }
     const attempt = snapshot.attempts.find((row) => row.id === intentId && row.seat === seat && row.kind === "prompt") ?? null;
-    const verdict = receiptVerdict(runDir, snapshot, attempt, bytes);
+    const verdict = receiptVerdict(runDir, snapshot, attempt, bytes, ctx.layer);
     testPoint(POINTS.afterReplyValidation);
     const receipt = await depositReceipt(store, { runId, seat, attemptId: intentId, verdict, layer: ctx.layer, deadline });
     const round = receipt.round ?? attempt?.round ?? null;
@@ -1256,16 +1321,16 @@ export async function crossExamine(runDir, deps) {
   const briefText = readObject(runDir, snapshot.run.brief_sha256, "md").toString("utf8");
   const schemaText = fs.readFileSync(roundSchemaPath(2), "utf8");
   const lenses = new Map(snapshot.seats.map((row) => [row.seat, row.lens]));
-  const entries = valid.map((row) => ({
-    seat: row.seat,
-    attemptId: randomBytes(16).toString("hex"),
-    promptSha256: installObject(
-      runDir,
-      renderRound2Prompt({ brief: briefText, lens: lenses.get(row.seat), ownFindings: answers[row.seat].findings, bundle: bundles[row.seat], schemaText }),
-      "md"
-    ),
-    mapSha256
-  }));
+  const entries = valid.map((row) => {
+    const prompt = renderRound2Prompt({ brief: briefText, lens: lenses.get(row.seat), ownFindings: answers[row.seat].findings, bundle: bundles[row.seat], schemaText });
+    return {
+      seat: row.seat,
+      attemptId: randomBytes(16).toString("hex"),
+      promptSha256: installObject(runDir, prompt, "md"),
+      retryPromptSha256: retryPromptOf(runDir, prompt, layer),
+      mapSha256
+    };
+  });
   const seeded = await startRound2(store, { runId, mapSha256, entries, layer, deadline });
   if (!seeded.ok) {
     throw refusalOf(seeded.reason);
@@ -1317,7 +1382,7 @@ export function mergeInput(runDir, snapshot) {
     round1: answersOf(1),
     round2: answersOf(2),
     anonymisation: round2?.map_sha256 ? readJsonObject(runDir, round2.map_sha256) : {},
-    turns: { used: charges.turn + charges.repair + charges.retry, repairs: charges.repair, retries: charges.retry }
+    turns: { used: charges.turn, repairs: charges.repair, retries: charges.retry }
   };
 }
 
@@ -1715,7 +1780,7 @@ function seatTable(snapshot) {
 
 function runLine(snapshot) {
   const charges = snapshot.charges.total;
-  const used = charges.turn + charges.repair + charges.retry;
+  const used = charges.turn;
   return `Run ${snapshot.run.id} · ${snapshot.run.kind} · 2 rounds · member turns ${used} of ${snapshot.run.turn_cap} (repairs ${charges.repair}, retries ${charges.retry})`;
 }
 

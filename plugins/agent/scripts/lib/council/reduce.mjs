@@ -63,6 +63,55 @@ function wallLimits(job, timeoutMs) {
   return timelyClaim ? { due: job.claimed_at + timeoutMs, cause: "deadline" } : { due: queueBy, cause: "queue" };
 }
 
+// The Layer 1 replacement of a seat's current attempt: a repair or retry write, or null when its
+// slot is used, its prompt digest is missing, or (for a live job) the job has a thread. The kind
+// follows the exact job: a Claude prompt stays a prompt; a provider continues an ended job that
+// recorded a thread and otherwise starts a fresh job.
+function replacementWrite(view, attempts, row, current, job, { charge, promptSha256, live = false }) {
+  if (!promptSha256) {
+    return null;
+  }
+  const seatAttempts = attempts.filter((attempt) => attempt.seat === row.seat);
+  if (seatAttempts.some((attempt) => attempt.charge === charge)) {
+    return null;
+  }
+  let kind = "prompt";
+  let predecessorId = null;
+  if (current.kind !== "prompt") {
+    const threaded = Boolean(job && job.thread_id);
+    if (live && threaded) {
+      return null;
+    }
+    if (!live && threaded && job.end_state !== null) {
+      kind = "continue";
+      predecessorId = current.job_id;
+    } else {
+      kind = "create";
+    }
+  }
+  const index = (Number(row.seat.slice(1)) - 1) * 2 + (charge === "repair" ? 0 : 1);
+  return {
+    op: "replace",
+    seat: row.seat,
+    charge,
+    attemptId: view.freshIds?.[index],
+    kind,
+    predecessorId,
+    replacesId: current.id,
+    promptSha256,
+    retryPromptSha256: current.retry_prompt_sha256 ?? null
+  };
+}
+
+// The prompt digest of an ordinary retry (late output, silent prompt, council-caused timeout):
+// the prepared retry object carried on the attempt, else the seat's initial turn prompt.
+function retryDigest(attempts, row, current) {
+  if (current.retry_prompt_sha256) {
+    return current.retry_prompt_sha256;
+  }
+  return attempts.find((attempt) => attempt.seat === row.seat && attempt.charge === "turn")?.prompt_sha256 ?? null;
+}
+
 function finishWrite(seat, outcome) {
   return {
     op: "finish",
@@ -82,6 +131,12 @@ function finishWrite(seat, outcome) {
  * Returns `{ writes, nextDue }`: writes are `{ op: "account", seat }`, `{ op: "finish", seat,
  * state, reason, answerSha256, errorsSha256 }`, `{ op: "stop", jobId, cause }` and
  * `{ op: "close", quorum }`; `nextDue` is the nearest remaining delay after the writes.
+ * At `layer` 1 or more, an ordinary B4, B5 or B7 candidate first tries L1a (cancellation
+ * attribution from `view.cancels`), L1b (one repair of an invalid answer with its prepared digest)
+ * and L1c (one retry of a transient failure, a late output, a silent prompt or a council-caused
+ * timeout), writing `{ op: "replace", seat, charge, attemptId, kind, predecessorId, replacesId,
+ * promptSha256, retryPromptSha256 }` with `attemptId` from `view.freshIds` (two per seat); B8
+ * also covers a council stop without first-cancellation evidence.
  */
 export function reduceRound(view, { w, t, layer = 0 }) {
   if (!view.round || view.round.closed_at !== null) {
@@ -115,6 +170,22 @@ export function reduceRound(view, { w, t, layer = 0 }) {
     }
   }
 
+  const roundAttempts = view.attempts ?? [];
+  // Exact council-first cancellation evidence, recorded by the stop's own E18 transaction.
+  const councilFirst = new Set((view.cancels ?? []).map((row) => row.job_id));
+  const replaced = [];
+  // Before an ordinary B4, B5 or B7 candidate finishes, Layer 1 tries its repair (L1b) or retry
+  // (L1c) slot; the fallback finishes the candidate.
+  const settle = (row, current, job, outcome, slot) => {
+    const write = layer >= 1 && slot ? replacementWrite(view, roundAttempts, row, current, job, slot) : null;
+    if (!write) {
+      finish(row.seat, outcome);
+      return;
+    }
+    writes.push(write);
+    replaced.push(write);
+    states.set(row.seat, write.kind === "prompt" ? "running" : "issuing");
+  };
   const newStops = [];
   for (const row of ordered) {
     if (states.get(row.seat) !== "running") {
@@ -124,18 +195,38 @@ export function reduceRound(view, { w, t, layer = 0 }) {
     const observation = observations.get(current.id);
     if (current.kind === "prompt") {
       if (observation) {
-        finish(row.seat, observationOutcome(observation, null));
+        const repair = observation.outcome === "invalid" ? { charge: "repair", promptSha256: observation.replacement_sha256 } : null;
+        settle(row, current, null, observationOutcome(observation, null), repair);
       } else if (t >= current.issue_by) {
-        finish(row.seat, { state: "timed-out", reason: "reply deadline expired" });
+        settle(row, current, null, { state: "timed-out", reason: "reply deadline expired" }, { charge: "retry", promptSha256: retryDigest(roundAttempts, row, current) });
       }
       continue;
     }
     const stop = stops.get(current.job_id) ?? null;
+    const job = jobs[current.job_id];
+    const proven = councilFirst.has(current.job_id);
     if (observation) {
-      finish(row.seat, observationOutcome(observation, stop));
+      let outcome = observationOutcome(observation, stop);
+      let slot = null;
+      if (layer >= 1) {
+        if (observation.outcome === "invalid") {
+          slot = { charge: "repair", promptSha256: observation.replacement_sha256 };
+        } else if (observation.outcome === "late") {
+          slot = { charge: "retry", promptSha256: retryDigest(roundAttempts, row, current) };
+        } else if (observation.outcome === "failure" && observation.transient === 1) {
+          slot = { charge: "retry", promptSha256: observation.replacement_sha256 };
+        } else if (observation.outcome === "cancelled") {
+          if (stop && proven) {
+            slot = { charge: "retry", promptSha256: retryDigest(roundAttempts, row, current) };
+          } else {
+            // L1a: a council stop row alone carries no attribution.
+            outcome = { state: "error", reason: "external cancellation" };
+          }
+        }
+      }
+      settle(row, current, job, outcome, slot);
       continue;
     }
-    const job = jobs[current.job_id];
     if (!job || job.end_state !== null) {
       continue;
     }
@@ -148,10 +239,18 @@ export function reduceRound(view, { w, t, layer = 0 }) {
       }
     }
     if (stop && stop.dispatched_at !== null && t >= stop.dispatched_at + STOP_BOUND_MS) {
-      finish(row.seat, { state: "timed-out", reason: STOP_CAUSE_REASONS[stop.cause] });
+      if (layer >= 1 && !proven) {
+        // L1a: a selected dispatch with no council-first evidence did not cause the cancellation.
+        finish(row.seat, { state: "error", reason: "external cancellation did not settle" });
+      } else {
+        const slot = { charge: "retry", promptSha256: retryDigest(roundAttempts, row, current), live: true };
+        settle(row, current, job, { state: "timed-out", reason: STOP_CAUSE_REASONS[stop.cause] }, slot);
+      }
       continue;
     }
-    if (!stop && job.cancel_requested_at !== null && w >= job.cancel_requested_at + STOP_BOUND_MS) {
+    // B8, and at Layer 1 its extension to a council stop without first-cancellation evidence.
+    const foreign = layer >= 1 ? !stop || !proven : !stop;
+    if (foreign && job.cancel_requested_at !== null && w >= job.cancel_requested_at + STOP_BOUND_MS) {
       finish(row.seat, { state: "error", reason: "external cancellation did not settle" });
     }
   }
@@ -164,9 +263,24 @@ export function reduceRound(view, { w, t, layer = 0 }) {
     return { writes, nextDue: null };
   }
 
+  const replacementOf = new Map(replaced.map((write) => [write.seat, write]));
   const after = {
     ...view,
-    seatRounds: view.seatRounds.map((row) => ({ ...row, state: states.get(row.seat) })),
+    seatRounds: view.seatRounds.map((row) => ({ ...row, state: states.get(row.seat), current_id: replacementOf.get(row.seat)?.attemptId ?? row.current_id })),
+    attempts: [
+      ...roundAttempts,
+      ...replaced.map((write) => ({
+        id: write.attemptId,
+        seat: write.seat,
+        charge: write.charge,
+        kind: write.kind,
+        job_id: null,
+        refusal: null,
+        created_at: t,
+        issue_by: t + T,
+        retry_prompt_sha256: write.retryPromptSha256
+      }))
+    ],
     stops: [...(view.stops ?? []), ...newStops]
   };
   return { writes, nextDue: nextDue(after, { w, t, layer }) };
@@ -180,7 +294,6 @@ export function reduceRound(view, { w, t, layer = 0 }) {
  * deadline; a delay already due is 0.
  */
 export function nextDue(view, { w, t, layer = 0 }) {
-  void layer;
   if (!view.round || view.round.closed_at !== null) {
     return null;
   }
@@ -188,6 +301,7 @@ export function nextDue(view, { w, t, layer = 0 }) {
   const attempts = indexBy(view.attempts, "id");
   const observations = indexBy(view.observations, "attempt_id");
   const stops = indexBy(view.stops, "job_id");
+  const councilFirst = new Set((view.cancels ?? []).map((row) => row.job_id));
   const jobs = view.jobs ?? {};
   const candidates = [];
   const add = (seat, name, axis, deadline, now) => candidates.push({ delayMs: Math.max(0, deadline - now), axis, source: `${seat}:${name}` });
@@ -220,7 +334,8 @@ export function nextDue(view, { w, t, layer = 0 }) {
     if (stop && stop.dispatched_at !== null) {
       add(row.seat, "stop-dispatch", "council", stop.dispatched_at + STOP_BOUND_MS, t);
     }
-    if (!stop && job.cancel_requested_at !== null) {
+    const foreign = layer >= 1 ? !stop || !councilFirst.has(current.job_id) : !stop;
+    if (foreign && job.cancel_requested_at !== null) {
       add(row.seat, "external-cancel", "wall", job.cancel_requested_at + STOP_BOUND_MS, w);
     }
   }
