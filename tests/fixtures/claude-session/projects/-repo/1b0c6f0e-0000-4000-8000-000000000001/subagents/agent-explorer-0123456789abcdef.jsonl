@@ -1,0 +1,2 @@
+{"type":"user","isSidechain":true,"agentId":"0123456789abcdef","sessionId":"1b0c6f0e-0000-4000-8000-000000000001","message":{"role":"user","content":"Find every caller."}}
+{"type":"assistant","isSidechain":true,"agentId":"0123456789abcdef","sessionId":"1b0c6f0e-0000-4000-8000-000000000001","message":{"role":"assistant","content":[{"type":"text","text":"Two callers."}]}}

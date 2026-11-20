@@ -1276,7 +1276,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
 
   return withAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Importing Claude session into Codex.", "transferring");
-    const contentSha256 = sourceContentSha256(options.sourcePath);
+    const contentSha256 = options.contentSha256 ?? sourceContentSha256(options.sourcePath);
     const importStartedAtMs = Date.now();
     let completion;
     try {
@@ -1305,8 +1305,85 @@ export async function importExternalAgentSession(cwd, options = {}) {
     emitProgress(options.onProgress, `Claude session imported (${threadId}).`, "completed", { threadId });
     return {
       threadId,
+      importId: typeof completion?.importId === "string" ? completion.importId : null,
+      codexVersion: /^codex-cli\s+(\S+)/.exec(availability.detail ?? "")?.[1] ?? null,
       stderr: cleanCodexStderr(client.stderr)
     };
+  });
+}
+
+// Codex answers thread/read for a thread it does not know with an error that says so.
+const UNKNOWN_THREAD_ERROR = /unknown thread|thread not found|no thread|not found|does not exist|no rollout/i;
+
+/**
+ * Whether Codex still has the thread `threadId`, checked with thread/read. An error that says the
+ * thread is unknown answers false; any other error is thrown.
+ */
+export async function threadExists(cwd, threadId) {
+  return withAppServer(cwd, async (client) => {
+    try {
+      await client.request("thread/read", { threadId });
+      return true;
+    } catch (error) {
+      if (typeof error?.rpcCode === "number" && UNKNOWN_THREAD_ERROR.test(String(error.message))) {
+        return false;
+      }
+      throw error;
+    }
+  });
+}
+
+/**
+ * Counts the user and assistant messages of an imported thread from its rollout file, which
+ * thread/read names: the `response_item` lines of type `message`, by role. Resolves to null when
+ * Codex names no rollout file or the file cannot be read. Call it before anything is appended to
+ * the thread.
+ */
+export async function censusImportedThread(cwd, threadId) {
+  const rolloutPath = await withAppServer(cwd, async (client) => {
+    const response = await client.request("thread/read", { threadId });
+    return typeof response?.thread?.path === "string" && response.thread.path ? response.thread.path : null;
+  });
+  if (!rolloutPath) {
+    return null;
+  }
+  const census = { userMessages: 0, assistantMessages: 0 };
+  try {
+    const { createInterface } = await import("node:readline");
+    const lines = createInterface({ input: fs.createReadStream(rolloutPath), crlfDelay: Infinity });
+    for await (const line of lines) {
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (entry?.type !== "response_item" || entry.payload?.type !== "message") {
+        continue;
+      }
+      if (entry.payload.role === "user") {
+        census.userMessages += 1;
+      } else if (entry.payload.role === "assistant") {
+        census.assistantMessages += 1;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return census;
+}
+
+/**
+ * Appends one user message with `text` to the model-visible history of `threadId`. The thread is
+ * loaded with thread/resume first, because thread/inject_items needs a loaded thread.
+ */
+export async function injectThreadPointer(cwd, threadId, text) {
+  await withAppServer(cwd, async (client) => {
+    await client.request("thread/resume", { threadId, excludeTurns: true });
+    await client.request("thread/inject_items", {
+      threadId,
+      items: [{ type: "message", role: "user", content: [{ type: "input_text", text }] }]
+    });
   });
 }
 

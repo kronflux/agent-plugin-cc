@@ -11,7 +11,9 @@ const SCRIPTS = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "p
 const CODEX_COMPANION = path.join(SCRIPTS, "codex-companion.mjs");
 const SHARED_FOLDERS = ["lib", "commands"];
 // Folders under lib/ or commands/ whose files may name a provider, each with the reason.
-const EXEMPT_FOLDERS = [];
+const EXEMPT_FOLDERS = [
+  { folder: "lib/transfer/sources/", reason: "a source reader names the client whose files it reads" }
+];
 const CAPABILITIES = [
   "authCheck",
   "effort",

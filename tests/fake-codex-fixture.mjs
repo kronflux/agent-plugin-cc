@@ -367,6 +367,61 @@ function saveImportLedger(ledger) {
   fs.writeFileSync(ledgerPath, JSON.stringify(ledger, null, 2));
 }
 
+// "hold-import": writes import-held beside the state file, then waits up to 30 s for
+// import-release there before the import reads the staged file.
+function holdImportUntilReleased() {
+  const dir = path.dirname(STATE_PATH);
+  fs.writeFileSync(path.join(dir, "import-held"), String(process.pid));
+  const deadline = Date.now() + 30000;
+  while (!fs.existsSync(path.join(dir, "import-release")) && Date.now() < deadline) {
+    sleepSync(25);
+  }
+}
+
+// Writes the rollout file of an imported thread under CODEX_HOME/sessions: a session_meta line,
+// then one response_item message line per visible message. Returns its path.
+function writeImportRollout(threadId, messages) {
+  const sessionsDir = path.join(path.dirname(importLedgerPath()), "sessions");
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  const rolloutPath = path.join(sessionsDir, "rollout-" + threadId + ".jsonl");
+  const timestamp = new Date().toISOString();
+  const lines = [{ timestamp, type: "session_meta", payload: { id: threadId } }].concat(
+    messages.map((entry) => ({
+      timestamp,
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: entry.role,
+        content: [{ type: entry.role === "user" ? "input_text" : "output_text", text: entry.text }]
+      }
+    }))
+  );
+  fs.writeFileSync(rolloutPath, lines.map((line) => JSON.stringify(line)).join("\\n") + "\\n");
+  return rolloutPath;
+}
+
+// The importer skips lines that are not JSON.
+function parseImportLine(line) {
+  try {
+    return JSON.parse(line);
+  } catch {
+    return null;
+  }
+}
+
+// The text an import keeps from a record: string content, or the text blocks of array content;
+// tool_use, tool_result and thinking blocks are left out.
+function visibleImportText(entry) {
+  const content = entry.message?.content;
+  if (typeof content === "string") {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content.filter((block) => block && block.type === "text" && typeof block.text === "string").map((block) => block.text).join("\\n");
+}
+
 function emitTurnCompleted(threadId, turnId, item) {
   const items = Array.isArray(item) ? item : [item];
   send({ method: "turn/started", params: { threadId, turn: buildTurn(turnId) } });
@@ -705,6 +760,43 @@ function handleMessage(message) {
         break;
       }
 
+      // thread/read answers for threads this fake imported or started, with the rollout file
+      // of an imported thread as its path, and fails for any other id.
+      case "thread/read": {
+        state.threadReads = [...(state.threadReads || []), message.params.threadId];
+        const thread = ensureThread(state, message.params.threadId);
+        saveState(state);
+        send({ id: message.id, result: { thread: { ...buildThread(thread), path: thread.rolloutPath || null } } });
+        break;
+      }
+
+      // thread/inject_items records each call with its items, whether thread/resume loaded the
+      // thread first, and whether the file a pointer names existed; it appends the items to the
+      // thread's rollout file. "inject-fail" answers with an error.
+      case "thread/inject_items": {
+        if (BEHAVIOR === "inject-fail") {
+          send({ id: message.id, error: { code: -32000, message: "thread/inject_items failed for this thread" } });
+          break;
+        }
+        const thread = ensureThread(state, message.params.threadId);
+        const items = message.params.items || [];
+        const text = items.flatMap((item) => item.content || []).map((part) => part.text || "").join("\\n");
+        const named = /is in (.+?)\\. Read it before acting/.exec(text);
+        state.injections = [...(state.injections || []), {
+          threadId: thread.id,
+          items,
+          resumedFirst: Boolean(state.lastThreadResume && state.lastThreadResume.threadId === thread.id),
+          namedPath: named ? named[1] : null,
+          namedPathExisted: named ? fs.existsSync(named[1]) : null
+        }];
+        if (thread.rolloutPath) {
+          fs.appendFileSync(thread.rolloutPath, items.map((item) => JSON.stringify({ timestamp: new Date().toISOString(), type: "response_item", payload: item })).join("\\n") + "\\n");
+        }
+        saveState(state);
+        send({ id: message.id, result: {} });
+        break;
+      }
+
       case "externalAgentConfig/import": {
         if (BEHAVIOR === "external-import-unsupported") {
           send({ id: message.id, error: { code: -32601, message: "Unsupported method: externalAgentConfig/import" } });
@@ -720,6 +812,9 @@ function handleMessage(message) {
         const session = sessions[0];
         if (!session) {
           throw new Error("missing external session migration");
+        }
+        if (BEHAVIOR === "hold-import") {
+          holdImportUntilReleased();
         }
         const sourcePath = fs.realpathSync(session.path);
         state.nextImportId = (state.nextImportId || 0) + 1;
@@ -757,6 +852,8 @@ function handleMessage(message) {
         }
         const contents = fs.readFileSync(sourcePath, "utf8");
         const contentSha256 = crypto.createHash("sha256").update(contents).digest("hex");
+        // Every import records the size, hash and line count of the file it received.
+        state.imports = [...(state.imports || []), { sourcePath, bytes: Buffer.byteLength(contents), sha256: contentSha256, lines: contents.split("\\n").filter(Boolean).length }];
         const ledger = loadImportLedger();
         let record = ledger.records.find(
           (candidate) => candidate.source_path === ledgerSourcePath(sourcePath) && candidate.content_sha256 === contentSha256
@@ -765,15 +862,17 @@ function handleMessage(message) {
         if (record) {
           thread = ensureThread(state, record.imported_thread_id);
         } else {
-          const records = contents.split(/\\r?\\n/).filter(Boolean).map((line) => JSON.parse(line));
+          const records = contents.split(/\\r?\\n/).filter(Boolean).map(parseImportLine).filter(Boolean);
           const title = records.find((entry) => entry.type === "custom-title")?.customTitle || null;
           const messages = records
-            .filter((entry) => entry.type === "user" || entry.type === "assistant")
-            .map((entry) => ({ role: entry.type, text: entry.message?.content || "" }));
+            .filter((entry) => (entry.type === "user" || entry.type === "assistant") && !entry.isMeta && !entry.isSidechain)
+            .map((entry) => ({ role: entry.type, text: visibleImportText(entry) }))
+            .filter((entry) => entry.text !== "");
           thread = nextThread(state, session.cwd, false);
           thread.name = title;
           thread.preview = messages.find((entry) => entry.role === "user")?.text || "";
           thread.visibleMessages = messages;
+          thread.rolloutPath = writeImportRollout(thread.id, messages);
           state.lastExternalAgentImport = { sourcePath, threadId: thread.id, messages };
           record = {
             source_path: ledgerSourcePath(sourcePath),

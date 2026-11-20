@@ -1,0 +1,1 @@
+export FIXTURE_VALUE=1

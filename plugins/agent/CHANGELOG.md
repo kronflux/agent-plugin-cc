@@ -18,6 +18,8 @@
 - Status and result no longer print a `codex resume` command for a job whose thread is ephemeral, and review jobs no longer print a resume command.
 - On POSIX, if the shared temp state root (`$TMPDIR/agent-plugin-<uid>`) is a symlink or belongs to another user, commands stop with "The plugin state folder <dir> is not a private folder owned by you; set CLAUDE_PLUGIN_DATA."
 - An unreadable legacy `state.json` is now kept, with a warning on stderr.
+- `/agent:codex-transfer` copies the transcript once before every import, also when it is already under `~/.claude/projects`, and imports that copy. It writes a session map, `SESSION-MAP.md`, and a manifest to the plugin's state folder, never to the project, and appends one message to the new thread that points to the map. An unchanged session whose thread still exists reuses the thread. `--no-map` writes no map and adds no pointer. The output ends with a fidelity line that counts the thread's user and assistant messages and says that tool calls and results appear in them only as tagged text.
+- `/agent:codex-transfer --json` prints the transfer manifest, version 1. The old `{ threadId, resumeCommand, sourcePath, sessionId }` object is removed; its values are `target.threadId`, `target.resumeCommand`, `source.transcriptPath` and `source.sessionId`. The line "Transferred the Claude session into a Codex thread with visible turn history." is removed.
 
 ## 2.0.0
 

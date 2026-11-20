@@ -16,7 +16,11 @@ import type {
   Thread,
   ThreadItem,
   ThreadListParams,
+  ThreadInjectItemsParams,
+  ThreadInjectItemsResponse,
   ThreadListResponse,
+  ThreadReadParams,
+  ThreadReadResponse,
   ThreadResumeParams as RawThreadResumeParams,
   ThreadResumeResponse,
   ThreadSetNameParams,
@@ -63,6 +67,8 @@ export interface AppServerMethodMap {
   "thread/resume": { params: ThreadResumeParams; result: ThreadResumeResponse };
   "thread/name/set": { params: ThreadSetNameParams; result: ThreadSetNameResponse };
   "thread/list": { params: ThreadListParams; result: ThreadListResponse };
+  "thread/read": { params: ThreadReadParams; result: ThreadReadResponse };
+  "thread/inject_items": { params: ThreadInjectItemsParams; result: ThreadInjectItemsResponse };
   "review/start": { params: ReviewStartParams; result: ReviewStartResponse };
   "turn/start": { params: TurnStartParams; result: TurnStartResponse };
   "turn/interrupt": { params: TurnInterruptParams; result: TurnInterruptResponse };

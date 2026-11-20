@@ -83,6 +83,12 @@ export function listHostTranscriptRoots(env = process.env) {
   return dirs;
 }
 
+/** The Claude Code profile folder: CLAUDE_CONFIG_DIR when set, else <home>/.claude. */
+export function claudeProfileDir(env = process.env) {
+  const configDir = env[CONFIG_DIR_ENV];
+  return configDir ? path.resolve(configDir) : path.join(os.homedir(), ".claude");
+}
+
 /** The path of the plugin manifest Claude Code reads. */
 export function pluginManifestPath() {
   return fileURLToPath(new URL("../../.claude-plugin/plugin.json", import.meta.url));
