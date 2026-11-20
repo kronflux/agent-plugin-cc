@@ -59,6 +59,13 @@ function cleanCodexStderr(stderr) {
     .join("\n");
 }
 
+// Thread requests take the effort as the config key model_reasoning_effort, merged with any other
+// config the caller sets.
+function threadConfig(options) {
+  const config = { ...(options.config ?? {}), ...(options.effort ? { model_reasoning_effort: options.effort } : {}) };
+  return Object.keys(config).length > 0 ? { config } : {};
+}
+
 /** @returns {ThreadStartParams} */
 function buildThreadParams(cwd, options = {}) {
   return {
@@ -68,7 +75,7 @@ function buildThreadParams(cwd, options = {}) {
     sandbox: options.sandbox ?? "read-only",
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true,
-    ...(options.config ? { config: options.config } : {})
+    ...threadConfig(options)
   };
 }
 
@@ -79,8 +86,33 @@ function buildResumeParams(threadId, cwd, options = {}) {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only"
+    sandbox: options.sandbox ?? "read-only",
+    ...threadConfig(options)
   };
+}
+
+// The model and effort a thread/start or thread/resume response says the thread uses; a field
+// the response leaves out or sets to null is left out.
+function reportedSelection(response) {
+  return {
+    ...(typeof response?.model === "string" && response.model ? { model: response.model } : {}),
+    ...(typeof response?.reasoningEffort === "string" && response.reasoningEffort ? { effort: response.reasoningEffort } : {})
+  };
+}
+
+// Prints one warning when the thread reports a model or effort other than the one sent, then
+// hands the reported values to `onThreadReady`. A value the plugin did not send is not compared.
+function announceThreadSelection(response, sent, onThreadReady) {
+  const reported = reportedSelection(response);
+  const modelDiffers = Boolean(sent.model && reported.model && reported.model !== sent.model);
+  const effortDiffers = Boolean(sent.effort && reported.effort && reported.effort !== sent.effort);
+  if (modelDiffers || effortDiffers) {
+    const describe = (model, effort) => `${model ?? "default"} (effort ${effort ?? "default"})`;
+    process.stderr.write(
+      `Codex reported model ${describe(reported.model ?? sent.model, reported.effort ?? sent.effort)} for this thread; the plugin sent ${describe(sent.model, sent.effort)}.\n`
+    );
+  }
+  onThreadReady?.(reported);
 }
 
 /** @returns {UserInput[]} */
@@ -1171,16 +1203,20 @@ export async function runAppServerReview(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
-    await validateModelSelection(client, { model: options.model, effort: options.effort });
+    // A selection the caller resolved against the catalog is not checked again.
+    if (options.modelResolved !== true) {
+      await validateModelSelection(client, { model: options.model, effort: options.effort });
+    }
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     // review/start takes no effort parameter, so the effort is set on the review's thread.
     const thread = await startThread(client, cwd, {
       model: options.model,
+      effort: options.effort,
       sandbox: "read-only",
       ephemeral: true,
-      threadName: options.threadName,
-      config: options.effort ? { model_reasoning_effort: options.effort } : null
+      threadName: options.threadName
     });
+    announceThreadSelection(thread, { model: options.model ?? null, effort: options.effort ?? null }, options.onThreadReady);
     const sourceThreadId = thread.thread.id;
     emitProgress(options.onProgress, `Thread ready (${sourceThreadId}).`, "starting", {
       threadId: sourceThreadId
@@ -1283,25 +1319,43 @@ export async function runAppServerTurn(cwd, options = {}) {
   // The app server is the repository's; the thread can run in another directory, such as a worktree.
   const threadCwd = options.threadCwd ?? cwd;
   return withAppServer(cwd, async (client) => {
-    await validateModelSelection(client, { model: options.model, effort: options.effort });
+    // A selection the caller resolved against the catalog is not checked again.
+    if (options.modelResolved !== true) {
+      await validateModelSelection(client, { model: options.model, effort: options.effort });
+    }
+    const sent = { model: options.model ?? null, effort: options.effort ?? null };
+    // turn/start sends the same model and effort, and a value it sends overrides the thread's,
+    // so the turn runs on a sent value and, where none was sent, on the one the thread reports.
+    const onThreadReady = options.onThreadReady
+      ? (reported) =>
+          options.onThreadReady({
+            ...reported,
+            ...(sent.model ? { model: sent.model } : {}),
+            ...(sent.effort ? { effort: sent.effort } : {})
+          })
+      : null;
     let threadId;
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
       const response = await resumeThread(client, options.resumeThreadId, threadCwd, {
         model: options.model,
+        effort: options.effort,
         sandbox: options.sandbox,
         ephemeral: false
       });
+      announceThreadSelection(response, sent, onThreadReady);
       threadId = response.thread.id;
     } else {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
       const response = await startThread(client, threadCwd, {
         model: options.model,
+        effort: options.effort,
         sandbox: options.sandbox,
         ephemeral: options.persistThread ? false : true,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
       });
+      announceThreadSelection(response, sent, onThreadReady);
       threadId = response.thread.id;
     }
 

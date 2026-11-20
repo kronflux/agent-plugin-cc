@@ -9,13 +9,13 @@ import {
 import { readStdinIfPiped } from "../../../lib/fs.mjs";
 import { getSessionId } from "../../../lib/host.mjs";
 import { sortJobsNewestFirst } from "../../../lib/job-control.mjs";
-import { resolveModelSelection } from "../../../lib/model-selection.mjs";
+import { newestJobOnThread, resolveModelSelection, storedSelection } from "../../../lib/model-selection.mjs";
 import { renderTaskResult } from "../../../lib/render.mjs";
-import { getConfig, listJobs, takeJobMessages, writeJobMessageOutcome } from "../../../lib/state.mjs";
+import { getConfig, listJobs, takeJobMessages, upsertJob, writeJobMessageOutcome } from "../../../lib/state.mjs";
 import { createProviderJob, firstMeaningfulLine, shorten } from "../../../lib/task-launch.mjs";
 import { resolveWorkspaceRoot } from "../../../lib/workspace.mjs";
 import { agyProvider } from "../index.mjs";
-import { ensureAgyAvailable, runAgyTurn } from "../runtime.mjs";
+import { ensureAgyAvailable, readAgySavedModel, runAgyTurn } from "../runtime.mjs";
 
 // Background tasks run in a worker started from the agy companion script.
 const COMPANION_SCRIPT = agyProvider.companionScript;
@@ -44,9 +44,45 @@ export function resolveLatestConversation(workspaceRoot) {
   return (sessionId ? tasks.find((job) => job.sessionId === sessionId) : null) ?? tasks[0] ?? null;
 }
 
+// The lines of a job's output that name the model agy used when the plugin named none.
+function modelNotes(model, providerModel, savedModelChange) {
+  if (model) {
+    return "";
+  }
+  const lines = [providerModel ? `Model: ${providerModel} (from the Antigravity settings)` : "Model: chosen by Antigravity"];
+  if (savedModelChange) {
+    lines.push(savedModelChange);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+// Without a model agy runs on the model saved in its settings, which it reads when it starts. The
+// settings are therefore read when the job runs, not when it was queued, and the job record and
+// output name that model. A resumed conversation whose saved model changed since it started
+// gets one line that names both.
+function readRunModel(workspaceRoot, request) {
+  if (request.model) {
+    return { providerModel: null, savedModelChange: null };
+  }
+  const providerModel = readAgySavedModel();
+  const started = request.continuedProviderModel ?? null;
+  const savedModelChange =
+    started && providerModel && started !== providerModel
+      ? `Antigravity's saved model changed from ${started} to ${providerModel} since this conversation started.`
+      : null;
+  if (savedModelChange) {
+    process.stderr.write(`${savedModelChange}\n`);
+  }
+  if (request.jobId && providerModel !== (request.providerModel ?? null)) {
+    upsertJob(workspaceRoot, { id: request.jobId, providerModel });
+  }
+  return { providerModel, savedModelChange };
+}
+
 export async function executeAgyTask(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
   ensureAgyAvailable(request.cwd);
+  const { providerModel, savedModelChange } = readRunModel(workspaceRoot, request);
   const title = request.resumeThreadId ? "Antigravity Resume" : "Antigravity Task";
   const result = await runAgyTurn(workspaceRoot, {
     prompt: request.prompt,
@@ -75,7 +111,7 @@ export async function executeAgyTask(request) {
       rawOutput,
       ...(result.status !== 0 && failureMessage ? { failureMessage } : {})
     },
-    rendered: renderTaskResult({ rawOutput, failureMessage }, { title, jobId: request.jobId ?? null, write: Boolean(request.write), providerLabel: agyProvider.label }),
+    rendered: `${renderTaskResult({ rawOutput, failureMessage }, { title, jobId: request.jobId ?? null, write: Boolean(request.write), providerLabel: agyProvider.label })}${modelNotes(request.model, providerModel, savedModelChange)}`,
     summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${title} finished.`)),
     jobTitle: title,
     jobClass: "task",
@@ -91,7 +127,6 @@ export async function handleTask(argv) {
   });
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const { model, effort } = await resolveModelSelection(agyProvider, { model: options.model, effort: options.effort, cwd });
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
   let resumeThreadId = options["resume-thread"] ? String(options["resume-thread"]).trim() : null;
@@ -110,6 +145,23 @@ export async function handleTask(argv) {
     }
     resumeThreadId = latest.threadId;
   }
+  // A resumed conversation keeps the model and effort of the newest job on it, except for a value
+  // the command gives.
+  const continued = newestJobOnThread(workspaceRoot, agyProvider.id, resumeThreadId);
+  const selection = await resolveModelSelection(agyProvider, {
+    model: options.model,
+    effort: options.effort,
+    setting: getConfig(workspaceRoot).models?.[agyProvider.id] ?? null,
+    stored: storedSelection(continued),
+    cwd
+  });
+  for (const warning of selection.warnings ?? []) {
+    process.stderr.write(`${warning}\n`);
+  }
+  const { model, effort } = selection;
+  // Without a model agy runs on the model saved in its settings. The queued job names the model
+  // saved now, and the run records the one agy reads when it starts.
+  const providerModel = model ? null : readAgySavedModel();
 
   const write = Boolean(options.write);
   const job = createProviderJob(agyProvider, {
@@ -120,9 +172,15 @@ export async function handleTask(argv) {
     workspaceRoot,
     jobClass: "task",
     summary: shorten(prompt),
-    write
+    write,
+    model,
+    effort,
+    modelSource: selection.modelSource,
+    effortSource: selection.effortSource,
+    providerModel
   });
-  const request = { cwd, model, effort, prompt, write, resumeThreadId, jobId: job.id };
+  const continuedProviderModel = continued?.providerModel ?? null;
+  const request = { cwd, model, effort, providerModel, continuedProviderModel, prompt, write, resumeThreadId, jobId: job.id };
 
   if (options.background) {
     const { payload } = enqueueBackgroundTask(cwd, job, request, { workerScript: COMPANION_SCRIPT });

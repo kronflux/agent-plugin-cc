@@ -855,14 +855,14 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const result = run("node", [SCRIPT, "task", "--model", "spark", "--effort", "low", "diagnose the failing test"], {
+  const result = run("node", [SCRIPT, "task", "--model", "luna", "--effort", "low", "diagnose the failing test"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
 
   assert.equal(result.status, 0, result.stderr);
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  assert.equal(fakeState.lastTurnStart.model, "gpt-5.3-codex-spark");
+  assert.equal(fakeState.lastTurnStart.model, "gpt-5.6-luna");
   assert.equal(fakeState.lastTurnStart.effort, "low");
 });
 
@@ -1940,12 +1940,14 @@ test("cancel stops a running job's worker and its app-server", async (t) => {
     () => {
       const job = readJobsState(stateDir).jobs.find((candidate) => candidate.id === jobId);
       const running = job?.status === "running" && Number.isInteger(job.pid);
-      return running && readAppServerPids(binDir).length === 1 ? job : null;
+      // The launch reads the model catalog through an app server of its own, which has ended
+      // before the worker starts the second one.
+      return running && readAppServerPids(binDir).length === 2 ? job : null;
     },
-    { timeoutMs: 15000, describe: "the job to run with one app server" }
+    { timeoutMs: 15000, describe: "the job to run with its own app server" }
   );
   workerPid = runningJob.pid;
-  const [appServerPid] = readAppServerPids(binDir);
+  const appServerPid = readAppServerPids(binDir).at(-1);
   assert.equal(isProcessAlive(workerPid), true, "the worker exited before cancel");
   assert.equal(isProcessAlive(appServerPid), true, "the app server exited before cancel");
 
@@ -2290,11 +2292,11 @@ test("each command starts its own app server and stops it", async (t) => {
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
 
   const env = buildEnv(binDir);
-  // setup checks the login and review runs a turn, so each talks to Codex; status reads only
-  // local job records.
+  // setup checks the login and reads the model catalog, and review reads the model catalog and
+  // then runs a turn, each in an app server of its own; status reads only local job records.
   for (const [args, started] of [
-    [["setup", "--json"], 1],
-    [["review"], 1],
+    [["setup", "--json"], 2],
+    [["review"], 2],
     [["status"], 0]
   ]) {
     const before = readAppServerPids(binDir);
@@ -2346,13 +2348,13 @@ test("setup and status read the workspace named by --cwd", async (t) => {
 
 // Runs a foreground task with a reasoning effort, which makes the companion read the model list,
 // and stops the companion after 20 s so a paging loop fails the test instead of hanging it.
-function runTaskWithEffort(t, behavior) {
+function runTaskWithEffort(t, behavior, effort = "high") {
   const repo = makeCommittedRepo(t);
   const binDir = makeTempDir(t);
   installFakeCodex(binDir, behavior);
   const exited = new Set();
   stopLeftoverProcesses(t, () => readAppServerPids(binDir), exited);
-  const result = spawnSync(process.execPath, [SCRIPT, "task", "--effort", "high", "check the cache"], {
+  const result = spawnSync(process.execPath, [SCRIPT, "task", "--effort", effort, "check the cache"], {
     cwd: repo,
     env: buildEnv(binDir),
     encoding: "utf8",
@@ -2381,10 +2383,12 @@ test("an endless model cursor stops after 50 pages", (t) => {
 });
 
 test("a model list that is not an array skips the effort check", (t) => {
-  const { result, fakeState } = runTaskWithEffort(t, "model-list-not-array");
+  // The well-formed effort list of the default model does not contain xhigh, so only a skipped
+  // check lets it through.
+  const { result, fakeState } = runTaskWithEffort(t, "model-list-not-array", "xhigh");
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(fakeState.lastTurnStart.effort, "high");
+  assert.equal(fakeState.lastTurnStart.effort, "xhigh");
 });
 
 test("an empty prompt contacts no app server", async (t) => {

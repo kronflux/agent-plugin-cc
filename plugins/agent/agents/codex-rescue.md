@@ -36,8 +36,8 @@ Forwarding rules:
 - `--background` and `--wait` in the user's request are Claude-side execution controls. Strip them; step 1 always passes `--background` to `task`.
 - Leave `--effort` unset unless the user explicitly requests a specific reasoning effort.
 - Leave model unset by default. Only add `--model` when the user explicitly asks for a specific model.
-- If the user asks for `spark`, map that to `--model gpt-5.3-codex-spark`.
-- If the user asks for a concrete model name such as `gpt-5.4-mini`, pass it through with `--model`.
+- Pass `--model` only when the user names a model, a family word, `default` or `configured`.
+- Pass the `--model` value through as the user gave it; the companion resolves and checks it.
 - Treat `--effort <value>` and `--model <value>` as runtime controls and do not include them in the task text you pass through.
 - Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
 - Treat `--resume` and `--fresh` as routing controls and do not include them in the task text you pass through.

@@ -1,15 +1,17 @@
 import process from "node:process";
 
 import { outputResult, parseCommandInput, resolveCommandCwd, resolveCommandWorkspace } from "../../../lib/companion-cli.mjs";
+import { delegationLines, describeDelegation, storeDelegationSetting } from "../../../lib/model-selection.mjs";
 import { binaryAvailable } from "../../../lib/process.mjs";
 import { getConfig, setConfig } from "../../../lib/state.mjs";
 import { resolveWorkspaceRoot } from "../../../lib/workspace.mjs";
+import { codexProvider } from "../index.mjs";
 import { renderSetupReport } from "../render.mjs";
 import { getCodexAuthStatus, getCodexAvailability, getSessionRuntimeStatus } from "../runtime.mjs";
 
 export const WRITE_SANDBOXES = ["workspace-write", "danger-full-access"];
 
-export const usage = `setup [--enable-review-gate|--disable-review-gate] [--write-sandbox <${WRITE_SANDBOXES.join("|")}>] [--json]`;
+export const usage = `setup [--model <id|family|default|configured>] [--effort <level>] [--write-sandbox <${WRITE_SANDBOXES.join("|")}>] [--enable-review-gate|--disable-review-gate] [--json]`;
 
 export async function buildSetupReport(cwd, actionsTaken = []) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
@@ -18,6 +20,7 @@ export async function buildSetupReport(cwd, actionsTaken = []) {
   const codexStatus = getCodexAvailability(cwd);
   const authStatus = await getCodexAuthStatus(cwd);
   const config = getConfig(workspaceRoot);
+  const delegation = await describeDelegation(codexProvider, workspaceRoot, cwd);
 
   const nextSteps = [];
   if (!codexStatus.available) {
@@ -41,14 +44,30 @@ export async function buildSetupReport(cwd, actionsTaken = []) {
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
     writeSandbox: config.writeSandbox ?? "workspace-write",
+    delegation,
     actionsTaken,
     nextSteps
   };
 }
 
+// The delegation lines follow the review gate line in the checks list.
+function renderReport(report) {
+  const rendered = renderSetupReport(report);
+  const lines = delegationLines(report.delegation, { chosenBy: codexProvider.label }).join("\n");
+  return rendered.replace(/^(- review gate: .*)$/m, (gate) => `${gate}\n${lines}`);
+}
+
+export function checkWriteSandbox(value) {
+  const sandbox = String(value).trim();
+  if (!WRITE_SANDBOXES.includes(sandbox)) {
+    throw new Error(`Unsupported write sandbox "${sandbox}". Use one of: ${WRITE_SANDBOXES.join(", ")}.`);
+  }
+  return sandbox;
+}
+
 export async function handleSetup(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "write-sandbox"],
+    valueOptions: ["cwd", "write-sandbox", "model", "effort"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
   });
 
@@ -59,6 +78,15 @@ export async function handleSetup(argv) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const actionsTaken = [];
+  const sandbox = options["write-sandbox"] !== undefined ? checkWriteSandbox(options["write-sandbox"]) : null;
+
+  const delegation = await storeDelegationSetting(codexProvider, workspaceRoot, cwd, options);
+  if (delegation) {
+    for (const warning of delegation.warnings) {
+      process.stderr.write(`${warning}\n`);
+    }
+    actionsTaken.push(delegation.action);
+  }
 
   if (options["enable-review-gate"]) {
     setConfig(workspaceRoot, "stopReviewGate", true);
@@ -68,17 +96,13 @@ export async function handleSetup(argv) {
     actionsTaken.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
   }
 
-  if (options["write-sandbox"] !== undefined) {
-    const sandbox = String(options["write-sandbox"]).trim();
-    if (!WRITE_SANDBOXES.includes(sandbox)) {
-      throw new Error(`Unsupported write sandbox "${sandbox}". Use one of: ${WRITE_SANDBOXES.join(", ")}.`);
-    }
+  if (sandbox) {
     setConfig(workspaceRoot, "writeSandbox", sandbox);
     actionsTaken.push(`Write-capable tasks now run with the ${sandbox} sandbox in ${workspaceRoot}.`);
   }
 
   const finalReport = await buildSetupReport(cwd, actionsTaken);
-  outputResult(options.json ? finalReport : renderSetupReport(finalReport), options.json);
+  outputResult(options.json ? finalReport : renderReport(finalReport), options.json);
 }
 
 export const run = handleSetup;

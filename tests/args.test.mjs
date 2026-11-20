@@ -4,9 +4,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
+import process from "node:process";
+import { spawnSync } from "node:child_process";
+
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { parseArgs, splitRawArgumentString } from "../plugins/agent/scripts/lib/args.mjs";
+import { setConfig } from "../plugins/agent/scripts/lib/state.mjs";
 
 test("the raw argument splitter keeps Windows path separators", () => {
   assert.deepEqual(splitRawArgumentString(String.raw`--source C:\work\notes.json`), ["--source", String.raw`C:\work\notes.json`]);
@@ -108,7 +112,7 @@ test("an effort the model does not list fails before a thread starts", () => {
   const ctx = makeRepo();
   const result = companion(ctx, ["task", "--model", "gpt-5.6-luna", "--effort", "ultra", "do it"]);
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /gpt-5\.6-luna does not support reasoning effort "ultra"\. Use one of: low, medium, high/);
+  assert.match(result.stderr, /Model gpt-5\.6-luna does not support reasoning effort "ultra"\. Use one of: low, medium, high\./);
   assert.equal(fakeState(ctx).lastThreadStart, undefined);
 });
 
@@ -116,16 +120,73 @@ test("the default model's efforts apply when no model is requested", () => {
   const ctx = makeRepo();
   const rejected = companion(ctx, ["task", "--effort", "max", "do it"]);
   assert.notEqual(rejected.status, 0);
-  assert.match(rejected.stderr, /gpt-5\.4 does not support reasoning effort "max"/);
-  const accepted = companion(ctx, ["task", "--effort", "xhigh", "do it"]);
+  assert.match(rejected.stderr, /Model m-default does not support reasoning effort "max"\. Use one of: low, medium, high\./);
+  assert.equal(fakeState(ctx).lastThreadStart, undefined);
+  const accepted = companion(ctx, ["task", "--effort", "high", "do it"]);
   assert.equal(accepted.status, 0, accepted.stderr);
+  assert.equal(fakeState(ctx).lastTurnStart.model, "m-default");
+  assert.equal(fakeState(ctx).lastTurnStart.effort, "high");
 });
 
 test("without a model list, any effort Codex knows is accepted", () => {
-  const ctx = makeRepo("no-model-list");
+  const ctx = makeRepo("no-catalog");
   const result = companion(ctx, ["task", "--effort", "ultra", "do it"]);
   assert.equal(result.status, 0, result.stderr);
+  assert.equal(fakeState(ctx).lastTurnStart.model, null);
   assert.equal(fakeState(ctx).lastTurnStart.effort, "ultra");
+  const rejected = companion(ctx, ["task", "--effort", "extreme", "do it"]);
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /Unsupported reasoning effort "extreme"\. Use one of: none, minimal, low, medium, high, xhigh, max, ultra\./);
+});
+
+function changeSource(ctx) {
+  fs.writeFileSync(path.join(ctx.repo, "src", "app.js"), "export const value = 2;\n");
+}
+
+test("a review with no model runs on the catalog default", () => {
+  const ctx = makeRepo("catalog-default");
+  changeSource(ctx);
+  const result = companion(ctx, ["review"]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fakeState(ctx).lastThreadStart.model, "m-default");
+  assert.deepEqual(fakeState(ctx).lastThreadStart.config, { model_reasoning_effort: "low" });
+});
+
+test("a review still rejects an effort its model does not list", () => {
+  const ctx = makeRepo();
+  changeSource(ctx);
+  const result = companion(ctx, ["review", "--model", "gpt-5.6-luna", "--effort", "ultra"]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Model gpt-5\.6-luna does not support reasoning effort "ultra"/);
+  assert.equal(fakeState(ctx).lastThreadStart, undefined);
+});
+
+test("a review uses the stored delegation setting", () => {
+  const ctx = makeRepo();
+  changeSource(ctx);
+  setConfig(ctx.repo, "models", { codex: { model: "gpt-5.6-luna", effort: "high" } });
+  const result = companion(ctx, ["review"]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fakeState(ctx).lastThreadStart.model, "gpt-5.6-luna");
+  assert.deepEqual(fakeState(ctx).lastThreadStart.config, { model_reasoning_effort: "high" });
+});
+
+test("a review against a model/list that does not answer finishes within the catalog timeouts", { timeout: 60000 }, () => {
+  const ctx = makeRepo("model-list-hangs");
+  changeSource(ctx);
+  const started = Date.now();
+  const result = spawnSync(process.execPath, [SCRIPT, "review"], {
+    cwd: ctx.repo,
+    env: ctx.env,
+    encoding: "utf8",
+    timeout: 45000,
+    windowsHide: true
+  });
+  const elapsed = Date.now() - started;
+  assert.equal(result.error?.code ?? null, null, "the review did not finish");
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(elapsed < 30000, `took ${elapsed} ms`);
+  assert.equal(fakeState(ctx).lastThreadStart.model, "gpt-6.1-sol");
 });
 
 test("the write sandbox setting applies to write-capable tasks", () => {

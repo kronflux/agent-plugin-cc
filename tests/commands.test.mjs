@@ -49,7 +49,7 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /```bash/);
   assert.match(source, /```typescript/);
   assert.match(source, /adversarial-review "\$ARGUMENTS"/);
-  assert.match(source, /\[--scope auto\|working-tree\|branch\] \[--model <model\|spark>\] \[--effort <[a-z|]+>\] \[focus \.\.\.\]/);
+  assert.match(source, /\[--scope auto\|working-tree\|branch\] \[--model <id\|family\|default\|configured>\] \[--effort <[a-z|]+>\] \[focus \.\.\.\]/);
   assert.match(source, /run_in_background:\s*true/);
   assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" adversarial-review "\$ARGUMENTS"`/);
   assert.match(source, /description:\s*"Codex adversarial review"/);
@@ -106,7 +106,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.doesNotMatch(rescue, /^context:\s*fork\b/m);
   assert.match(rescue, /--background\|--wait/);
   assert.match(rescue, /--resume\|--fresh/);
-  assert.match(rescue, /--model <model\|spark>/);
+  assert.match(rescue, /--model <id\|family\|default\|configured>/);
   assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh\|max\|ultra>/);
   assert.match(rescue, /task-resume-candidate --json/);
   assert.match(rescue, /AskUserQuestion/);
@@ -117,7 +117,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /Do not forward them to `task`/i);
   assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
   assert.match(rescue, /Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort/i);
-  assert.match(rescue, /If they ask for `spark`, map it to `gpt-5\.3-codex-spark`/i);
+  assert.match(rescue, /Pass `--model` only when the user names a model, a family word, `default` or `configured`/i);
   assert.match(rescue, /If the request includes `--resume`, do not ask whether to continue/i);
   assert.match(rescue, /If the request includes `--fresh`, do not ask whether to continue/i);
   assert.match(rescue, /If the user chooses continue, add `--resume`/i);
@@ -140,8 +140,8 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /Do not call `review`, `adversarial-review`, `status`, `send`, or `cancel`/i);
   assert.match(agent, /Leave `--effort` unset unless the user explicitly requests a specific reasoning effort/i);
   assert.match(agent, /Leave model unset by default/i);
-  assert.match(agent, /If the user asks for `spark`, map that to `--model gpt-5\.3-codex-spark`/i);
-  assert.match(agent, /If the user asks for a concrete model name such as `gpt-5\.4-mini`, pass it through with `--model`/i);
+  assert.match(agent, /Pass `--model` only when the user names a model, a family word, `default` or `configured`/i);
+  assert.match(agent, /Pass the `--model` value through as the user gave it/i);
   assert.match(agent, /Return the stdout of the last `result` call exactly as-is/i);
   assert.match(agent, /If a call fails with any exit code other than 75, return its output, including stderr, exactly as-is and stop/i);
   assert.match(agent, /gpt-5-4-prompting/);
@@ -153,7 +153,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /That prompt drafting is the only Claude-side work allowed/i);
   assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
   assert.match(runtimeSkill, /Leave model unset by default/i);
-  assert.match(runtimeSkill, /Map `spark` to `--model gpt-5\.3-codex-spark`/i);
+  assert.match(runtimeSkill, /Pass `--model` only when the user names a model, a family word, `default` or `configured`/i);
   assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
   assert.match(runtimeSkill, /Strip it before calling `task`/i);
   assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);
@@ -161,8 +161,8 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /If a call fails with any exit code other than 75, return its output/i);
   assert.match(readme, /`agent:codex-rescue` subagent/i);
   assert.match(readme, /if you do not pass `--model` or `--effort`, Codex chooses its own defaults/i);
-  assert.match(readme, /--model gpt-5\.4-mini --effort medium/i);
-  assert.match(readme, /`spark`, the plugin maps that to `gpt-5\.3-codex-spark`/i);
+  assert.match(readme, /--model <id> --effort medium/i);
+  assert.match(readme, /`--model` takes a catalog id, a family word, `default` or `configured`/i);
   assert.match(readme, /continue a previous Codex task/i);
   assert.match(readme, /### `\/agent:codex-setup`/);
   assert.match(readme, /### `\/agent:codex-review`/);

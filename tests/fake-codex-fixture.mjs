@@ -4,6 +4,65 @@ import process from "node:process";
 
 import { writeExecutable } from "./helpers.mjs";
 
+function listEfforts(names) {
+  return names.map((reasoningEffort) => ({ reasoningEffort, description: reasoningEffort }));
+}
+
+function debugLevels(names) {
+  return names.map((effort) => ({ effort, description: effort }));
+}
+
+// The model/list entries of the fake Codex. m-default is the catalog default.
+export const FAKE_LIST_MODELS = [
+  {
+    id: "m-default",
+    model: "m-default",
+    hidden: false,
+    isDefault: true,
+    defaultReasoningEffort: "low",
+    supportedReasoningEfforts: listEfforts(["low", "medium", "high"])
+  },
+  {
+    id: "gpt-5.6-luna",
+    model: "gpt-5.6-luna",
+    hidden: false,
+    isDefault: false,
+    defaultReasoningEffort: "medium",
+    supportedReasoningEfforts: listEfforts(["low", "medium", "high"])
+  }
+];
+
+// The `codex debug models` catalog that matches FAKE_LIST_MODELS.
+export const FAKE_DEBUG_DEFAULT_MODELS = [
+  { slug: "m-default", visibility: "list", priority: 1, default_reasoning_level: "low", supported_reasoning_levels: debugLevels(["low", "medium", "high"]) },
+  { slug: "gpt-5.6-luna", visibility: "list", priority: 9, default_reasoning_level: "medium", supported_reasoning_levels: debugLevels(["low", "medium", "high"]) }
+];
+
+// The `codex debug models` catalog of the behaviours that test the Sol fallback.
+export const FAKE_DEBUG_SOL_MODELS = [
+  { slug: "gpt-6.1-sol", visibility: "list", priority: 1, default_reasoning_level: "medium", supported_reasoning_levels: debugLevels(["low", "medium", "high", "xhigh"]) },
+  { slug: "gpt-6-sol", visibility: "list", priority: 4, default_reasoning_level: "medium", supported_reasoning_levels: debugLevels(["low", "medium", "high"]) },
+  { slug: "gpt-5.6-sol", visibility: "list", priority: 7, default_reasoning_level: "medium", supported_reasoning_levels: debugLevels(["low", "medium", "high"]) },
+  { slug: "gpt-5.6-luna", visibility: "list", priority: 9, default_reasoning_level: "medium", supported_reasoning_levels: debugLevels(["low", "medium", "high"]) }
+];
+
+// Model catalog behaviours:
+// - "catalog-default": as the default. thread/start with model null reports "m-configured", the
+//   model a Codex configuration sets; every behaviour reports that for model null.
+// - "list-fails-debug-sols": model/list errors; `codex debug models` lists FAKE_DEBUG_SOL_MODELS.
+// - "no-default-mark": model/list marks no default; debug lists FAKE_DEBUG_SOL_MODELS.
+// - "no-catalog" and "no-model-list": model/list and `codex debug models` both fail.
+// - "model-list-hangs": model/list is never answered; debug lists FAKE_DEBUG_SOL_MODELS.
+// - "reports-other-model": thread/start and thread/resume report "m-reported", effort "high".
+// - "partial-report": thread/start and thread/resume report a model and effort null.
+// - "unknown-model": no catalog, and a turn that names a model fails with modelNotFound.
+// - "catalog-initialize-hangs": the first app server, which reads the catalog, never answers
+//   initialize and keeps running after its input closes and after SIGTERM; later app servers work.
+//   debug lists FAKE_DEBUG_SOL_MODELS.
+// - "debug-models-hangs": `codex debug models` records its pid in debugModelsPids, ignores
+//   SIGTERM and never exits.
+// - "debug-models-floods": `codex debug models` records its pid in debugModelsPids and prints
+//   16 MiB of output without a complete JSON document, then never exits.
 export function installFakeCodex(binDir, behavior = "review-ok") {
   const statePath = path.join(binDir, "fake-codex-state.json");
   const scriptPath = path.join(binDir, "codex");
@@ -16,6 +75,11 @@ const readline = require("node:readline");
 
 	const STATE_PATH = ${JSON.stringify(statePath)};
 	const BEHAVIOR = ${JSON.stringify(behavior)};
+	const LIST_MODELS = ${JSON.stringify(FAKE_LIST_MODELS)};
+	const DEBUG_DEFAULT_MODELS = ${JSON.stringify(FAKE_DEBUG_DEFAULT_MODELS)};
+	const DEBUG_SOL_MODELS = ${JSON.stringify(FAKE_DEBUG_SOL_MODELS)};
+	const NO_CATALOG_BEHAVIORS = new Set(["no-catalog", "no-model-list", "unknown-model"]);
+	const DEBUG_SOL_BEHAVIORS = new Set(["list-fails-debug-sols", "no-default-mark", "model-list-hangs", "catalog-initialize-hangs"]);
 	const interruptibleTurns = new Map();
 	// Behaviors whose turns stay active for 5 s, so they can be interrupted or steered.
 	const SLOW_TURN_BEHAVIORS = new Set(["interruptible-slow-task", "steer-rejected", "steer-no-item", "steer-turn-ended", "steer-foreign-client-id"]);
@@ -210,6 +274,18 @@ function send(message) {
   process.stdout.write(JSON.stringify(message) + "\\n");
 }
 
+// The model and effort a thread/start or thread/resume response reports.
+function reportedSelection(params) {
+  if (BEHAVIOR === "reports-other-model") {
+    return { model: "m-reported", reasoningEffort: "high" };
+  }
+  const model = params.model || "m-configured";
+  if (BEHAVIOR === "partial-report") {
+    return { model, reasoningEffort: null };
+  }
+  return { model, reasoningEffort: (params.config && params.config.model_reasoning_effort) || null };
+}
+
 function nextThread(state, cwd, ephemeral) {
   const thread = {
     id: "thr_" + state.nextThreadId++,
@@ -372,15 +448,60 @@ if (args[0] === "login" && args[1] === "status") {
 if (args[0] === "login") {
   process.exit(0);
 }
+if (args[0] === "debug" && args[1] === "models") {
+  if (BEHAVIOR === "debug-models-hangs") {
+    withStateLock(() => {
+      const hangState = loadState();
+      hangState.debugModelsPids = [...(hangState.debugModelsPids || []), process.pid];
+      saveState(hangState);
+    });
+    process.on("SIGTERM", () => {});
+    setInterval(() => {}, 60000);
+    return;
+  }
+  if (BEHAVIOR === "debug-models-floods") {
+    withStateLock(() => {
+      const floodState = loadState();
+      floodState.debugModelsPids = [...(floodState.debugModelsPids || []), process.pid];
+      saveState(floodState);
+    });
+    const block = "x".repeat(1024 * 1024);
+    let written = 0;
+    const pump = () => {
+      if (written >= 16) {
+        setInterval(() => {}, 60000);
+        return;
+      }
+      written += 1;
+      process.stdout.write(block, pump);
+    };
+    pump();
+    return;
+  }
+  if (NO_CATALOG_BEHAVIORS.has(BEHAVIOR)) {
+    console.error("debug models is not available");
+    process.exit(1);
+  }
+  console.log(JSON.stringify({ models: DEBUG_SOL_BEHAVIORS.has(BEHAVIOR) ? DEBUG_SOL_MODELS : DEBUG_DEFAULT_MODELS }));
+  process.exit(0);
+}
 if (args[0] !== "app-server") {
   process.exit(1);
 }
+let bootIndex = 0;
 withStateLock(() => {
   const bootState = loadState();
   bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
   bootState.appServerPids = [...(bootState.appServerPids || []), process.pid];
+  bootIndex = bootState.appServerStarts;
   saveState(bootState);
 });
+// The catalog app server of catalog-initialize-hangs stays alive until it is killed.
+const initializeHangs = BEHAVIOR === "catalog-initialize-hangs" && bootIndex === 1;
+if (initializeHangs) {
+  process.on("SIGTERM", () => {});
+  setInterval(() => {}, 60000);
+}
 
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
@@ -407,6 +528,9 @@ function handleMessage(message) {
   const state = loadState();
     switch (message.method) {
       case "initialize":
+        if (initializeHangs) {
+          break;
+        }
         if (BEHAVIOR === "initialize-fails") {
           send({ id: message.id, error: { code: -32000, message: "initialize failed" } });
           break;
@@ -439,22 +563,29 @@ function handleMessage(message) {
         }
         state.lastThreadStart = message.params;
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        send({ id: message.id, result: { thread: buildThread(thread), ...reportedSelection(message.params), modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false } } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
       }
 
       case "model/list": {
-        if (BEHAVIOR === "no-model-list") {
+        if (NO_CATALOG_BEHAVIORS.has(BEHAVIOR)) {
           throw new Error("unknown method model/list");
+        }
+        if (BEHAVIOR === "list-fails-debug-sols") {
+          throw new Error("model/list failed");
         }
         state.modelListPages = (state.modelListPages || 0) + 1;
         saveState(state);
-        const efforts = (names) => names.map((reasoningEffort) => ({ reasoningEffort, description: reasoningEffort }));
-        const data = [
-          { id: "gpt-5.4", model: "gpt-5.4", isDefault: true, supportedReasoningEfforts: efforts(["low", "medium", "high", "xhigh"]) },
-          { id: "gpt-5.6-luna", model: "gpt-5.6-luna", isDefault: false, supportedReasoningEfforts: efforts(["low", "medium", "high"]) }
-        ];
+        if (BEHAVIOR === "model-list-hangs") {
+          break;
+        }
+        const data = JSON.parse(JSON.stringify(LIST_MODELS));
+        if (BEHAVIOR === "no-default-mark") {
+          for (const entry of data) {
+            entry.isDefault = false;
+          }
+        }
         if (BEHAVIOR === "model-list-not-array") {
           // A schema violation: the effort list is an object, not an array.
           data[0].supportedReasoningEfforts = { low: true };
@@ -504,6 +635,7 @@ function handleMessage(message) {
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
+        state.lastThreadResume = message.params;
         const thread = ensureThread(state, message.params.threadId);
         // A resumed thread runs its next turns in the directory the resume names.
         if (message.params.cwd) {
@@ -511,7 +643,7 @@ function handleMessage(message) {
         }
         thread.updatedAt = now();
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        send({ id: message.id, result: { thread: buildThread(thread), ...reportedSelection(message.params), modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false } } });
         break;
       }
 
@@ -713,6 +845,18 @@ function handleMessage(message) {
 	          break;
 	        }
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+	        if (BEHAVIOR === "unknown-model" && message.params.model) {
+	          // As Codex 0.169.0 does: the thread exists, and its first turn fails on the model.
+	          const error = {
+	            message: "The '" + message.params.model + "' model is not supported when using Codex with a ChatGPT account.",
+	            codexErrorInfo: "modelNotFound",
+	            additionalDetails: null
+	          };
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({ method: "error", params: { error, willRetry: false, threadId: thread.id, turnId } });
+	          send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "failed", error) } });
+	          break;
+	        }
 	        if (BEHAVIOR === "exit-mid-turn") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          // Exits once stdout has flushed, so the client sees the response and the notification first.

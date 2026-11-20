@@ -1,4 +1,7 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import readline from "node:readline";
 
 import { binaryAvailable, resolveCommand, runCommand, terminateProcessTree } from "../../lib/process.mjs";
@@ -43,7 +46,18 @@ export function ensureAgyAvailable(cwd) {
   }
 }
 
-function normalizeEffort(effort, efforts, cwd) {
+// agy refuses a model id that ends in an effort level together with a different --effort, so
+// the pair is refused before a job starts.
+function checkSuffixedModel(model, normalized, original, supported) {
+  const suffix = model ? supported.find((level) => String(model).endsWith(`-${level}`)) : undefined;
+  if (suffix && suffix !== normalized) {
+    throw new Error(
+      `Antigravity model ${model} already sets effort ${suffix}; remove --effort ${original} or choose a model without an effort suffix.`
+    );
+  }
+}
+
+function normalizeEffort(effort, efforts, cwd, model = null) {
   if (effort == null || !String(effort).trim()) {
     return null;
   }
@@ -52,23 +66,48 @@ function normalizeEffort(effort, efforts, cwd) {
   if (!supported.includes(normalized)) {
     throw new Error(`agy does not support reasoning effort "${effort}". Use one of: ${supported.join(", ")}.`);
   }
+  checkSuffixedModel(model, normalized, String(effort).trim(), supported);
   return normalized;
 }
 
-// The model catalog of the Antigravity provider. A requested model is passed to agy as given;
-// without one, agy uses its own default. Efforts are checked against the list `agy --help` prints.
+/**
+ * Reads the model agy saved as its default from the Antigravity settings file, as agy names it
+ * there (a display name such as "Model Name (Medium)"). Returns null when the file cannot be read
+ * or names no model.
+ */
+export function readAgySavedModel({ settingsPath = path.join(os.homedir(), ".gemini", "antigravity-cli", "settings.json") } = {}) {
+  try {
+    const model = JSON.parse(fs.readFileSync(settingsPath, "utf8"))?.model;
+    return typeof model === "string" && model.trim() ? model.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+// The model catalog of the Antigravity provider. A requested model is checked against the list
+// `agy models` prints when that list can be read, and passed unchecked with a warning when it
+// cannot. Without a requested model, agy uses its own saved default.
+// Efforts are checked against the list `agy --help` prints.
 export const agyModelCatalog = Object.freeze({
-  async resolveExplicit(value) {
+  async resolveExplicit(value, { cwd } = {}) {
     const model = value == null || !String(value).trim() ? null : String(value).trim();
-    return { model, source: "explicit", defaultEffort: null, efforts: null };
+    const listed = model ? readAgyModels(cwd) : { ok: false, models: [] };
+    if (listed.ok && !listed.models.some((entry) => entry.id === model)) {
+      throw new Error(
+        `Model "${model}" is not in the Antigravity model list. Available: ${listed.models.map((entry) => entry.id).join(", ")}.`
+      );
+    }
+    // Without a list the value is passed to agy unchecked, and one warning line says so.
+    const warning = model && !listed.ok ? `The Antigravity model list is unavailable, so "${model}" was not checked.` : null;
+    return { model, defaultEffort: null, efforts: null, ...(warning ? { warning } : {}) };
   },
 
   async resolveDefault() {
-    return { model: null, source: "provider-default", defaultEffort: null, efforts: null, warning: null };
+    return { model: null, source: "provider-default", defaultEffort: null, efforts: null, warning: null, savedModel: readAgySavedModel() };
   },
 
-  checkEffort(effort, efforts, { cwd } = {}) {
-    return normalizeEffort(effort, efforts, cwd);
+  checkEffort(effort, efforts, { cwd, model = null } = {}) {
+    return normalizeEffort(effort, efforts, cwd, model);
   }
 });
 

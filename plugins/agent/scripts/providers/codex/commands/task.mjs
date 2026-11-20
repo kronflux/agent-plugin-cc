@@ -15,10 +15,10 @@ import {
 import { readStdinIfPiped } from "../../../lib/fs.mjs";
 import { getSessionId } from "../../../lib/host.mjs";
 import { readStoredJob, reconcileJobLiveness, sortJobsNewestFirst } from "../../../lib/job-control.mjs";
-import { resolveModelSelection } from "../../../lib/model-selection.mjs";
+import { newestJobOnThread, resolveModelSelection, storedSelection } from "../../../lib/model-selection.mjs";
 import { interpolateTemplate, loadPromptTemplate } from "../../../lib/prompts.mjs";
 import { renderTaskResult } from "../../../lib/render.mjs";
-import { getConfig, listJobs, takeJobMessages, writeJobMessageOutcome } from "../../../lib/state.mjs";
+import { getConfig, listJobs, takeJobMessages, upsertJob, writeJobMessageOutcome } from "../../../lib/state.mjs";
 import {
   attachWorktree,
   buildTaskRequest,
@@ -30,7 +30,7 @@ import {
 } from "../../../lib/task-launch.mjs";
 import { resolveWorkspaceRoot } from "../../../lib/workspace.mjs";
 import { codexProvider } from "../index.mjs";
-import { codexModelCatalog, KNOWN_REASONING_EFFORTS, normalizeRequestedModel } from "../model-catalog.mjs";
+import { KNOWN_REASONING_EFFORTS } from "../model-catalog.mjs";
 import {
   buildPersistentTaskThreadName,
   DEFAULT_CONTINUE_PROMPT,
@@ -47,7 +47,7 @@ const COMPANION_SCRIPT = codexProvider.companionScript;
 const EFFORT_USAGE = `<${KNOWN_REASONING_EFFORTS.join("|")}>`;
 export const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
-export const usage = `task [--background] [--write] [--worktree] [--resume-last|--resume|--resume-thread <thread-id>|--fresh] [--from-last-review] [--model <model|spark>] [--effort ${EFFORT_USAGE}] [--output-schema <file>] [--manifest <file.json>] [--] [prompt]`;
+export const usage = `task [--background] [--write] [--worktree] [--resume-last|--resume|--resume-thread <thread-id>|--fresh] [--from-last-review] [--model <id|family|default|configured>] [--effort ${EFFORT_USAGE}] [--output-schema <file>] [--manifest <file.json>] [--] [prompt]`;
 
 export function filterJobsForCurrentSession(jobs) {
   const sessionId = getSessionId();
@@ -159,6 +159,17 @@ async function runTaskRequest(request) {
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
+    modelResolved: request.modelResolved === true,
+    // The job record keeps the model and effort the turn runs with: the values turn/start sends,
+    // and for a value it does not send, the one Codex reports for the thread.
+    onThreadReady: request.jobId
+      ? (reported) =>
+          upsertJob(workspaceRoot, {
+            id: request.jobId,
+            ...(reported.model ? { model: reported.model } : {}),
+            ...(reported.effort ? { effort: reported.effort } : {})
+          })
+      : null,
     sandbox: request.write ? getConfig(workspaceRoot).writeSandbox ?? "workspace-write" : "read-only",
     onProgress: request.onProgress,
     outputSchema: request.outputSchema ?? null,
@@ -234,7 +245,8 @@ export function renderQueuedTaskLaunch(payload) {
   return `${payload.title} started in the background as ${payload.jobId}.${worktree} Check /agent:status ${payload.jobId} for progress.\n`;
 }
 
-function buildTaskJob(workspaceRoot, taskMetadata, write) {
+// The job record names the model and effort the job runs with and how each was chosen.
+function buildTaskJob(workspaceRoot, taskMetadata, write, selection = null) {
   return createProviderJob(codexProvider, {
     prefix: "task",
     kind: "task",
@@ -243,7 +255,44 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
     workspaceRoot,
     jobClass: "task",
     summary: taskMetadata.summary,
-    write
+    write,
+    ...(selection ? selectionFields(selection) : {})
+  });
+}
+
+function selectionFields(selection) {
+  return {
+    model: selection.model,
+    effort: selection.effort,
+    modelSource: selection.modelSource,
+    effortSource: selection.effortSource
+  };
+}
+
+// A request built from a resolved selection is not checked again by the worker.
+function resolvedRequest(fields, selection) {
+  return { ...buildTaskRequest({ ...fields, model: selection.model, effort: selection.effort }), modelResolved: true };
+}
+
+function printWarnings(selection) {
+  for (const warning of selection.warnings ?? []) {
+    process.stderr.write(`${warning}\n`);
+  }
+}
+
+/**
+ * Resolves the model and effort of a Codex task from its options and the workspace setting. A
+ * task that continues the thread `continuesThreadId` keeps the model and effort of the newest
+ * job on that thread, except for a value the options give.
+ */
+export async function resolveTaskSelection(workspaceRoot, cwd, { model, effort, continuesThreadId = null } = {}) {
+  const continued = newestJobOnThread(workspaceRoot, codexProvider.id, continuesThreadId);
+  return resolveModelSelection(codexProvider, {
+    model,
+    effort,
+    setting: getConfig(workspaceRoot).models?.[codexProvider.id] ?? null,
+    stored: storedSelection(continued),
+    cwd
   });
 }
 
@@ -290,13 +339,16 @@ ${userRequest.trim()}` : ""
  * Starts a new background turn on the thread of a finished Codex job. The turn runs in the
  * worktree of the job it continues.
  */
-export function startCodexFollowUpTurn(cwd, workspaceRoot, job, text) {
+export async function startCodexFollowUpTurn(cwd, workspaceRoot, job, text) {
   ensureCodexAvailable(cwd);
   const write = Boolean(job.write);
+  // The new turn runs on the model and effort of the job it continues.
+  const selection = await resolveTaskSelection(workspaceRoot, cwd, { continuesThreadId: job.threadId });
+  printWarnings(selection);
   // The new turn runs in the worktree of the job it continues.
   const worktree = job.worktreePath ? { worktreePath: job.worktreePath, worktreeBranch: job.worktreeBranch ?? null } : {};
-  const newJob = { ...buildTaskJob(workspaceRoot, buildTaskRunMetadata({ prompt: text, resumeLast: true }), write), ...worktree };
-  const request = buildTaskRequest({
+  const newJob = { ...buildTaskJob(workspaceRoot, buildTaskRunMetadata({ prompt: text, resumeLast: true }), write, selection), ...worktree };
+  const request = resolvedRequest({
     cwd,
     prompt: text,
     write,
@@ -304,24 +356,30 @@ export function startCodexFollowUpTurn(cwd, workspaceRoot, job, text) {
     resumeThreadId: job.threadId,
     jobId: newJob.id,
     ...worktree
-  });
+  }, selection);
   enqueueBackgroundTask(cwd, newJob, request, { workerScript: COMPANION_SCRIPT });
   return { status: "started", jobId: job.id, newJobId: newJob.id, threadId: job.threadId };
 }
 
-// Each manifest entry's model and effort are checked as the entry is read, before any job starts.
-function checkManifestEntry(entry, raw) {
-  return {
-    ...entry,
-    model: raw.model == null ? undefined : normalizeRequestedModel(String(raw.model)),
-    effort: raw.effort == null ? undefined : codexModelCatalog.checkEffort(String(raw.effort))
-  };
+// Reads the manifest once and resolves the model and effort of every entry, in entry order,
+// before any job starts. Command-line --model and --effort apply to entries that do not set them.
+// Returns the entries and their selections, index for index.
+async function resolveManifestSelections(cwd, workspaceRoot, options) {
+  const entries = readTaskManifest(cwd, options.manifest);
+  const selections = [];
+  for (const [index, entry] of entries.entries()) {
+    try {
+      selections.push(
+        await resolveTaskSelection(workspaceRoot, cwd, { model: entry.model ?? options.model, effort: entry.effort ?? options.effort })
+      );
+    } catch (error) {
+      throw new Error(`Manifest entry ${index + 1}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return { entries, selections };
 }
 
-// Starts one background task per manifest entry. Command-line --model, --effort, --write, and
-// --worktree apply to entries that do not set them.
-export function launchManifestTasks(cwd, workspaceRoot, options, positionals, defaults, deps = { enqueue: enqueueBackgroundTask }) {
-  const enqueue = deps.enqueue ?? enqueueBackgroundTask;
+function checkManifestOptions(options, positionals) {
   const conflicting = ["prompt-file", "resume-last", "resume", "resume-thread", "fresh", "from-last-review", "output-schema"].filter(
     (name) => options[name] !== undefined && options[name] !== false
   );
@@ -330,19 +388,34 @@ export function launchManifestTasks(cwd, workspaceRoot, options, positionals, de
       `--manifest takes its prompts from the file. Remove ${[...conflicting.map((name) => `--${name}`), ...(positionals.length > 0 ? ["the prompt text"] : [])].join(", ")}.`
     );
   }
-  const entries = readTaskManifest(cwd, options.manifest, checkManifestEntry);
+}
+
+// Starts one background task per manifest entry. Command-line --write and --worktree apply to
+// entries that do not set them. `defaults.manifestEntries` holds the entries as they were read
+// when their selections were resolved, and `defaults.entries` each entry's resolved selection at
+// the same index; the file is then not read again. Without `defaults.manifestEntries` the file is
+// read here, and without `defaults.entries` an entry's model and effort, else `defaults.model`
+// and `defaults.effort`, are sent as given.
+export function launchManifestTasks(cwd, workspaceRoot, options, positionals, defaults, deps = { enqueue: enqueueBackgroundTask }) {
+  const enqueue = deps.enqueue ?? enqueueBackgroundTask;
+  checkManifestOptions(options, positionals);
+  const entries = defaults.manifestEntries ?? readTaskManifest(cwd, options.manifest);
+  if (defaults.manifestEntries && defaults.entries && defaults.entries.length !== entries.length) {
+    throw new Error("Each manifest entry needs one resolved selection.");
+  }
   ensureCodexAvailable(cwd);
 
   const launched = [];
   const failed = [];
-  for (const entry of entries) {
+  for (const [index, entry] of entries.entries()) {
     let job = null;
     try {
       const write = entry.write ?? Boolean(options.write);
       const metadata = { ...buildTaskRunMetadata({ prompt: entry.prompt }), title: `Codex Task: ${entry.label}` };
-      const baseJob = buildTaskJob(workspaceRoot, metadata, write);
+      const selection = defaults.entries?.[index] ?? null;
+      const baseJob = buildTaskJob(workspaceRoot, metadata, write, selection);
       job = entry.worktree ?? options.worktree ? attachWorktree(baseJob) : baseJob;
-      const request = buildTaskRequest({
+      const fields = {
         cwd,
         model: entry.model ?? defaults.model,
         effort: entry.effort ?? defaults.effort,
@@ -353,7 +426,8 @@ export function launchManifestTasks(cwd, workspaceRoot, options, positionals, de
         worktreePath: job.worktreePath ?? null,
         worktreeBranch: job.worktreeBranch ?? null,
         newWorktree: true
-      });
+      };
+      const request = selection ? resolvedRequest(fields, selection) : buildTaskRequest(fields);
       enqueue(cwd, job, request, { workerScript: COMPANION_SCRIPT });
       launched.push({ label: entry.label, jobId: job.id, ...(job.worktreePath ? { worktreePath: job.worktreePath } : {}) });
     } catch (caught) {
@@ -388,11 +462,20 @@ export async function handleTask(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const { model, effort } = await resolveModelSelection(codexProvider, { model: options.model, effort: options.effort, cwd });
   if (options.manifest) {
-    launchManifestTasks(cwd, workspaceRoot, options, positionals, { model, effort });
+    checkManifestOptions(options, positionals);
+    const { entries, selections } = await resolveManifestSelections(cwd, workspaceRoot, options);
+    selections.forEach(printWarnings);
+    launchManifestTasks(cwd, workspaceRoot, options, positionals, { model: null, effort: null, manifestEntries: entries, entries: selections });
     return;
   }
+  // The model is resolved before any job, worktree or worker exists, so a bad choice creates none.
+  // A resumed thread keeps the model and effort of the job that ran it.
+  const resolveSelection = async (continuesThreadId) => {
+    const resolved = await resolveTaskSelection(workspaceRoot, cwd, { model: options.model, effort: options.effort, continuesThreadId });
+    printWarnings(resolved);
+    return resolved;
+  };
   const requestText = await readTaskPrompt(cwd, options, positionals);
   const prompt = options["from-last-review"] ? buildReviewHandoffPrompt(workspaceRoot, requestText) : requestText;
   const outputSchema = options["output-schema"] ? readOutputSchema(path.resolve(cwd, options["output-schema"])) : null;
@@ -417,7 +500,8 @@ export async function handleTask(argv) {
     // follow-up on the new job runs there too. A thread that is not found yet is resolved by the
     // worker, which reports the failure.
     const resumed = resumeLast ? await resolveLatestTrackedTaskThread(workspaceRoot) : null;
-    const baseJob = buildTaskJob(workspaceRoot, taskMetadata, write);
+    const selection = await resolveSelection(resumed?.id ?? resumeThreadId);
+    const baseJob = buildTaskJob(workspaceRoot, taskMetadata, write, selection);
     const job = resumed?.worktreePath
       ? { ...baseJob, worktreePath: resumed.worktreePath, worktreeBranch: resumed.worktreeBranch ?? null }
       : options.worktree
@@ -426,10 +510,8 @@ export async function handleTask(argv) {
     // Only a worktree this launch created is removed when the launch fails; an inherited one
     // holds the earlier job's work.
     const createdWorktree = Boolean(job.worktreePath) && !resumed?.worktreePath;
-    const request = buildTaskRequest({
+    const request = resolvedRequest({
       cwd,
-      model,
-      effort,
       prompt,
       write,
       resumeLast: resumeLast && !resumed,
@@ -439,7 +521,7 @@ export async function handleTask(argv) {
       worktreePath: job.worktreePath ?? null,
       worktreeBranch: job.worktreeBranch ?? null,
       newWorktree: !resumed?.worktreePath
-    });
+    }, selection);
     let launch;
     try {
       launch = enqueueBackgroundTask(cwd, job, request, { workerScript: COMPANION_SCRIPT });
@@ -460,9 +542,10 @@ export async function handleTask(argv) {
       throw new Error("No previous Codex task thread was found for this repository.");
     }
   }
+  const selection = await resolveSelection(resumed?.id ?? resumeThreadId);
 
   // A resumed thread continues in its job's worktree; --worktree creates one only otherwise.
-  const baseJob = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const baseJob = buildTaskJob(workspaceRoot, taskMetadata, write, selection);
   const job = resumed?.worktreePath
     ? { ...baseJob, worktreePath: resumed.worktreePath, worktreeBranch: resumed.worktreeBranch ?? null }
     : options.worktree
@@ -483,8 +566,9 @@ export async function handleTask(argv) {
       (progress) =>
         executeTaskRun({
           cwd,
-          model,
-          effort,
+          model: selection.model,
+          effort: selection.effort,
+          modelResolved: true,
           prompt,
           write,
           resumeLast: false,

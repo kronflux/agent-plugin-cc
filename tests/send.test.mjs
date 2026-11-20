@@ -149,6 +149,25 @@ test("send to a finished job starts a new turn on its thread", async () => {
   assert.equal(turn.threadId, threadId);
 });
 
+test("send to a finished job keeps the job's model and effort", async () => {
+  const ctx = makeRepo();
+  const first = run("node", [SCRIPT, "task", "--json", "--model", "luna", "--effort", "high", "first pass"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(first.status, 0, first.stderr);
+  const { jobId } = JSON.parse(first.stdout);
+  assert.equal(fakeState(ctx.binDir).lastTurnStart.model, "gpt-5.6-luna");
+
+  const result = run("node", [NEUTRAL, "send", "--json", jobId, "more"], { cwd: ctx.repo, env: ctx.env });
+
+  assert.equal(result.status, 0, result.stderr);
+  const turn = await waitUntil(() => {
+    const last = fakeState(ctx.binDir).lastTurnStart;
+    return last?.prompt === "more" ? last : null;
+  }, 15000);
+  assert.ok(turn, "the new turn did not start");
+  assert.equal(turn.model, "gpt-5.6-luna");
+  assert.equal(turn.effort, "high");
+});
+
 test("send refuses jobs that are not tasks and unknown job ids", () => {
   const ctx = makeRepo();
   const unknown = run("node", [NEUTRAL, "send", "task-missing", "hello"], { cwd: ctx.repo, env: ctx.env });

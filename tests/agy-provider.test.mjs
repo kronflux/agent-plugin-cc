@@ -9,7 +9,8 @@ import { initGitRepo, makeTempDir, run, waitUntil } from "./helpers.mjs";
 import { isProcessAlive } from "../plugins/agent/scripts/lib/process.mjs";
 import { runAgyTurn } from "../plugins/agent/scripts/providers/agy/runtime.mjs";
 import { readStoredJob } from "../plugins/agent/scripts/lib/job-control.mjs";
-import { listJobs } from "../plugins/agent/scripts/lib/state.mjs";
+import { getConfig, listJobs, upsertJob } from "../plugins/agent/scripts/lib/state.mjs";
+import { executeAgyTask } from "../plugins/agent/scripts/providers/agy/commands/task.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const AGY = path.join(ROOT, "plugins", "agent", "scripts", "agy-companion.mjs");
@@ -44,8 +45,17 @@ function makeRepo(behavior, t) {
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
+  // The home folder holds the Antigravity settings file that names agy's saved model.
+  const home = makeTempDir(t);
+  writeAgySettings(home, { model: "Fake Model (High)" });
   const sep = process.platform === "win32" ? ";" : ":";
-  return { repo, binDir, env: { ...process.env, PATH: `${binDir}${sep}${process.env.PATH}` } };
+  return { repo, binDir, home, env: { ...process.env, HOME: home, USERPROFILE: home, PATH: `${binDir}${sep}${process.env.PATH}` } };
+}
+
+function writeAgySettings(home, settings) {
+  const folder = path.join(home, ".gemini", "antigravity-cli");
+  fs.mkdirSync(folder, { recursive: true });
+  fs.writeFileSync(path.join(folder, "settings.json"), JSON.stringify(settings));
 }
 
 function job(repo, jobId) {
@@ -128,6 +138,24 @@ test("send to a finished agy job resumes its conversation in a new process", asy
   assert.equal(runs.length, 2);
   assert.equal(runs[1].args[runs[1].args.indexOf("--conversation") + 1], "conv-1");
   assert.deepEqual(runs[1].inputs, ["follow up"]);
+});
+
+test("send to a finished agy job keeps its model and effort", async (t) => {
+  const ctx = makeRepo(undefined, t);
+  const first = run("node", [AGY, "task", "--json", "--model", "fake-model-low", "--effort", "low", "first"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(first.status, 0, first.stderr);
+  const { jobId } = JSON.parse(first.stdout);
+
+  const sent = run("node", [NEUTRAL, "send", "--json", jobId, "more"], { cwd: ctx.repo, env: ctx.env });
+
+  assert.equal(sent.status, 0, sent.stderr);
+  const { newJobId } = JSON.parse(sent.stdout);
+  assert.ok(await waitUntil(() => job(ctx.repo, newJobId)?.status === "completed", { timeoutMs: 20000 }));
+  const runs = readFakeAgyState(ctx.binDir).runs;
+  assert.equal(runs.length, 2);
+  assert.match(runs[1].args.join(" "), /--model fake-model-low --effort low/);
+  assert.equal(job(ctx.repo, newJobId).model, "fake-model-low");
+  assert.equal(job(ctx.repo, newJobId).effort, "low");
 });
 
 test("cancel stops a running agy job and its agy process", async (t) => {
@@ -311,4 +339,156 @@ test("a failed agy review keeps its failure message in the summary", (t) => {
   const review = listJobs(ctx.repo).find((candidate) => candidate.jobClass === "review");
   assert.ok(review, "no review job was recorded");
   assert.match(review.summary ?? "", /status ERROR/, JSON.stringify(review));
+});
+
+// The newest job record of the repository.
+function latestAgyJob(repo) {
+  return listJobs(repo).sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))[0] ?? null;
+}
+
+test("agy uses its saved default and names it in the job output", (t) => {
+  const ctx = makeRepo(undefined, t);
+  const result = run("node", [AGY, "task", "hi"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^Model: Fake Model \(High\) \(from the Antigravity settings\)$/m);
+  const [agyRun] = readFakeAgyState(ctx.binDir).runs;
+  assert.equal(agyRun.args.includes("--model"), false);
+  const record = latestAgyJob(ctx.repo);
+  assert.equal(record.model, null);
+  assert.equal(record.modelSource, "provider-default");
+  assert.equal(record.providerModel, "Fake Model (High)");
+
+  fs.rmSync(path.join(ctx.home, ".gemini"), { recursive: true, force: true });
+  const unnamed = run("node", [AGY, "task", "hi"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(unnamed.status, 0, unnamed.stderr);
+  assert.match(unnamed.stdout, /^Model: chosen by Antigravity$/m);
+});
+
+test("agy rejects a --model its model list does not contain", (t) => {
+  const ctx = makeRepo(undefined, t);
+  const result = run("node", [AGY, "task", "--model", "nope", "hi"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Model "nope" is not in the Antigravity model list\. Available: fake-model-high, fake-model-low\./);
+  assert.equal(readFakeAgyState(ctx.binDir).runs.length, 0);
+  assert.deepEqual(listJobs(ctx.repo), []);
+
+  const accepted = run("node", [AGY, "task", "--model", "fake-model-low", "hi"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(accepted.status, 0, accepted.stderr);
+  assert.match(readFakeAgyState(ctx.binDir).runs[0].args.join(" "), /--model fake-model-low/);
+  assert.equal(latestAgyJob(ctx.repo).modelSource, "explicit");
+});
+
+test("a resumed agy conversation names a changed saved model", (t) => {
+  const ctx = makeRepo(undefined, t);
+  const first = run("node", [AGY, "task", "first"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(first.status, 0, first.stderr);
+  writeAgySettings(ctx.home, { model: "Fake Model (Low)" });
+
+  const resumed = run("node", [AGY, "task", "--resume-last", "more"], { cwd: ctx.repo, env: ctx.env });
+
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.match(resumed.stderr, /Antigravity's saved model changed from Fake Model \(High\) to Fake Model \(Low\) since this conversation started\./);
+  assert.equal(latestAgyJob(ctx.repo).providerModel, "Fake Model (Low)");
+});
+
+test("agy rejects a suffixed model with a different --effort", (t) => {
+  const ctx = makeRepo(undefined, t);
+  const rejected = run("node", [AGY, "task", "--model", "fake-model-high", "--effort", "low", "hi"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(rejected.status, 1);
+  assert.match(
+    rejected.stderr,
+    /Antigravity model fake-model-high already sets effort high; remove --effort low or choose a model without an effort suffix\./
+  );
+  assert.equal(readFakeAgyState(ctx.binDir).runs.length, 0);
+
+  const matching = run("node", [AGY, "task", "--model", "fake-model-high", "--effort", "high", "hi"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(matching.status, 0, matching.stderr);
+  assert.match(readFakeAgyState(ctx.binDir).runs[0].args.join(" "), /--model fake-model-high --effort high/);
+});
+
+test("agy setup stores a model and accepts --write-sandbox", (t) => {
+  const ctx = makeRepo(undefined, t);
+  const result = run("node", [AGY, "setup", "--model", "fake-model-low", "--write-sandbox", "danger-full-access", "--json"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  const config = getConfig(ctx.repo);
+  assert.deepEqual(config.models, { agy: { model: "fake-model-low", effort: null } });
+  assert.equal(config.writeSandbox, "danger-full-access");
+  assert.equal(report.writeSandbox, "danger-full-access");
+  assert.deepEqual(report.delegation, { model: "fake-model-low", effort: null, modelSource: "setting", effortSource: "provider-default", providerModel: null });
+
+  const cleared = run("node", [AGY, "setup", "--model", "default"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(cleared.status, 0, cleared.stderr);
+  assert.match(cleared.stdout, /^- delegation model: Fake Model \(High\) from the Antigravity settings \(provider-default\)$/m);
+  assert.match(cleared.stdout, /^- delegation effort: default \(provider-default\)$/m);
+
+  const rejected = run("node", [AGY, "setup", "--write-sandbox", "anything"], { cwd: ctx.repo, env: ctx.env });
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /Unsupported write sandbox "anything"/);
+});
+
+test("an agy task uses the stored setting and returns to the provider default after setup --model default", (t) => {
+  const ctx = makeRepo(undefined, t);
+  assert.equal(run("node", [AGY, "setup", "--model", "fake-model-low"], { cwd: ctx.repo, env: ctx.env }).status, 0);
+  const first = run("node", [AGY, "task", "one"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(first.status, 0, first.stderr);
+  assert.match(readFakeAgyState(ctx.binDir).runs[0].args.join(" "), /--model fake-model-low/);
+  assert.equal(latestAgyJob(ctx.repo).modelSource, "setting");
+
+  assert.equal(run("node", [AGY, "setup", "--model", "default"], { cwd: ctx.repo, env: ctx.env }).status, 0);
+  const second = run("node", [AGY, "task", "two"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(second.status, 0, second.stderr);
+  assert.equal(readFakeAgyState(ctx.binDir).runs[1].args.includes("--model"), false);
+  assert.equal(latestAgyJob(ctx.repo).modelSource, "provider-default");
+});
+
+test("a follow-up with a suffixed model drops an inherited effort that conflicts with the suffix", (t) => {
+  const ctx = makeRepo(undefined, t);
+  const first = run("node", [AGY, "task", "--model", "fake-model-high", "--effort", "high", "first"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(first.status, 0, first.stderr);
+
+  const resumed = run("node", [AGY, "task", "--resume-last", "--model", "fake-model-low", "more"], { cwd: ctx.repo, env: ctx.env });
+
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.match(resumed.stderr, /^Effort high of the continued job does not apply to model fake-model-low, so it was not used\.$/m);
+  const args = readFakeAgyState(ctx.binDir).runs[1].args;
+  assert.match(args.join(" "), /--model fake-model-low/);
+  assert.equal(args.includes("--effort"), false, args.join(" "));
+  const record = latestAgyJob(ctx.repo);
+  assert.equal(record.effort, null);
+  assert.equal(record.effortSource, "provider-default");
+});
+
+test("an agy job records the saved model agy reads when the job runs", async (t) => {
+  const ctx = makeRepo(undefined, t);
+  // The settings changed after the job was queued with the model saved then.
+  writeAgySettings(ctx.home, { model: "Fake Model (Low)" });
+  const jobId = "task-saved-model-check";
+  upsertJob(ctx.repo, { id: jobId, provider: "agy", jobClass: "task", status: "running", model: null, providerModel: "Fake Model (High)" });
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, PATH: process.env.PATH };
+  Object.assign(process.env, { HOME: ctx.env.HOME, USERPROFILE: ctx.env.USERPROFILE, PATH: ctx.env.PATH });
+  let execution;
+  try {
+    execution = await executeAgyTask({ cwd: ctx.repo, prompt: "hi", model: null, effort: null, providerModel: "Fake Model (High)", jobId });
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+  assert.match(execution.rendered, /^Model: Fake Model \(Low\) \(from the Antigravity settings\)$/m);
+  assert.equal(job(ctx.repo, jobId).providerModel, "Fake Model (Low)");
+});
+
+test("agy setup warns that a model it could not check was stored unchecked", (t) => {
+  const ctx = makeRepo("models-fail", t);
+  const result = run("node", [AGY, "setup", "--model", "custom-model"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /^The Antigravity model list is unavailable, so "custom-model" was not checked\.$/m);
+  assert.doesNotMatch(result.stdout, /Delegations now use model custom-model/);
+  assert.match(result.stdout, /Stored model custom-model for delegations in .* without checking it\./);
+  assert.deepEqual(getConfig(ctx.repo).models, { agy: { model: "custom-model", effort: null } });
 });

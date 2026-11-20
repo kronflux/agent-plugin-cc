@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--from-last-review] [--worktree] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [what Codex should investigate, solve, or continue]"
+argument-hint: "[--background|--wait] [--resume|--fresh] [--from-last-review] [--worktree] [--model <id|family|default|configured>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [what Codex should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -46,7 +46,7 @@ Operating rules:
 - Do not ask the subagent to inspect files, poll `/agent:status`, call `/agent:cancel`, summarize output, or do follow-up work of its own.
 - While a Codex job runs, `/agent:send <job-id> <message>` adds a message to its running turn, and `/agent:cancel <job-id>` stops it.
 - Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
-- Leave the model unset unless the user explicitly asks for one. If they ask for `spark`, map it to `gpt-5.3-codex-spark`.
+- Leave the model unset unless the user explicitly asks for one. Pass `--model` only when the user names a model, a family word, `default` or `configured`.
 - Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
 - If the helper reports that Codex is missing or unauthenticated, stop and tell the user to run `/agent:codex-setup`.
 - If the user did not supply a request and did not pass `--from-last-review`, ask what Codex should investigate or fix.

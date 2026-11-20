@@ -182,8 +182,8 @@ Examples:
 /agent:codex-rescue investigate why the tests started failing
 /agent:codex-rescue fix the failing test with the smallest safe patch
 /agent:codex-rescue --resume apply the top fix from the last run
-/agent:codex-rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
-/agent:codex-rescue --model spark fix the issue quickly
+/agent:codex-rescue --model <id> --effort medium investigate the flaky integration test
+/agent:codex-rescue --model configured fix the issue quickly
 /agent:codex-rescue --background investigate the regression
 /agent:codex-rescue --from-last-review skip the style findings
 /agent:codex-rescue --worktree try a rewrite of the cache layer
@@ -204,7 +204,7 @@ Ask Codex to redesign the database connection to be more resilient.
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - `--effort` takes `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`; an effort the selected model does not support is rejected before Codex starts, with the efforts it does support
-- if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
+- `--model` takes a catalog id, a family word, `default` or `configured`; `default` is the model Codex marks as its default, and `configured` sends no model, so Codex chooses it and a model set in the Codex configuration applies
 - write-capable rescue runs use the `workspace-write` sandbox; `/agent:codex-setup --write-sandbox danger-full-access` turns the sandbox off for this repository, and `--write-sandbox workspace-write` turns it back on
 - follow-up rescue requests can continue the latest Codex task in the repo
 
@@ -411,7 +411,7 @@ The Codex plugin wraps the [Codex app server](https://developers.openai.com/code
 If you want to change the default reasoning effort or the default model that gets used by the plugin, you can define that inside your user-level or project-level `config.toml`. For example to always use `gpt-5.4-mini` on `high` for a specific project you can add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
 
 ```toml
-model = "gpt-5.4-mini"
+model = "<model id>"
 model_reasoning_effort = "high"
 ```
 
