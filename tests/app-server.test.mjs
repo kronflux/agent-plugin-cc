@@ -12,7 +12,7 @@ import {
 } from "../plugins/agent/scripts/providers/codex/app-server.mjs";
 import { isProcessAlive } from "../plugins/agent/scripts/lib/process.mjs";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { makeTempDir, waitUntil } from "./helpers.mjs";
+import { makeTempDir, stopOwnedProcesses, waitUntil } from "./helpers.mjs";
 
 /** Minimal client that records the JSON-RPC messages it would send. */
 class CapturingClient extends AppServerClientBase {
@@ -394,4 +394,31 @@ test("a failed tree stop on close is reported, not swallowed", { timeout: 15000,
 
   assert.match(client.stopError?.message ?? "", /taskkill refused/);
   assert.match(warnings.join(""), /codex app-server process 999998 could not be stopped: taskkill refused/);
+});
+
+test("an auth check ends its app-server and stops it by identity when it lingers", { timeout: 30000 }, async (t) => {
+  // The fake records each app server's identity; whatever the check leaves running is stopped
+  // through those identities when the test ends, before its folders are removed.
+  let binDir = null;
+  t.after(async () => {
+    const identities = binDir && fs.existsSync(path.join(binDir, "fake-codex-state.json")) ? (readFakeState(binDir).processIdentities ?? []) : [];
+    await stopOwnedProcesses(identities.map(({ pid, startToken }) => ({ pid, startToken })), { tree: true });
+  });
+  binDir = makeTempDir(t);
+  const cwd = makeTempDir(t);
+  installFakeCodex(binDir, "ignore-eof", { recordIdentities: true });
+  const { getCodexAuthStatus } = await import("../plugins/agent/scripts/providers/codex/runtime.mjs");
+  await getCodexAuthStatus(cwd, { env: buildEnv(binDir) });
+  const returnedAt = Date.now();
+  const state = readFakeState(binDir);
+  assert.equal(state.appServerPids.length, 1);
+  assert.ok(state.stdinEndedAt, "the auth check did not end the app server's input");
+  // The app server gets 2 seconds to exit by itself after its input ended, then it is stopped.
+  const lingered = returnedAt - state.stdinEndedAt;
+  t.diagnostic(`the app server was stopped ${lingered} ms after its input ended`);
+  assert.ok(lingered >= 1900, `the app server was stopped ${lingered} ms after its input ended`);
+  assert.ok(lingered <= 2500 + 1000, `the app server lingered ${lingered} ms`);
+  const { readProcessIdentity } = await import("../plugins/agent/scripts/lib/process.mjs");
+  const after = await readProcessIdentity(state.appServerPids[0], { deadline: performance.now() + 15000 });
+  assert.equal(after.state, "absent", "the lingering app server still runs after the auth check");
 });

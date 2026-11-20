@@ -32,6 +32,29 @@ function wholeLineLength(file) {
   }
 }
 
+// The length to keep of a transcript copy: all of it when the text after its last "\n" is one
+// complete JSON record, otherwise up to and including that newline, so a partial record is cut.
+function recordsLength(file) {
+  const whole = wholeLineLength(file);
+  const size = fs.statSync(file).size;
+  if (whole === size) {
+    return size;
+  }
+  const tail = Buffer.alloc(size - whole);
+  const fd = fs.openSync(file, "r");
+  try {
+    fs.readSync(fd, tail, 0, tail.length, whole);
+  } finally {
+    fs.closeSync(fd);
+  }
+  try {
+    const record = JSON.parse(tail.toString("utf8"));
+    return record !== null && typeof record === "object" ? size : whole;
+  } catch {
+    return whole;
+  }
+}
+
 function fileSha256(file) {
   const hash = crypto.createHash("sha256");
   const fd = fs.openSync(file, "r");
@@ -48,7 +71,8 @@ function fileSha256(file) {
 
 /**
  * Copies the transcript at `sourcePath` to `<home>/.claude/projects/.agent-plugin-transfer-<hex>/`
- * and cuts the copy after its last newline, so it holds whole records only. Returns the copy's
+ * and cuts the copy after its last newline unless the text after it is one complete JSON record,
+ * so it holds whole records only. Returns the copy's
  * path, size, SHA-256 and the time it was taken, and `cleanup()`, which removes the copy's folder
  * and any parent folder the copy created and returns whether the copy is gone. Callers run
  * `cleanup()` in `finally`; a failure while staging cleans up before it throws.
@@ -60,7 +84,11 @@ export function stageTranscriptSnapshot(sourcePath) {
   const stagingDir = path.join(projects, `${STAGING_DIR_PREFIX}${crypto.randomBytes(6).toString("hex")}`);
   const copyPath = path.join(stagingDir, path.basename(sourcePath));
   const cleanup = () => {
-    fs.rmSync(stagingDir, { recursive: true, force: true });
+    try {
+      fs.rmSync(stagingDir, { recursive: true, force: true });
+    } catch {
+      // Another process holds the copy open; the check below reports it as not removed.
+    }
     for (const dir of [...createdDirs].reverse()) {
       try {
         fs.rmdirSync(dir);
@@ -73,7 +101,7 @@ export function stageTranscriptSnapshot(sourcePath) {
   try {
     fs.mkdirSync(stagingDir, { recursive: true, mode: 0o700 });
     fs.copyFileSync(sourcePath, copyPath);
-    fs.truncateSync(copyPath, wholeLineLength(copyPath));
+    fs.truncateSync(copyPath, recordsLength(copyPath));
     return {
       path: copyPath,
       bytes: fs.statSync(copyPath).size,

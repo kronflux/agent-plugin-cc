@@ -7,9 +7,9 @@ import { fileURLToPath } from "node:url";
 import { installFakeAgy, readFakeAgyState } from "./fake-agy-fixture.mjs";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { buildReviewPrompt, parseReviewArguments, resolveReviewTarget } from "../plugins/agent/scripts/lib/review-target.mjs";
-import { readStoredJob } from "../plugins/agent/scripts/lib/job-control.mjs";
-import { candidateStateDirs, listJobs, setConfig } from "../plugins/agent/scripts/lib/state.mjs";
+import { candidateStateDirs, resolveStateDir, setConfig } from "../plugins/agent/scripts/lib/state.mjs";
 import { makeCommittedRepo, makeTempDir, run, waitUntil } from "./helpers.mjs";
+import { rawAll } from "./store-fixtures.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "agent");
@@ -400,11 +400,37 @@ function jobFolderEntries(workspace) {
   });
 }
 
-// The review jobs of a workspace, newest first.
+// The Codex review jobs of a workspace's job store, newest first, each with its parsed request.
 function reviewJobs(workspace) {
-  return listJobs(workspace)
-    .filter((job) => job.jobClass === "review")
-    .sort((left, right) => String(right.createdAt ?? "").localeCompare(String(left.createdAt ?? "")));
+  return storeReviews(workspace).filter((row) => row.provider === "codex");
+}
+
+// The rows of a workspace's job store, where Antigravity jobs live; empty before the store exists.
+function storeRows(workspace, where = "1 = 1") {
+  const stateDir = resolveStateDir(workspace);
+  if (!fs.existsSync(path.join(stateDir, "store", "state.db"))) {
+    return [];
+  }
+  return rawAll(stateDir, `SELECT * FROM jobs WHERE ${where} ORDER BY created_at DESC, id DESC`);
+}
+
+// The review jobs of a workspace's job store, newest first, each with its parsed request.
+function storeReviews(workspace) {
+  return storeRows(workspace, "kind = 'review'").map((row) => ({ ...row, request: JSON.parse(row.request_json) }));
+}
+
+// Waits until a store job has an end decision and a released execution, and returns its row with
+// its parsed request.
+async function waitForStoreEnd(workspace, jobId) {
+  let row = null;
+  await waitUntil(
+    () => {
+      row = storeReviews(workspace).find((entry) => entry.id === jobId) ?? null;
+      return row !== null && row.end_state !== null && (row.exec_gen === 0 || row.exec_released_at !== null);
+    },
+    { timeoutMs: 30000, describe: `store job ${jobId} ending` }
+  );
+  return row;
 }
 
 const CHANGES_TARGET = {
@@ -488,6 +514,19 @@ test("review --stance critical uses the critical prompt", (t) => {
   assert.equal(state.lastReviewStart, undefined);
 });
 
+test("a foreground structured review reads its stored result when a model warning leads the text", (t) => {
+  const ctx = makeDirtyCodexRepo(t, "reports-other-model");
+  const result = run("node", [CODEX, "review", "--stance", "critical", "--json"], { cwd: ctx.repo, env: ctx.env });
+  // The stored text starts with the reported-model warning; the stored JSON is the review.
+  const [job] = reviewJobs(ctx.repo);
+  assert.match(job.result_text, /^Codex reported model m-reported/);
+  assert.ok(job.result_json, "the worker stored no structured result");
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.result, JSON.parse(job.result_json));
+  assert.equal(payload.parseError, null);
+});
+
 test("review with instructions runs a peer schema-bound turn", (t) => {
   const ctx = makeDirtyCodexRepo(t);
   const result = run("node", [CODEX, "review", "--", "focus on the index access"], { cwd: ctx.repo, env: ctx.env });
@@ -504,7 +543,7 @@ test("a schema-bound review thread is persistent and a native one is ephemeral",
   const bound = run("node", [CODEX, "review", "--stance", "critical"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(bound.status, 0, bound.stderr);
   assert.equal(readCodexState(ctx.binDir).lastThreadStart.ephemeral, false);
-  assert.equal(reviewJobs(ctx.repo)[0].ephemeralThread, false);
+  assert.equal(reviewJobs(ctx.repo)[0].ephemeral, 0);
 
   const native = run("node", [CODEX, "review"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(native.status, 0, native.stderr);
@@ -512,21 +551,21 @@ test("a schema-bound review thread is persistent and a native one is ephemeral",
   assert.equal(state.lastThreadStart.ephemeral, true);
   assert.ok(state.lastReviewStart, "the native review sent no review/start");
   const [job] = reviewJobs(ctx.repo);
-  assert.equal(job.ephemeralThread, true);
+  assert.equal(job.ephemeral, 1);
   const result = run("node", [NEUTRAL, "result", job.id], { cwd: ctx.repo, env: ctx.env });
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stdout, /codex resume/);
 });
 
-test("result of a schema-bound review prints its resume command", (t) => {
+test("result of a schema-bound review names its Codex session", (t) => {
   const ctx = makeDirtyCodexRepo(t);
   const review = run("node", [CODEX, "review", "--stance", "critical"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(review.status, 0, review.stderr);
   const [job] = reviewJobs(ctx.repo);
-  assert.ok(job.threadId, "the review recorded no thread");
+  assert.ok(job.thread_id, "the review recorded no thread");
   const result = run("node", [NEUTRAL, "result", job.id], { cwd: ctx.repo, env: ctx.env });
   assert.equal(result.status, 0, result.stderr);
-  assert.ok(result.stdout.includes(`codex resume ${job.threadId}`), result.stdout);
+  assert.ok(result.stdout.includes(`Codex session ID: ${job.thread_id}`), result.stdout);
 });
 
 test("task --resume-thread continues a schema-bound review thread", (t) => {
@@ -534,13 +573,13 @@ test("task --resume-thread continues a schema-bound review thread", (t) => {
   const review = run("node", [CODEX, "review", "--stance", "critical"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(review.status, 0, review.stderr);
   const [job] = reviewJobs(ctx.repo);
-  assert.ok(job.threadId, "the review recorded no thread");
-  const followUp = run("node", [CODEX, "task", "--resume-thread", job.threadId, "follow up on the first finding"], {
+  assert.ok(job.thread_id, "the review recorded no thread");
+  const followUp = run("node", [CODEX, "task", "--resume-thread", job.thread_id, "follow up on the first finding"], {
     cwd: ctx.repo,
     env: ctx.env
   });
   assert.equal(followUp.status, 0, followUp.stderr);
-  assert.equal(readCodexState(ctx.binDir).lastThreadResume.threadId, job.threadId);
+  assert.equal(readCodexState(ctx.binDir).lastThreadResume.threadId, job.thread_id);
 });
 
 // A fake agy on PATH, with a home folder whose Antigravity settings name a saved model.
@@ -591,9 +630,9 @@ test("codex review outside git reviews the folder as a project", (t) => {
   assert.ok(samePath(state.lastThreadStart.cwd, folder), "the review thread did not run in the folder");
   assert.equal(state.lastThreadStart.sandbox, "read-only");
   const [job] = reviewJobs(folder);
-  assert.equal(job.review.target, "project");
-  assert.equal(job.review.native, false);
-  assert.equal(job.review.stance, "peer");
+  assert.equal(job.request.review.target, "project");
+  assert.equal(job.request.review.native, false);
+  assert.equal(job.request.review.stance, "peer");
 });
 
 test("agy review outside git reviews the folder as a project", (t) => {
@@ -606,9 +645,10 @@ test("agy review outside git reviews the folder as a project", (t) => {
   assert.ok(samePath(promptRoot(prompt), folder), prompt);
   assert.match(prompt, /Set the top-level `target` field to `project`/);
   assert.ok(prompt.includes(PEER_MARKER), "the agy review default is not the peer stance");
-  const [job] = reviewJobs(folder);
-  assert.equal(job.review.target, "project");
-  assert.equal(job.review.stance, "peer");
+  const [job] = storeReviews(folder);
+  assert.equal(job.provider, "agy");
+  assert.equal(job.request.review.target, "project");
+  assert.equal(job.request.review.stance, "peer");
 });
 
 test("review of a clean repository records target project", (t) => {
@@ -618,13 +658,13 @@ test("review of a clean repository records target project", (t) => {
   const result = run("node", [CODEX, "review"], { cwd: repo, env: buildEnv(binDir) });
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stderr, /nothing to review/i);
-  assert.equal(reviewJobs(repo)[0].review.target, "project");
+  assert.equal(reviewJobs(repo)[0].request.review.target, "project");
   assert.ok(samePath(promptRoot(readCodexState(binDir).lastTurnStart.prompt), repo));
 
   const agy = fakeAgyEnv(t);
   const agyResult = run("node", [AGY, "review"], { cwd: repo, env: agy.env });
   assert.equal(agyResult.status, 0, agyResult.stderr);
-  assert.equal(reviewJobs(repo)[0].review.target, "project");
+  assert.equal(storeReviews(repo)[0].request.review.target, "project");
 });
 
 test("repeated --path narrows a changes review in both providers", (t) => {
@@ -645,9 +685,9 @@ test("repeated --path narrows a changes review in both providers", (t) => {
   assert.doesNotMatch(prompt, /CHANGED_C/);
   assert.doesNotMatch(prompt, /c\.js/);
   const [job] = reviewJobs(repo);
-  assert.equal(job.review.target, "changes");
-  assert.deepEqual(job.review.paths, ["a.js", "b.js"]);
-  assert.equal(job.review.native, false);
+  assert.equal(job.request.review.target, "changes");
+  assert.deepEqual(job.request.review.paths, ["a.js", "b.js"]);
+  assert.equal(job.request.review.native, false);
 
   const agy = fakeAgyEnv(t);
   const agyResult = run("node", [AGY, ...args], { cwd: repo, env: agy.env });
@@ -687,16 +727,16 @@ test("a review stores its model fields and honours the stored setting", (t) => {
   assert.equal(state.lastTurnStart.effort, "high");
   const [job] = reviewJobs(ctx.repo);
   assert.equal(job.model, "gpt-5.6-luna");
-  assert.equal(job.effort, "high");
-  assert.equal(job.modelSource, "setting");
-  assert.equal(job.effortSource, "setting");
+  assert.equal(job.request.effort, "high");
+  assert.equal(job.request.modelSource, "setting");
+  assert.equal(job.request.effortSource, "setting");
 
   const explicit = run("node", [CODEX, "review", "--model", "m-default"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(explicit.status, 0, explicit.stderr);
   const [native] = reviewJobs(ctx.repo);
   assert.equal(native.model, "m-default");
-  assert.equal(native.modelSource, "explicit");
-  assert.equal(native.review.native, true);
+  assert.equal(native.request.modelSource, "explicit");
+  assert.equal(native.request.review.native, true);
   assert.equal(readCodexState(ctx.binDir).lastThreadStart.model, "m-default");
 });
 
@@ -718,6 +758,7 @@ test("an invalid model or effort on review is rejected before any job exists", (
   assert.equal(agyEffort.status, 1, agyEffort.stdout);
   assert.match(agyEffort.stderr, /agy does not support reasoning effort "max"/);
   assert.deepEqual(jobFolderEntries(ctx.repo), []);
+  assert.deepEqual(storeRows(ctx.repo), []);
   assert.equal(readFakeAgyState(agy.binDir).runs.length, 0);
 });
 
@@ -736,6 +777,7 @@ test("review target errors exit 1 before any job exists", (t) => {
   assert.equal(outside.status, 1);
   assert.equal(outside.stderr.trim(), "--path .. cannot be resolved inside the review root.");
   assert.deepEqual(jobFolderEntries(folder), []);
+  assert.deepEqual(storeRows(folder), []);
 });
 
 test("a blank --path exits 1 before any job exists in both providers", (t) => {
@@ -750,6 +792,7 @@ test("a blank --path exits 1 before any job exists in both providers", (t) => {
     }
   }
   assert.deepEqual(jobFolderEntries(ctx.repo), []);
+  assert.deepEqual(storeRows(ctx.repo), []);
   assert.equal(readFakeAgyState(agy.binDir).runs.length, 0);
 });
 
@@ -767,6 +810,7 @@ test("a blank --target, --base, --scope or --stance exits 1 before any job exist
     }
   }
   assert.deepEqual(jobFolderEntries(ctx.repo), []);
+  assert.deepEqual(storeRows(ctx.repo), []);
   assert.equal(readFakeAgyState(agy.binDir).runs.length, 0);
 });
 
@@ -794,22 +838,9 @@ test("an invalid --base or a scope conflict exits 1 before any job exists in bot
     }
   }
   assert.deepEqual(jobFolderEntries(ctx.repo), []);
+  assert.deepEqual(storeRows(ctx.repo), []);
   assert.equal(readFakeAgyState(agy.binDir).runs.length, 0);
 });
-
-// Waits until the job has ended and returns its stored record.
-async function waitForEnd(workspace, jobId) {
-  let record = null;
-  const ended = await waitUntil(
-    () => {
-      record = readStoredJob(workspace, jobId);
-      return record && ["completed", "failed", "cancelled"].includes(record.status);
-    },
-    { timeoutMs: 30000, describe: `job ${jobId} ending` }
-  );
-  assert.ok(ended, JSON.stringify(record));
-  return record;
-}
 
 test("a background review is a tracked job with an id and finishes with its findings", async (t) => {
   const ctx = makeDirtyCodexRepo(t);
@@ -818,22 +849,26 @@ test("a background review is a tracked job with an id and finishes with its find
   const { jobId, status } = JSON.parse(launched.stdout);
   assert.match(jobId, /^review-/);
   assert.equal(status, "queued");
-  const record = await waitForEnd(ctx.repo, jobId);
-  assert.equal(record.status, "completed", JSON.stringify(record));
-  assert.equal(record.review.target, "changes");
-  assert.equal(record.review.stance, "critical");
+  const record = await waitForStoreEnd(ctx.repo, jobId);
+  assert.equal(record.end_state, "completed", JSON.stringify(record));
+  assert.equal(record.request.review.target, "changes");
+  assert.equal(record.request.review.stance, "critical");
   const result = run("node", [NEUTRAL, "result", jobId], { cwd: ctx.repo, env: ctx.env });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Missing empty-state guard/);
+});
 
+test("an Antigravity background review is a store job and finishes with its findings", async (t) => {
+  const ctx = makeDirtyCodexRepo(t);
   const agy = fakeAgyEnv(t);
   const agyLaunch = run("node", [AGY, "review", "--background", "--json"], { cwd: ctx.repo, env: agy.env });
   assert.equal(agyLaunch.status, 0, agyLaunch.stderr);
   const agyJob = JSON.parse(agyLaunch.stdout).jobId;
   assert.match(agyJob, /^review-/);
-  const agyRecord = await waitForEnd(ctx.repo, agyJob);
-  assert.equal(agyRecord.status, "completed", JSON.stringify(agyRecord));
+  const agyRecord = await waitForStoreEnd(ctx.repo, agyJob);
+  assert.equal(agyRecord.end_state, "completed", JSON.stringify(agyRecord));
   assert.equal(agyRecord.provider, "agy");
+  assert.equal(agyRecord.request.review.target, "changes");
   const agyResult = run("node", [NEUTRAL, "result", agyJob], { cwd: ctx.repo, env: agy.env });
   assert.equal(agyResult.status, 0, agyResult.stderr);
   assert.match(agyResult.stdout, /No material issues found by the fake agy\./);
@@ -845,14 +880,14 @@ test("a background schema-bound review keeps its thread persistent", async (t) =
   assert.equal(launched.status, 0, launched.stderr);
   const jobId = launched.stdout.match(/as (review-\S+)\./)?.[1];
   assert.ok(jobId, launched.stdout);
-  const record = await waitForEnd(ctx.repo, jobId);
-  assert.equal(record.status, "completed", JSON.stringify(record));
-  assert.equal(record.ephemeralThread, false);
-  assert.equal(record.review.native, false);
+  const record = await waitForStoreEnd(ctx.repo, jobId);
+  assert.equal(record.end_state, "completed", JSON.stringify(record));
+  assert.equal(record.ephemeral, 0);
+  assert.equal(record.request.review.native, false);
   const state = readCodexState(ctx.binDir);
   assert.equal(state.lastThreadStart.ephemeral, false);
   assert.equal(state.lastReviewStart, undefined);
-  assert.ok(record.threadId);
+  assert.ok(record.thread_id);
 });
 
 test("every object in the review schema lists all its properties as required", () => {
@@ -928,7 +963,7 @@ test("a Codex review without valid JSON fails and is never handed off", (t) => {
   assert.equal(result.status, 1, result.stdout);
   assert.match(result.stdout, /did not return valid structured JSON/);
   const [job] = reviewJobs(ctx.repo);
-  assert.equal(job.status, "failed", JSON.stringify(job));
+  assert.equal(job.end_state, "failed", JSON.stringify(job));
   const handoff = run("node", [CODEX, "task", "--from-last-review"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(handoff.status, 1, handoff.stdout);
   assert.match(handoff.stderr, /No finished review with output was found/);
@@ -940,17 +975,17 @@ test("an Antigravity review names the saved model it ran on, in the output and t
   const result = run("node", [AGY, "review"], { cwd: folder, env: agy.env });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /^Model: Fake Model \(High\) \(from the Antigravity settings\)$/m);
-  const [job] = reviewJobs(folder);
+  const [job] = storeReviews(folder);
   assert.equal(job.model, null);
-  assert.equal(job.modelSource, "provider-default");
-  assert.equal(job.providerModel, "Fake Model (High)");
+  assert.equal(job.request.modelSource, "provider-default");
+  assert.equal(job.request.providerModel, "Fake Model (High)");
 
   const launched = run("node", [AGY, "review", "--background", "--json"], { cwd: folder, env: agy.env });
   assert.equal(launched.status, 0, launched.stderr);
   const { jobId } = JSON.parse(launched.stdout);
-  const record = await waitForEnd(folder, jobId);
-  assert.equal(record.providerModel, "Fake Model (High)");
+  const record = await waitForStoreEnd(folder, jobId);
+  assert.equal(record.request.providerModel, "Fake Model (High)");
   const stored = run("node", [NEUTRAL, "result", jobId], { cwd: folder, env: agy.env });
   assert.equal(stored.status, 0, stored.stderr);
-  assert.match(stored.stdout, /^Model: Fake Model \(High\) \(from the Antigravity settings\)$/m);
+  assert.match(stored.stdout, /One project-wide concern surfaced by the fake agy\./);
 });

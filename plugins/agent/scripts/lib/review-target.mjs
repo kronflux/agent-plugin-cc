@@ -13,7 +13,7 @@ import {
   listChangedPaths,
   resolveChangesTarget
 } from "./git.mjs";
-import { enqueueBackgroundTask, normalizeArgv, outputCommandResult, parseCommandInput } from "./companion-cli.mjs";
+import { normalizeArgv, parseCommandInput } from "./companion-cli.mjs";
 import { interpolateTemplate, loadPromptTemplate } from "./prompts.mjs";
 
 export const REVIEW_TARGET_KINDS = ["auto", "changes", "project"];
@@ -297,20 +297,6 @@ export function parseReviewArguments(argv, { aliasMap = {} } = {}) {
     instructions: positionals.join(" ").trim(),
     background: Boolean(options.background)
   };
-}
-
-/**
- * Queues the review `request` of `job` for the background worker of `workerScript`, which runs
- * a request marked `requestKind: "review"` as a review, and prints the job id.
- */
-export function enqueueBackgroundReview(cwd, job, request, { workerScript, json = false }) {
-  const { payload } = enqueueBackgroundTask(cwd, job, { ...request, requestKind: "review" }, { workerScript });
-  outputCommandResult(
-    payload,
-    `${payload.title} started in the background as ${payload.jobId}. Check /agent:status ${payload.jobId} for progress.\n`,
-    json
-  );
-  return payload;
 }
 
 const PROJECT_COLLECTION_GUIDANCE = "Read the files under the review root yourself with read-only commands before finalizing findings.";

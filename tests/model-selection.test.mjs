@@ -9,9 +9,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildEnv, FAKE_DEBUG_SOL_MODELS, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { makeCommittedRepo, makeTempDir, stopOwnedProcesses, waitUntil } from "./helpers.mjs";
 import { launchManifestTasks } from "../plugins/agent/scripts/codex-companion.mjs";
-import { sortJobsNewestFirst } from "../plugins/agent/scripts/lib/job-control.mjs";
 import { isProcessAlive } from "../plugins/agent/scripts/lib/process.mjs";
-import { getConfig, listJobs, setConfig, upsertJob } from "../plugins/agent/scripts/lib/state.mjs";
+import { getConfig, listJobViews, resolveStateDir, setConfig } from "../plugins/agent/scripts/lib/state.mjs";
+import { openStore } from "../plugins/agent/scripts/lib/store.mjs";
 import {
   listCatalogModels,
   pickNewestSol,
@@ -84,9 +84,42 @@ function fakeState(ctx) {
   return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
 }
 
-// The newest job record of the repository.
+// Runs `fn` on the job store of the repository and closes the store after.
+function withStore(ctx, fn) {
+  const store = openStore(resolveStateDir(ctx.repo));
+  try {
+    return fn(store);
+  } finally {
+    store.close();
+  }
+}
+
+// Every job of the repository's job store, newest first, as job views: `row` holds the columns
+// (model, error, thread_id), `request` the stored request (model, effort, modelSource,
+// effortSource) and `state` the job's state.
+function allJobs(ctx) {
+  return withStore(ctx, (store) => listJobViews(store, { all: true, limit: 200 }));
+}
+
+// The newest job of the repository's job store, or null.
 function latestJob(ctx) {
-  return sortJobsNewestFirst(listJobs(ctx.repo))[0] ?? null;
+  return allJobs(ctx)[0] ?? null;
+}
+
+// Changes the stored model and request fields of a job, as a job that ran with them would hold
+// them: `model` sets the model column and the request's model; `request` merges into the request.
+function updateStoredJob(ctx, jobId, { request = {}, ...columns }) {
+  withStore(ctx, (store) =>
+    store.transact((db) => {
+      const row = db.prepare("SELECT model, request_json FROM jobs WHERE id = ?").get(jobId);
+      const merged = { ...JSON.parse(row.request_json), ...request };
+      const model = Object.hasOwn(columns, "model") ? columns.model : row.model;
+      if (Object.hasOwn(columns, "model")) {
+        merged.model = columns.model;
+      }
+      db.prepare("UPDATE jobs SET model = ?, request_json = ? WHERE id = ?").run(model, JSON.stringify(merged), jobId);
+    })
+  );
 }
 
 function warningLines(stderr, text) {
@@ -104,8 +137,8 @@ test("with no model the catalog default model and effort are used", (t) => {
   assert.equal(state.lastTurnStart.model, "m-default");
   assert.equal(state.lastTurnStart.effort, "low");
   const job = latestJob(ctx);
-  assert.equal(job.modelSource, "catalog-default");
-  assert.equal(job.effortSource, "catalog-default");
+  assert.equal(job.request.modelSource, "catalog-default");
+  assert.equal(job.request.effortSource, "catalog-default");
 });
 
 test("--model configured sends no model and records provider-default", (t) => {
@@ -115,7 +148,7 @@ test("--model configured sends no model and records provider-default", (t) => {
   const state = fakeState(ctx);
   assert.equal(state.lastThreadStart.model, null);
   assert.equal(state.lastTurnStart.model, null);
-  assert.equal(latestJob(ctx).modelSource, "provider-default");
+  assert.equal(latestJob(ctx).request.modelSource, "provider-default");
 });
 
 test("a family word resolves from the catalog", (t) => {
@@ -123,7 +156,7 @@ test("a family word resolves from the catalog", (t) => {
   const result = companion(ctx, ["task", "--model", "sol", "x"]);
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fakeState(ctx).lastThreadStart.model, "gpt-6.1-sol");
-  assert.equal(latestJob(ctx).modelSource, "explicit");
+  assert.equal(latestJob(ctx).request.modelSource, "explicit");
 });
 
 test("an unknown model exits 1 with the visible ids before any job or thread", (t) => {
@@ -131,7 +164,7 @@ test("an unknown model exits 1 with the visible ids before any job or thread", (
   const result = companion(ctx, ["task", "--model", "spark", "x"]);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /Model "spark" is not in the Codex catalog\. Available: m-default, gpt-5\.6-luna\./);
-  assert.deepEqual(listJobs(ctx.repo), []);
+  assert.deepEqual(allJobs(ctx), []);
   assert.equal(fakeState(ctx).lastThreadStart, undefined);
 });
 
@@ -141,8 +174,8 @@ test("when model/list fails the newest visible Sol model is used", (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fakeState(ctx).lastThreadStart.model, "gpt-6.1-sol");
   assert.equal(fakeState(ctx).lastTurnStart.model, "gpt-6.1-sol");
-  assert.equal(latestJob(ctx).modelSource, "family-fallback");
-  assert.equal(latestJob(ctx).model, "gpt-6.1-sol");
+  assert.equal(latestJob(ctx).request.modelSource, "family-fallback");
+  assert.equal(latestJob(ctx).row.model, "gpt-6.1-sol");
 });
 
 test("when no entry is marked default the newest visible Sol model is used", (t) => {
@@ -150,12 +183,15 @@ test("when no entry is marked default the newest visible Sol model is used", (t)
   const result = companion(ctx, ["task", "x"]);
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fakeState(ctx).lastThreadStart.model, "gpt-6.1-sol");
-  assert.equal(latestJob(ctx).modelSource, "family-fallback");
+  assert.equal(latestJob(ctx).request.modelSource, "family-fallback");
 });
 
-// A catalog timeout short enough that a test of the timeout path keeps a wide margin for slow
-// process starts on a loaded machine.
-const SHORT_CATALOG_TIMEOUT = { CODEX_COMPANION_CATALOG_TIMEOUT_MS: "1500" };
+// A catalog timeout short enough that a test of the timeout path keeps a wide margin, and long
+// enough that the fake app server exists when the timeout stops it. The fake starts through a
+// batch-file wrapper; at 1,500 ms, with the whole suite running, the stop sometimes came while the
+// wrapper was still starting its child, and that child then ran on ("an app server is still
+// running", twice in four whole-suite runs).
+const SHORT_CATALOG_TIMEOUT = { CODEX_COMPANION_CATALOG_TIMEOUT_MS: "4000" };
 
 test("a model/list that does not answer falls back within the catalog timeout", { timeout: 60000 }, (t) => {
   const repo = makeRepo(t, "model-list-hangs");
@@ -175,7 +211,7 @@ test("without any catalog no model is sent and one warning line is printed", (t)
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fakeState(ctx).lastThreadStart.model, null);
   assert.equal(warningLines(result.stderr, CODEX_CHOSE).length, 1, result.stderr);
-  assert.equal(latestJob(ctx).modelSource, "provider-default");
+  assert.equal(latestJob(ctx).request.modelSource, "provider-default");
 });
 
 test("an effort the resolved model does not list is rejected before a job", (t) => {
@@ -183,7 +219,7 @@ test("an effort the resolved model does not list is rejected before a job", (t) 
   const result = companion(ctx, ["task", "--model", "gpt-5.6-luna", "--effort", "ultra", "x"]);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /Model gpt-5\.6-luna does not support reasoning effort "ultra"\. Use one of: low, medium, high\./);
-  assert.deepEqual(listJobs(ctx.repo), []);
+  assert.deepEqual(allJobs(ctx), []);
   assert.equal(fakeState(ctx).lastThreadStart, undefined);
 });
 
@@ -195,7 +231,7 @@ test("--model default ignores the stored model and effort", (t) => {
   const state = fakeState(ctx);
   assert.equal(state.lastTurnStart.model, "m-default");
   assert.equal(state.lastTurnStart.effort, "low");
-  assert.equal(latestJob(ctx).effortSource, "catalog-default");
+  assert.equal(latestJob(ctx).request.effortSource, "catalog-default");
 });
 
 test("a model Codex does not know fails the job with Codex's message when no catalog can check it", (t) => {
@@ -208,8 +244,8 @@ test("a model Codex does not know fails the job with Codex's message when no cat
     result.stderr
   );
   const job = latestJob(ctx);
-  assert.equal(job.status, "failed");
-  assert.match(job.errorMessage, /The 'gpt-0-nonexistent' model is not supported/);
+  assert.equal(job.state, "failed");
+  assert.match(job.row.error, /The 'gpt-0-nonexistent' model is not supported/);
   assert.equal(fakeState(ctx).lastTurnStart.model, "gpt-0-nonexistent");
 });
 
@@ -247,7 +283,9 @@ test("the reported-model warning of a background task reaches the job log and re
   const ctx = makeRepo(t, "reports-other-model");
   const launched = companion(ctx, ["task", "--background", "--json", "--", "x"]);
   assert.equal(launched.status, 0, launched.stderr);
-  const { jobId, logFile } = JSON.parse(launched.stdout);
+  const { jobId } = JSON.parse(launched.stdout);
+  // A store job's log is the file <state dir>/store/artifacts/<job id>.log.
+  const logFile = path.join(resolveStateDir(ctx.repo), "store", "artifacts", `${jobId}.log`);
   const neutral = path.join(ROOT, "plugins", "agent", "scripts", "agent-companion.mjs");
   const result = companion(ctx, ["result", jobId, "--wait", "--timeout-ms", "30000"], { script: neutral });
   assert.equal(result.status, 0, result.stderr);
@@ -262,8 +300,8 @@ test("a partial report keeps the resolved effort", (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(warningLines(result.stderr, "Codex reported model"), []);
   const job = latestJob(ctx);
-  assert.equal(job.model, "m-default");
-  assert.equal(job.effort, "low");
+  assert.equal(job.row.model, "m-default");
+  assert.equal(job.request.effort, "low");
 });
 
 // Runs a first task and returns its thread id.
@@ -284,8 +322,8 @@ test("--resume-last keeps the continued job's model and effort", (t) => {
   assert.equal(state.lastTurnStart.model, "gpt-5.6-luna");
   assert.equal(state.lastTurnStart.effort, "high");
   const job = latestJob(ctx);
-  assert.equal(job.modelSource, "explicit");
-  assert.equal(job.effortSource, "explicit");
+  assert.equal(job.request.modelSource, "explicit");
+  assert.equal(job.request.effortSource, "explicit");
 });
 
 test("a follow-up keeps the stored model after the catalog and the setting change", (t) => {
@@ -298,7 +336,7 @@ test("a follow-up keeps the stored model after the catalog and the setting chang
   const state = fakeState(ctx);
   assert.equal(state.lastTurnStart.model, "m-default");
   assert.equal(state.lastTurnStart.effort, "low");
-  assert.equal(latestJob(ctx).modelSource, "catalog-default");
+  assert.equal(latestJob(ctx).request.modelSource, "catalog-default");
 });
 
 test("a follow-up with its own --model uses it", (t) => {
@@ -310,8 +348,8 @@ test("a follow-up with its own --model uses it", (t) => {
   assert.equal(state.lastTurnStart.model, "gpt-5.6-luna");
   assert.equal(state.lastTurnStart.effort, "low");
   const job = latestJob(ctx);
-  assert.equal(job.modelSource, "explicit");
-  assert.equal(job.effortSource, "catalog-default");
+  assert.equal(job.request.modelSource, "explicit");
+  assert.equal(job.request.effortSource, "catalog-default");
 });
 
 test("a recorded null model stays null on resume", (t) => {
@@ -319,20 +357,20 @@ test("a recorded null model stays null on resume", (t) => {
   firstTask(ctx, ["--model", "configured"]);
   // Codex reports the model a thread runs on, so a null model is written here as a record
   // without a report would hold it.
-  upsertJob(ctx.repo, { id: latestJob(ctx).id, model: null });
+  updateStoredJob(ctx, latestJob(ctx).id, { model: null });
   const resumed = companion(ctx, ["task", "--resume-last", "more"]);
   assert.equal(resumed.status, 0, resumed.stderr);
   const state = fakeState(ctx);
   assert.equal(state.lastThreadResume.model, null);
   assert.equal(state.lastTurnStart.model, null);
-  assert.equal(latestJob(ctx).modelSource, "provider-default");
+  assert.equal(latestJob(ctx).request.modelSource, "provider-default");
 });
 
 test("a follow-up checks a new effort against the kept model only when the catalog lists that exact id", (t) => {
   const ctx = makeRepo(t, "list-fails-debug-sols");
   firstTask(ctx);
   // The kept id is a bare word that matches no catalog id; only gpt-5.6-luna ends in -luna.
-  upsertJob(ctx.repo, { id: latestJob(ctx).id, model: "luna" });
+  updateStoredJob(ctx, latestJob(ctx).id, { model: "luna" });
   const resumed = companion(ctx, ["task", "--resume-last", "--effort", "xhigh", "more"]);
   assert.equal(resumed.status, 0, resumed.stderr);
   const state = fakeState(ctx);
@@ -344,9 +382,11 @@ test("a follow-up with --model configured keeps the inherited effort", (t) => {
   const ctx = makeRepo(t);
   firstTask(ctx);
   // The visible catalog says nothing about the model a Codex configuration sets.
-  upsertJob(ctx.repo, { id: latestJob(ctx).id, effort: "ultra", effortSource: "explicit" });
+  updateStoredJob(ctx, latestJob(ctx).id, { request: { effort: "ultra", effortSource: "explicit" } });
   const resumed = companion(ctx, ["task", "--resume-last", "--model", "configured", "more"]);
   assert.equal(resumed.status, 0, resumed.stderr);
+  // --model configured applies to the continuation: no model is sent, and the effort is kept.
+  assert.equal(fakeState(ctx).lastTurnStart.model, null);
   assert.equal(fakeState(ctx).lastTurnStart.effort, "ultra");
   assert.deepEqual(warningLines(resumed.stderr, "of the continued job"), []);
 });
@@ -444,14 +484,20 @@ test("a stored setting applies to the next task", (t) => {
   assert.equal(state.lastTurnStart.model, "gpt-5.6-luna");
   assert.equal(state.lastTurnStart.effort, "high");
   const job = latestJob(ctx);
-  assert.equal(job.modelSource, "setting");
-  assert.equal(job.effortSource, "setting");
+  assert.equal(job.request.modelSource, "setting");
+  assert.equal(job.request.effortSource, "setting");
 });
 
 // Stops, through stopOwnedProcesses, each process the fake Codex of this test recorded under `key`
-// with its start token, and returns the recorded ids a signal 0 probe found running. A running
-// process is given time to record its identity first.
+// with its start token, and returns the recorded ids a signal 0 probe found running after a short
+// wait. A running process is given time to record its identity first.
 async function stopRecordedProcesses(ctx, key) {
+  // The job's worker ends its own app server a moment after the foreground command returns, so a
+  // process still ending gets a short time to exit. A process that was left behind does not exit.
+  await waitUntil(() => (fakeState(ctx)[key] ?? []).every((pid) => !isProcessAlive(pid)), {
+    timeoutMs: 3000,
+    describe: "the recorded processes to exit"
+  }).catch(() => {});
   const running = (fakeState(ctx)[key] ?? []).filter((pid) => isProcessAlive(pid));
   const identities = () => (fakeState(ctx).processIdentities ?? []).filter((entry) => entry.key === key);
   await waitUntil(() => running.every((pid) => !isProcessAlive(pid) || identities().some((entry) => entry.pid === pid)), {
@@ -503,7 +549,7 @@ test("a codex debug models run that ignores SIGTERM is stopped after a short gra
   assert.match(report.detail, /did not answer within/);
 });
 
-test("a manifest launch pairs each entry with its own selection from one read of the file", (t) => {
+test("a manifest launch pairs each entry with its own selection from one read of the file", async (t) => {
   const ctx = makeRepo(t);
   const manifest = path.join(makeTempDir(t), "manifest.json");
   const first = { label: "first", prompt: "one", model: "luna" };
@@ -511,34 +557,38 @@ test("a manifest launch pairs each entry with its own selection from one read of
   const selection = (model, effort) => ({ model, effort, modelSource: "explicit", effortSource: "catalog-default", warnings: [] });
   // The file changed after the selections were resolved: reordered, with an entry added.
   fs.writeFileSync(manifest, JSON.stringify([second, first, { label: "added", prompt: "three", model: "unchecked" }]));
-  const enqueued = [];
-  const enqueue = (_cwd, job, request) => {
-    enqueued.push({ job, request });
-    return { payload: { jobId: job.id } };
+  // Each entry's store job is created through the create seam, which records its fields; no
+  // worker is launched.
+  const created = [];
+  const create = (_store, fields) => {
+    created.push(fields);
+    return { jobId: `task-entry-${created.length}` };
   };
-  // The launch checks Codex on PATH and prints its report to stdout; both are restored after.
+  const launch = async () => null;
+  // The launch checks Codex on PATH and prints its report to stdout; both are restored after. The
+  // report is written as a string; the test runner's own binary messages pass through.
   const savedPath = process.env.PATH;
   const savedWrite = process.stdout.write;
   const savedExitCode = process.exitCode;
   process.env.PATH = ctx.env.PATH;
-  process.stdout.write = () => true;
+  process.stdout.write = (chunk, ...rest) => (typeof chunk === "string" ? true : savedWrite.call(process.stdout, chunk, ...rest));
   try {
-    launchManifestTasks(ctx.repo, ctx.repo, { manifest, json: true }, [], {
+    await launchManifestTasks(ctx.repo, ctx.repo, { manifest, json: true }, [], {
       model: null,
       effort: null,
       manifestEntries: [first, second],
       entries: [selection("gpt-5.6-luna", "medium"), selection("m-default", "low")]
-    }, { enqueue });
+    }, { create, launch });
   } finally {
     process.stdout.write = savedWrite;
     process.env.PATH = savedPath;
     process.exitCode = savedExitCode;
   }
   assert.deepEqual(
-    enqueued.map(({ request }) => [request.prompt, request.model, request.effort]),
+    created.map((fields) => [fields.prompt, fields.request.model, fields.request.effort]),
     [["one", "gpt-5.6-luna", "medium"], ["two", "m-default", "low"]]
   );
-  assert.deepEqual(enqueued.map(({ job }) => job.model), ["gpt-5.6-luna", "m-default"]);
+  assert.deepEqual(created.map((fields) => fields.model), ["gpt-5.6-luna", "m-default"]);
 });
 
 test("a follow-up's new effort is checked against the continued job's model", (t) => {
@@ -560,8 +610,8 @@ test("the job records the model and effort turn/start sends, and a follow-up inh
   firstTask(ctx);
   const first = latestJob(ctx);
   assert.equal(fakeState(ctx).lastTurnStart.model, "m-default");
-  assert.equal(first.model, "m-default");
-  assert.equal(first.effort, "low");
+  assert.equal(first.row.model, "m-default");
+  assert.equal(first.request.effort, "low");
 
   const resumed = companion(ctx, ["task", "--resume-last", "more"]);
   assert.equal(resumed.status, 0, resumed.stderr);

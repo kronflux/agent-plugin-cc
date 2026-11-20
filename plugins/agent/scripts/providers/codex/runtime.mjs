@@ -40,12 +40,11 @@ import os from "node:os";
 import path from "node:path";
 
 import { readJsonFile } from "../../lib/fs.mjs";
-import { CodexAppServerClient } from "./app-server.mjs";
-import { binaryAvailable } from "../../lib/process.mjs";
+import { CodexAppServerClient, spawnAppServer } from "./app-server.mjs";
+import { binaryAvailable, stopHeldTree } from "../../lib/process.mjs";
+import { boundary } from "../../lib/store.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
-const TASK_THREAD_PREFIX = "Codex Companion Task";
-const REVIEW_THREAD_PREFIX = "Codex Companion Review";
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
@@ -141,11 +140,6 @@ function looksLikeVerificationCommand(command) {
   );
 }
 
-function buildTaskThreadName(prompt) {
-  const excerpt = shorten(prompt, 56);
-  return excerpt ? `${TASK_THREAD_PREFIX}: ${excerpt}` : TASK_THREAD_PREFIX;
-}
-
 function extractThreadId(message) {
   return message?.params?.threadId ?? null;
 }
@@ -158,18 +152,6 @@ function extractTurnId(message) {
     return message.params.turn.id;
   }
   return null;
-}
-
-function collectTouchedFiles(fileChanges) {
-  const paths = new Set();
-  for (const fileChange of fileChanges) {
-    for (const change of fileChange.changes ?? []) {
-      if (change.path) {
-        paths.add(change.path);
-      }
-    }
-  }
-  return [...paths];
 }
 
 function normalizeReasoningText(text) {
@@ -612,215 +594,43 @@ function readTurnIdleTimeoutMs() {
   return /^\d+$/.test(raw) ? Math.min(Number(raw), 2 ** 31 - 1) : DEFAULT_TURN_IDLE_TIMEOUT_MS;
 }
 
-const MESSAGE_INBOX_POLL_MS = 500;
-
-async function captureTurn(client, threadId, startRequest, options = {}) {
-  const state = createTurnCaptureState(threadId, options);
-  const previousHandler = client.notificationHandler;
-  const idleTimeoutMs = options.idleTimeoutMs ?? readTurnIdleTimeoutMs();
-  let idleTimer = null;
-  const inbox = options.messageInbox ?? null;
-  const sentMessages = new Map();
-  let inboxTimer = null;
-  let inboxBusy = false;
-
-  function reportMessage(id, outcome) {
-    try {
-      inbox.report(id, outcome);
-    } catch {
-      // The sender reads a missing outcome as not confirmed.
-    }
-  }
-
-  // A queued message joins the running turn through turn/steer. Codex applies it at its next
-  // step and then emits a userMessage item carrying the message id as its clientId; only that
-  // item confirms the message. A rejected steer is retried once with the current turn id. Codex
-  // answers "no active turn to steer" once the turn has ended, which is reported as turn-ended.
-  async function steerTurn(queued) {
-    let lastError = null;
-    let turnEnded = false;
-    for (let attempt = 0; attempt < 2 && !state.completed && !turnEnded; attempt += 1) {
-      const expectedTurnId = state.turnId;
-      sentMessages.set(queued.id, queued);
-      try {
-        await client.request("turn/steer", {
-          threadId: state.threadId,
-          expectedTurnId,
-          clientUserMessageId: queued.id,
-          input: buildTurnInput(queued.text)
-        });
-        if (sentMessages.has(queued.id)) {
-          reportMessage(queued.id, { status: "sent", turnId: expectedTurnId });
-        }
-        emitProgress(state.onProgress, `Message sent to the running turn: ${shorten(queued.text, 96)}`);
-        return;
-      } catch (error) {
-        sentMessages.delete(queued.id);
-        lastError = error;
-        turnEnded = /no active turn/i.test(String(error?.message ?? ""));
-      }
-    }
-    reportMessage(
-      queued.id,
-      state.completed || turnEnded ? { status: "turn-ended" } : { status: "failed", error: lastError?.message ?? "turn/steer failed." }
-    );
-  }
-
-  async function deliverQueuedMessages() {
-    if (!inbox || inboxBusy || state.completed || !state.turnId) {
-      return;
-    }
-    inboxBusy = true;
-    try {
-      let queued = [];
-      try {
-        queued = inbox.take();
-      } catch {
-        queued = [];
-      }
-      for (const message of queued) {
-        await steerTurn(message);
-      }
-    } finally {
-      inboxBusy = false;
-    }
-  }
-
-  function confirmMessage(item) {
-    const text = (Array.isArray(item.content) ? item.content : [])
-      .map((part) => (typeof part?.text === "string" ? part.text : ""))
-      .join("")
-      .trim();
-    // An item with a client id confirms only the message sent under that id; text matching
-    // applies only to items without one.
-    const match = item.clientId
-      ? sentMessages.get(item.clientId)
-      : [...sentMessages.values()].find((message) => message.text.trim() === text);
-    if (!match) {
-      return;
-    }
-    sentMessages.delete(match.id);
-    reportMessage(match.id, { status: "applied", turnId: state.turnId });
-    emitProgress(state.onProgress, `Codex received the message: ${shorten(match.text, 96)}`);
-  }
-
-  // When Codex stops sending events without finishing the turn, the turn is interrupted and
-  // completed as failed, keeping the messages it produced.
-  function armIdleTimer() {
-    clearTimeout(idleTimer);
-    if (idleTimeoutMs <= 0 || state.completed || !state.turnId) {
-      return;
-    }
-    idleTimer = setTimeout(() => {
-      if (state.completed) {
-        return;
-      }
-      const seconds = Math.round(idleTimeoutMs / 1000);
-      const message = `Codex sent no events for ${seconds} s, so the turn was stopped. Its output so far is kept.`;
-      state.error = { message };
-      emitProgress(state.onProgress, message, "failed");
-      client.request("turn/interrupt", { threadId: state.threadId, turnId: state.turnId }).catch(() => {});
-      completeTurn(state, { id: state.turnId, status: "failed" });
-    }, idleTimeoutMs);
-    idleTimer.unref?.();
-  }
-
-  // The client keeps reading lines after a handler error, so an error here fails the turn
-  // instead of leaving it waiting for an event that was already handled.
-  client.setNotificationHandler((message) => {
-    try {
-      handleTurnNotification(message);
-    } catch (error) {
-      if (!state.completed) {
-        state.completed = true;
-        clearCompletionTimer(state);
-        state.rejectCompletion(error);
-      }
-    }
-  });
-
-  function handleTurnNotification(message) {
-    if (!state.turnId) {
-      state.bufferedNotifications.push(message);
-      return;
-    }
-
-    if (message.method === "thread/started" || message.method === "thread/name/updated") {
-      applyTurnNotification(state, message);
-      return;
-    }
-
-    if (!belongsToTurn(state, message)) {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-        return;
-    }
-
-    applyTurnNotification(state, message);
-    if (
-      inbox &&
-      (message.method === "item/started" || message.method === "item/completed") &&
-      message.params?.item?.type === "userMessage"
-    ) {
-      confirmMessage(message.params.item);
-    }
-    armIdleTimer();
-  }
-
-  try {
-    const response = await startRequest();
-    options.onResponse?.(response, state);
-    state.turnId = response.turn?.id ?? null;
-    if (state.turnId) {
-      state.threadTurnIds.set(state.threadId, state.turnId);
-    }
-    for (const message of state.bufferedNotifications) {
-      if (belongsToTurn(state, message)) {
-        applyTurnNotification(state, message);
-      } else {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-      }
-    }
-    state.bufferedNotifications.length = 0;
-
-    if (response.turn?.status && response.turn.status !== "inProgress") {
-      completeTurn(state, response.turn);
-    }
-    armIdleTimer();
-    if (inbox && !state.completed) {
-      void deliverQueuedMessages();
-      inboxTimer = setInterval(() => void deliverQueuedMessages(), MESSAGE_INBOX_POLL_MS);
-      inboxTimer.unref?.();
-    }
-
-    // An app server that exits before the turn completes fails the turn with the exit reason.
-    client.exitPromise?.then(() => {
-      if (!state.completed) {
-        state.completed = true;
-        state.rejectCompletion(client.exitError ?? new Error("codex app-server connection closed before the turn completed."));
-      }
-    });
-    return await state.completion;
-  } finally {
-    clearInterval(inboxTimer);
-    for (const id of sentMessages.keys()) {
-      reportMessage(id, { status: "unconfirmed" });
-    }
-    clearTimeout(idleTimer);
-    clearCompletionTimer(state);
-    client.setNotificationHandler(previousHandler ?? null);
-  }
-}
-
 async function withAppServer(cwd, fn) {
   const client = await CodexAppServerClient.connect(cwd);
   try {
     return await fn(client);
   } finally {
     await client.close();
+  }
+}
+
+// How long a short-lived app server may take to exit by itself after its input ended.
+const SHORT_LIVED_EXIT_MS = 2000;
+// The time the stop of a short-lived app server that did not exit by itself may take.
+const SHORT_LIVED_STOP_MS = 10000;
+
+/**
+ * Runs `fn(client)` on an app server of its own, for a short exchange such as an auth check or a
+ * rate-limit read. When `fn` settles the app server's input is ended; if it is still running 2
+ * seconds later, its tree is stopped through the ChildProcess this call holds, so the stop cannot
+ * reach another process that took its id. Resolves or rejects as `fn` did.
+ */
+export async function withShortLivedAppServer(cwd, fn, { env = undefined } = {}) {
+  const { client, child } = await spawnAppServer(cwd, { env });
+  try {
+    return await fn(client);
+  } finally {
+    // The exit that follows is the one asked for here, so the client reports no error for it.
+    client.closeStarted = true;
+    client.closed = true;
+    try {
+      child.stdin.end();
+    } catch {
+      // An input that already failed cannot be ended; the stop below still applies.
+    }
+    if (!(await client.waitForProcessExit(SHORT_LIVED_EXIT_MS))) {
+      await stopHeldTree(child, { deadline: performance.now() + SHORT_LIVED_STOP_MS });
+      await client.waitForProcessExit(SHORT_LIVED_EXIT_MS);
+    }
   }
 }
 
@@ -962,32 +772,6 @@ async function requestExternalAgentSessionImport(client, params) {
     clearTimeout(timeout);
     client.setNotificationHandler(previousHandler ?? null);
   }
-}
-
-async function startThread(client, cwd, options = {}) {
-  const response = await client.request("thread/start", buildThreadParams(cwd, options));
-  const threadId = response.thread.id;
-  if (options.threadName) {
-    try {
-      await client.request("thread/name/set", { threadId, name: options.threadName });
-    } catch (err) {
-      // Only suppress "unknown variant/method" errors from older CLI versions
-      // that don't support thread/name/set. Rethrow auth, network, or server errors.
-      const msg = String(err?.message ?? err ?? "");
-      if (!msg.includes("unknown variant") && !msg.includes("unknown method")) {
-        throw err;
-      }
-    }
-  }
-  return response;
-}
-
-async function resumeThread(client, threadId, cwd, options = {}) {
-  return client.request("thread/resume", buildResumeParams(threadId, cwd, options));
-}
-
-function buildResultStatus(turnState) {
-  return turnState.finalTurn?.status === "completed" ? 0 : 1;
 }
 
 const BUILTIN_PROVIDER_LABELS = new Map([
@@ -1169,21 +953,21 @@ export async function getCodexAuthStatus(cwd, options = {}) {
     };
   }
 
-  let client = null;
   try {
-    client = await CodexAppServerClient.connect(cwd, { env: options.env });
-    const status = await getCodexAuthStatusFromClient(client, cwd);
-    return { ...status, userAgent: client.serverInfo?.userAgent ?? null };
+    return await withShortLivedAppServer(
+      cwd,
+      async (client) => {
+        const status = await getCodexAuthStatusFromClient(client, cwd);
+        return { ...status, userAgent: client.serverInfo?.userAgent ?? null };
+      },
+      { env: options.env }
+    );
   } catch (error) {
     return buildAuthStatus({
       loggedIn: false,
       detail: error instanceof Error ? error.message : String(error),
       source: "app-server"
     });
-  } finally {
-    if (client) {
-      await client.close().catch(() => {});
-    }
   }
 }
 
@@ -1192,77 +976,7 @@ export async function readCodexRateLimits(cwd) {
   if (!availability.available) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/agent:codex-setup`.");
   }
-  const client = await CodexAppServerClient.connect(cwd);
-  try {
-    return await client.request("account/rateLimits/read", {});
-  } finally {
-    await client.close().catch(() => {});
-  }
-}
-
-export async function runAppServerReview(cwd, options = {}) {
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/agent:codex-setup`.");
-  }
-
-  return withAppServer(cwd, async (client) => {
-    emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
-    // review/start takes no effort parameter, so the effort is set on the review's thread.
-    const thread = await startThread(client, cwd, {
-      model: options.model,
-      effort: options.effort,
-      sandbox: "read-only",
-      ephemeral: true,
-      threadName: options.threadName
-    });
-    const warning = announceThreadSelection(
-      thread,
-      { model: options.model ?? null, effort: options.effort ?? null },
-      options.onThreadReady,
-      options.onProgress
-    );
-    const sourceThreadId = thread.thread.id;
-    emitProgress(options.onProgress, `Thread ready (${sourceThreadId}).`, "starting", {
-      threadId: sourceThreadId
-    });
-    const delivery = options.delivery ?? "inline";
-
-    const turnState = await captureTurn(
-      client,
-      sourceThreadId,
-      () =>
-        client.request("review/start", {
-          threadId: sourceThreadId,
-          delivery,
-          target: options.target
-        }),
-      {
-        onProgress: options.onProgress,
-        onResponse(response, state) {
-          if (response.reviewThreadId) {
-            state.threadIds.add(response.reviewThreadId);
-            if (delivery === "detached") {
-              state.threadId = response.reviewThreadId;
-            }
-          }
-        }
-      }
-    );
-
-    return {
-      status: buildResultStatus(turnState),
-      threadId: turnState.threadId,
-      sourceThreadId,
-      turnId: turnState.turnId,
-      reviewText: turnState.reviewText,
-      reasoningSummary: turnState.reasoningSummary,
-      turn: turnState.finalTurn,
-      error: turnState.error,
-      stderr: cleanCodexStderr(client.stderr),
-      warnings: warning ? [warning] : []
-    };
-  });
+  return withShortLivedAppServer(cwd, (client) => client.request("account/rateLimits/read", {}));
 }
 
 export async function importExternalAgentSession(cwd, options = {}) {
@@ -1312,8 +1026,9 @@ export async function importExternalAgentSession(cwd, options = {}) {
   });
 }
 
-// Codex answers thread/read for a thread it does not know with an error that says so.
-const UNKNOWN_THREAD_ERROR = /unknown thread|thread not found|no thread|not found|does not exist|no rollout/i;
+// Codex answers thread/read for a thread it does not know with an error that says so. Codex
+// 0.169.0 answers "thread not loaded: <id>"; the other forms cover earlier and later wording.
+const UNKNOWN_THREAD_ERROR = /thread not loaded|unknown thread|thread not found|no thread|not found|does not exist|no rollout/i;
 
 /**
  * Whether Codex still has the thread `threadId`, checked with thread/read. An error that says the
@@ -1387,125 +1102,6 @@ export async function injectThreadPointer(cwd, threadId, text) {
   });
 }
 
-export async function runAppServerTurn(cwd, options = {}) {
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/agent:codex-setup`.");
-  }
-
-  // The prompt is checked first, so an empty one neither starts nor resumes a thread.
-  const prompt = options.prompt?.trim() || options.defaultPrompt || "";
-  if (!prompt) {
-    throw new Error("A prompt is required for this Codex run.");
-  }
-
-  // The app server is the repository's; the thread can run in another directory, such as a worktree.
-  const threadCwd = options.threadCwd ?? cwd;
-  return withAppServer(cwd, async (client) => {
-    const sent = { model: options.model ?? null, effort: options.effort ?? null };
-    // turn/start sends the same model and effort, and a value it sends overrides the thread's,
-    // so the turn runs on a sent value and, where none was sent, on the one the thread reports.
-    const onThreadReady = options.onThreadReady
-      ? (reported) =>
-          options.onThreadReady({
-            ...reported,
-            ...(sent.model ? { model: sent.model } : {}),
-            ...(sent.effort ? { effort: sent.effort } : {})
-          })
-      : null;
-    let threadId;
-    let warning;
-
-    if (options.resumeThreadId) {
-      emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
-      const response = await resumeThread(client, options.resumeThreadId, threadCwd, {
-        model: options.model,
-        effort: options.effort,
-        sandbox: options.sandbox,
-        ephemeral: false
-      });
-      warning = announceThreadSelection(response, sent, onThreadReady, options.onProgress);
-      threadId = response.thread.id;
-    } else {
-      emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
-      const response = await startThread(client, threadCwd, {
-        model: options.model,
-        effort: options.effort,
-        sandbox: options.sandbox,
-        ephemeral: options.persistThread ? false : true,
-        threadName: options.persistThread ? options.threadName : options.threadName ?? null
-      });
-      warning = announceThreadSelection(response, sent, onThreadReady, options.onProgress);
-      threadId = response.thread.id;
-    }
-
-    emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", {
-      threadId
-    });
-
-    const turnState = await captureTurn(
-      client,
-      threadId,
-      () =>
-        client.request("turn/start", {
-          threadId,
-          input: buildTurnInput(prompt),
-          model: options.model ?? null,
-          effort: options.effort ?? null,
-          outputSchema: options.outputSchema ?? null
-        }),
-      { onProgress: options.onProgress, messageInbox: options.messageInbox ?? null }
-    );
-
-    return {
-      status: buildResultStatus(turnState),
-      threadId,
-      turnId: turnState.turnId,
-      finalMessage: turnState.lastAgentMessage,
-      reasoningSummary: turnState.reasoningSummary,
-      turn: turnState.finalTurn,
-      error: turnState.error,
-      stderr: cleanCodexStderr(client.stderr),
-      fileChanges: turnState.fileChanges,
-      touchedFiles: collectTouchedFiles(turnState.fileChanges),
-      commandExecutions: turnState.commandExecutions,
-      warnings: warning ? [warning] : []
-    };
-  });
-}
-
-export async function findLatestTaskThread(cwd) {
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/agent:codex-setup`.");
-  }
-
-  return withAppServer(cwd, async (client) => {
-    const response = await client.request("thread/list", {
-      cwd,
-      limit: 20,
-      sortKey: "updated_at",
-      sourceKinds: ["appServer"],
-      searchTerm: TASK_THREAD_PREFIX
-    });
-
-    return (
-      response.data.find((thread) => typeof thread.name === "string" && thread.name.startsWith(TASK_THREAD_PREFIX)) ??
-      null
-    );
-  });
-}
-
-export function buildPersistentTaskThreadName(prompt) {
-  return buildTaskThreadName(prompt);
-}
-
-/** The name of a schema-bound review thread, which Codex keeps so the review can be continued. */
-export function buildReviewThreadName(description) {
-  const excerpt = shorten(description, 56);
-  return excerpt ? `${REVIEW_THREAD_PREFIX}: ${excerpt}` : REVIEW_THREAD_PREFIX;
-}
-
 export function parseStructuredOutput(rawOutput, fallback = {}) {
   if (!rawOutput) {
     return {
@@ -1537,4 +1133,344 @@ export function readOutputSchema(schemaPath) {
   return readJsonFile(schemaPath);
 }
 
-export { DEFAULT_CONTINUE_PROMPT, TASK_THREAD_PREFIX };
+// ---------------------------------------------------------------------------------------------
+// The Codex driver of the job store worker (see "The provider driver contract" in
+// lib/tracked-jobs.mjs). The worker owns every store write; the driver only talks to its own app
+// server and reports what happened.
+
+// The version a Codex user agent names, such as "codex_cli_rs/0.169.0 (...)".
+function versionFromUserAgent(userAgent) {
+  const match = /(\d+\.\d+\.\d+)/.exec(String(userAgent ?? ""));
+  return match ? match[1] : null;
+}
+
+// The id of a turn a resumed thread reports as still running, or null.
+function turnInProgressOf(thread) {
+  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+  const running = turns.filter((turn) => turn?.status === "inProgress" || turn?.status === "in_progress");
+  return running.length > 0 ? (running.at(-1).id ?? null) : null;
+}
+
+function errorText(error) {
+  if (!error) {
+    return null;
+  }
+  return typeof error === "string" ? error : (error.message ?? JSON.stringify(error));
+}
+
+// The answer a finished turn gives the worker. An interrupted turn keeps the output it produced.
+// With `requireJson` (a schema-bound review), an answer that is not valid JSON fails the turn and
+// keeps its text, so no hand-off reads it as a finished review.
+function turnAnswer(state, outputSchema, { requireJson = false } = {}) {
+  const status = state.finalTurn?.status ?? "completed";
+  // A native review's answer is the reviewer's text; a turn's is its last agent message.
+  const text = state.reviewText || state.lastAgentMessage || "";
+  if (status === "failed") {
+    return { status: "failed", text, json: null, error: errorText(state.finalTurn?.error ?? state.error) ?? "the Codex turn failed" };
+  }
+  let json = null;
+  if (outputSchema && text) {
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = null;
+    }
+  }
+  if (requireJson && outputSchema && json === null) {
+    return { status: "failed", text, json: null, error: "Codex did not return valid structured JSON." };
+  }
+  return { status: "answer", text, json, error: null };
+}
+
+// Writes one capture progress event to the job log through the worker's `log`: its message as a
+// line and, when it has one, its titled block below it.
+function logProgress(ctx, event) {
+  if (!ctx?.log || !event) {
+    return;
+  }
+  const message = typeof event === "string" ? event : String(event.message ?? "");
+  if (message.trim()) {
+    ctx.log(message);
+  }
+  if (typeof event === "object" && event.logTitle && event.logBody) {
+    ctx.log(`${event.logTitle}\n${String(event.logBody).trimEnd()}`);
+  }
+}
+
+/**
+ * The driver that runs one Codex job in a worker: its own app server (leading its own process
+ * group on Linux), `thread/start` or `thread/resume`, `turn/start` with the message's client id,
+ * steering into the open turn, interrupts, and the thread history for messages that may have been
+ * delivered. `job` may be omitted; the worker passes the job row in each call's context.
+ */
+export function createCodexDriver(job = null, { env = process.env } = {}) {
+  let client = null;
+  let child = null;
+  let threadId = null;
+  let turnId = null;
+  let capture = null;
+  let resolveTurn = null;
+  let outputSchema = null;
+  let context = null;
+  let idleTimer = null;
+  let startAnswered = false;
+  let selectionWarning = null;
+  let handshakeDone = false;
+  const idleTimeoutMs = readTurnIdleTimeoutMs();
+  const previousTurns = new Map();
+
+  const request = (method, params) => {
+    boundary("provider-request");
+    return client.request(method, params);
+  };
+
+  // When Codex sends no event for the idle limit while the turn runs, the turn is interrupted and
+  // ends failed, keeping the output it produced.
+  const armIdleTimer = () => {
+    clearTimeout(idleTimer);
+    if (idleTimeoutMs <= 0 || !capture || capture.completed || !turnId) {
+      return;
+    }
+    idleTimer = setTimeout(() => {
+      if (!capture || capture.completed) {
+        return;
+      }
+      const seconds = Math.round(idleTimeoutMs / 1000);
+      capture.error = { message: `Codex sent no events for ${seconds} s, so the turn was stopped. Its output so far is kept.` };
+      request("turn/interrupt", { threadId, turnId }).catch(() => {});
+      completeTurn(capture, { id: turnId, status: "failed", error: capture.error });
+      finishTurn();
+    }, idleTimeoutMs);
+    idleTimer.unref?.();
+  };
+
+  const finishTurn = () => {
+    if (capture?.completed) {
+      clearTimeout(idleTimer);
+    }
+    if (resolveTurn && capture?.completed) {
+      const resolve = resolveTurn;
+      resolveTurn = null;
+      const review = context?.job ? parseJobRequest(context.job).review : null;
+      const answer = turnAnswer(capture, outputSchema, { requireJson: Boolean(review && !review.native) });
+      // The model warning leads the stored output, so result shows it; the last line stays the
+      // agent's, where a question is read from.
+      resolve(selectionWarning ? { ...answer, text: answer.text ? `${selectionWarning}\n\n${answer.text}` : selectionWarning } : answer);
+    }
+  };
+
+  const onNotification = (message) => {
+    const item = message.params?.item;
+    if ((message.method === "item/started" || message.method === "item/completed") && item?.type === "userMessage" && item.clientId) {
+      context?.onReceipt?.(item.clientId);
+    }
+    if (message.method === "turn/completed") {
+      const endedId = message.params?.turn?.id ?? null;
+      const waiter = endedId ? previousTurns.get(endedId) : null;
+      if (waiter) {
+        previousTurns.delete(endedId);
+        waiter();
+        return;
+      }
+      if (turnId && endedId && endedId !== turnId && (message.params?.threadId ?? null) === threadId) {
+        return;
+      }
+    }
+    if (capture && !capture.completed) {
+      // Until the start request is answered the turn id is unknown, so notifications wait.
+      if (!startAnswered) {
+        capture.bufferedNotifications.push(message);
+        return;
+      }
+      applyCaptured(message);
+    }
+  };
+
+  // Applies one notification to the turn's capture when it belongs to this turn or one of its
+  // subagents; thread starts and names are always kept, for the labels of later subagents.
+  const applyCaptured = (message) => {
+    if (!capture || capture.completed) {
+      return;
+    }
+    if (message.method !== "thread/started" && message.method !== "thread/name/updated" && !belongsToTurn(capture, message)) {
+      return;
+    }
+    applyTurnNotification(capture, message);
+    armIdleTimer();
+    finishTurn();
+  };
+
+  const driver = {
+    id: "codex",
+    resumeMethod: "thread",
+    capabilities: Object.freeze({ steer: true, interrupt: true, history: true, ownExit: false }),
+    turnEnded: null,
+
+    async spawn(ctx) {
+      context = ctx;
+      // The handshake waits for prepare, so the worker holds the child, and can stop it, first.
+      const started = await spawnAppServer(ctx.cwd ?? ctx.job?.cwd ?? job?.cwd, { env, ownProcessGroup: true, handshake: false });
+      client = started.client;
+      child = started.child;
+      client.setNotificationHandler(onNotification);
+      const exited = new Promise((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          resolve({ code: child.exitCode, signal: child.signalCode, at: Date.now() });
+          return;
+        }
+        child.once("exit", (code, signal) => resolve({ code, signal, at: Date.now() }));
+      });
+      return { pid: child.pid, exited, child };
+    },
+
+    async prepare(ctx) {
+      context = ctx;
+      if (!handshakeDone) {
+        boundary("provider-request");
+        await client.handshake();
+        handshakeDone = true;
+      }
+      const row = ctx.job;
+      const requestFields = parseJobRequest(row);
+      const options = { model: row.model ?? requestFields.model ?? null, effort: requestFields.effort ?? null, sandbox: requestFields.sandbox ?? undefined };
+      // The user agent names the Codex version; when it does not, `codex --version` does.
+      const version =
+        versionFromUserAgent(client.serverInfo?.userAgent) ?? versionFromUserAgent(binaryAvailable("codex", ["--version"], { cwd: row.cwd, env }).detail);
+      const cwd = requestFields.worktree?.path ?? row.cwd;
+      // A thread that reports another model or effort than the one sent gets one warning, at the top
+      // of the turn's answer: the worker writes that answer to the job log and stores it as the
+      // result. Logging it here as well would print it twice in a foreground run.
+      const sent = { model: options.model, effort: options.effort };
+      const announce = (response) => {
+        selectionWarning = announceThreadSelection(response, sent, null);
+      };
+      if (row.thread_id) {
+        const response = await request("thread/resume", buildResumeParams(row.thread_id, cwd, options));
+        threadId = response.thread?.id ?? row.thread_id;
+        announce(response);
+        return { threadId, turnInProgress: turnInProgressOf(response.thread), version };
+      }
+      const response = await request("thread/start", buildThreadParams(cwd, { ...options, ephemeral: Boolean(row.ephemeral) }));
+      threadId = response.thread.id;
+      announce(response);
+      return { threadId, turnInProgress: null, version };
+    },
+
+    async start(ctx, { text, clientId, outputSchema: schema }) {
+      context = ctx;
+      outputSchema = schema ?? null;
+      startAnswered = false;
+      // The turn's progress lines, reasoning summaries and messages go to the job log.
+      capture = createTurnCaptureState(threadId, { onProgress: (event) => logProgress(ctx, event) });
+      // A completion the capture infers on its own timer (the main thread answered and its subagents
+      // drained, but no turn/completed came) ends the turn too.
+      capture.completion.then(finishTurn, () => {});
+      driver.turnEnded = new Promise((resolve) => {
+        resolveTurn = resolve;
+      });
+      const requestFields = parseJobRequest(ctx.job);
+      let response;
+      try {
+        response = requestFields.review?.native
+          ? // Codex's built-in reviewer runs on the job's own single-use thread.
+            await request("review/start", { threadId, delivery: "inline", target: requestFields.review.nativeTarget })
+          : await request("turn/start", {
+              threadId,
+              input: buildTurnInput(text),
+              clientUserMessageId: clientId,
+              model: ctx.job.model ?? requestFields.model ?? null,
+              effort: requestFields.effort ?? null,
+              outputSchema
+            });
+      } catch {
+        return "rejected";
+      }
+      turnId = response.turn?.id ?? null;
+      if (turnId) {
+        capture.turnId = turnId;
+        capture.threadTurnIds.set(threadId, turnId);
+      }
+      startAnswered = true;
+      for (const message of capture.bufferedNotifications.splice(0)) {
+        applyCaptured(message);
+      }
+      ctx.onTurn(turnId);
+      ctx.onStarted();
+      armIdleTimer();
+      finishTurn();
+      return "written";
+    },
+
+    async steer(ctx, { text, clientId }) {
+      context = ctx;
+      try {
+        await request("turn/steer", { threadId, expectedTurnId: turnId, input: buildTurnInput(text), clientUserMessageId: clientId });
+        return "accepted";
+      } catch (error) {
+        return /no active turn|turn (has )?ended|not (the )?active|already (completed|ended)/i.test(String(error?.message ?? error)) ? "turn-ended" : "rejected";
+      }
+    },
+
+    async interrupt() {
+      if (threadId && turnId) {
+        await request("turn/interrupt", { threadId, turnId });
+      }
+    },
+
+    async interruptPrevious(ctx, previousTurnId, timeoutMs) {
+      const ended = new Promise((resolve) => previousTurns.set(previousTurnId, () => resolve("ended")));
+      let timer;
+      const timedOut = new Promise((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), timeoutMs);
+      });
+      // A turn that already ended answers with an error; its end notification still decides. An
+      // interrupt that is never answered is waited for no longer than the turn's end.
+      const interrupted = (async () => request("turn/interrupt", { threadId, turnId: previousTurnId }))().catch(() => {});
+      await Promise.race([interrupted, timedOut]);
+      const outcome = await Promise.race([ended, timedOut]);
+      clearTimeout(timer);
+      previousTurns.delete(previousTurnId);
+      return outcome;
+    },
+
+    async historyHas(ctx, clientIds) {
+      const wanted = new Set(clientIds);
+      const found = new Set();
+      let cursor = null;
+      for (let page = 0; page < 1000; page += 1) {
+        const response = await request("thread/turns/list", { threadId, cursor, limit: 50 });
+        for (const turn of response.data ?? []) {
+          for (const entry of turn.items ?? []) {
+            if (entry?.type === "userMessage" && wanted.has(entry.clientId)) {
+              found.add(entry.clientId);
+            }
+          }
+        }
+        cursor = response.nextCursor ?? null;
+        if (!cursor || found.size === wanted.size) {
+          break;
+        }
+      }
+      return found;
+    },
+
+    endInput() {
+      try {
+        child?.stdin.end();
+      } catch {
+        // An input that already failed cannot be ended.
+      }
+    }
+  };
+  return driver;
+}
+
+function parseJobRequest(row) {
+  try {
+    return JSON.parse(row?.request_json ?? "{}") ?? {};
+  } catch {
+    return {};
+  }
+}
+
+export { DEFAULT_CONTINUE_PROMPT };

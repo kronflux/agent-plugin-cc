@@ -1,16 +1,15 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import process from "node:process";
 
 import { createWorktree, removeWorktree } from "./git.mjs";
-import { generateJobId, readCohort, readJobView, recordLaunchAttempt, resolveStateDir } from "./state.mjs";
+import { interpolateTemplate, loadPromptTemplate } from "./prompts.mjs";
+import { readCohort, readJobView, recordLaunchAttempt, resolveStateDir } from "./state.mjs";
 import { boundary, NODE_LAUNCH_FLAGS, wallNow } from "./store.mjs";
-import { createJobRecord } from "./tracked-jobs.mjs";
 
-// How long send waits for the agent to confirm a message by default, and how long a provider's
-// companion may take to start a follow-up turn.
+// How long send waits for the agent to confirm a message by default.
 export const DEFAULT_SEND_TIMEOUT_MS = 60000;
 
 export function shorten(text, limit = 96) {
@@ -22,30 +21,6 @@ export function shorten(text, limit = 96) {
     return normalized;
   }
   return `${normalized.slice(0, limit - 3)}...`;
-}
-
-export function firstMeaningfulLine(text, fallback) {
-  const line = String(text ?? "")
-    .split(/\r?\n/)
-    .map((value) => value.trim())
-    .find(Boolean);
-  return line ?? fallback;
-}
-
-/** Creates the record of a new job that `provider` runs. Extra fields are kept on the record. */
-export function createProviderJob(provider, { prefix, kind, kindLabel, title, workspaceRoot, jobClass, summary, write = false, ...extra }) {
-  return createJobRecord({
-    id: generateJobId(prefix),
-    provider: provider.id,
-    kind,
-    kindLabel,
-    title,
-    workspaceRoot,
-    jobClass,
-    summary,
-    write,
-    ...extra
-  });
 }
 
 // A worktree job gets its own checkout of HEAD under the state directory, on the new branch
@@ -67,25 +42,6 @@ export function discardLaunchWorktree(workspaceRoot, { worktreePath, worktreeBra
     const message = error == null ? "" : `${error instanceof Error ? error.message : String(error)} `;
     return new Error(`${message}The worktree ${worktreePath} (branch ${worktreeBranch}) could not be removed: ${cleanupError.message}`);
   }
-}
-
-// newWorktree marks a worktree created for this request, which a failed start removes; a
-// follow-up turn in an earlier job's worktree leaves it in place.
-export function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, resumeThreadId = null, jobId, outputSchema = null, worktreePath = null, worktreeBranch = null, newWorktree = false }) {
-  return {
-    cwd,
-    model,
-    effort,
-    prompt,
-    write,
-    resumeLast,
-    resumeThreadId,
-    jobId,
-    outputSchema,
-    worktreePath,
-    worktreeBranch,
-    newWorktree: Boolean(worktreePath && newWorktree)
-  };
 }
 
 export const MANIFEST_FIELDS = new Set(["label", "prompt", "model", "effort", "write", "worktree"]);
@@ -211,38 +167,6 @@ export function extractQuestion({ text = "", json = null, allowQuestions = false
   return { question: null, json: output };
 }
 
-// Another provider's follow-up turn is started by that provider's companion as a new
-// background task on the same thread.
-export function startTurnWithProviderCompanion(cwd, provider, job, text, deps = { spawnSyncImpl: spawnSync }) {
-  const spawnSyncImpl = deps.spawnSyncImpl ?? spawnSync;
-  const label = provider.label;
-  const result = spawnSyncImpl(
-    process.execPath,
-    [provider.companionScript, "task", "--background", "--json", "--cwd", cwd, "--resume-thread", job.threadId, ...(job.write ? ["--write"] : []), "--", text],
-    { cwd, env: process.env, encoding: "utf8", windowsHide: true, timeout: DEFAULT_SEND_TIMEOUT_MS }
-  );
-  if (result.error?.code === "ETIMEDOUT" || result.signal) {
-    throw new Error(`${label} did not start the turn within ${Math.round(DEFAULT_SEND_TIMEOUT_MS / 1000)} s.`);
-  }
-  if (result.error) {
-    throw new Error(`${label} could not start the turn: ${result.error.message}`);
-  }
-  if (result.status !== 0) {
-    throw new Error(String(result.stderr || `${label} could not start the turn.`).trim());
-  }
-  let launched;
-  try {
-    launched = JSON.parse(result.stdout);
-  } catch {
-    throw new Error(`${label} started the turn but printed output that is not JSON: ${firstMeaningfulLine(result.stdout, "")}`);
-  }
-  const newJobId = launched?.jobId;
-  if (typeof newJobId !== "string" || !newJobId.trim()) {
-    throw new Error(`${label} printed no job id for the new turn.`);
-  }
-  return { status: "started", jobId: job.id, newJobId, threadId: job.threadId };
-}
-
 // ---------------------------------------------------------------------------------------------
 // Launching workers for queued store jobs
 
@@ -324,4 +248,119 @@ export async function launchEligible(store, stateDir, providerId, { deadline = u
     }
   }
   return launched;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Prompt and schema files of a task
+
+const SCHEMA_TYPES = new Set(["object", "array", "string", "number", "integer", "boolean", "null"]);
+
+/**
+ * The first shape error of an output schema, or null: the root is an object; `type`, when present,
+ * is one JSON Schema type name or an array of them; `required`, when present, is an array of
+ * strings; `properties`, when present, is an object whose values are objects.
+ */
+export function checkSchemaShape(schema) {
+  const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+  if (!isObject(schema)) {
+    return "the schema root must be a JSON object";
+  }
+  if (schema.type !== undefined) {
+    const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+    const unknown = types.find((type) => !SCHEMA_TYPES.has(type));
+    if (types.length === 0 || unknown !== undefined) {
+      return `"type" must name JSON Schema types, not ${JSON.stringify(unknown ?? schema.type)}`;
+    }
+  }
+  if (schema.required !== undefined && !(Array.isArray(schema.required) && schema.required.every((key) => typeof key === "string"))) {
+    return '"required" must be an array of property names';
+  }
+  if (schema.properties !== undefined && !(isObject(schema.properties) && Object.values(schema.properties).every(isObject))) {
+    return '"properties" must be an object of property schemas';
+  }
+  return null;
+}
+
+/**
+ * Reads a task's prompt file and output schema file, relative to `cwd`. The schema is checked by
+ * checkSchemaShape and, with `allowQuestions`, prepared for an optional question property; the
+ * returned copy is what the job stores, and the file itself is only read. An unreadable file,
+ * invalid JSON or a schema error throws `Error("<path>: <reason>")`.
+ */
+export function readTaskInputFiles(cwd, { promptFile = null, outputSchema = null, allowQuestions = false } = {}) {
+  const read = (file) => {
+    const full = path.resolve(cwd, String(file));
+    try {
+      return { full, text: fs.readFileSync(full, "utf8") };
+    } catch (error) {
+      throw new Error(`${full}: the file cannot be read (${error.code ?? error.message})`);
+    }
+  };
+  const prompt = promptFile ? read(promptFile).text : null;
+  if (!outputSchema) {
+    return { prompt, schema: null, schemaPath: null };
+  }
+  const { full, text } = read(outputSchema);
+  let schema;
+  try {
+    schema = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`${full}: the schema is not valid JSON (${error.message})`);
+  }
+  const shapeError = checkSchemaShape(schema);
+  if (shapeError) {
+    throw new Error(`${full}: ${shapeError}`);
+  }
+  if (!allowQuestions) {
+    return { prompt, schema, schemaPath: full };
+  }
+  try {
+    validateQuestionSchema(schema);
+  } catch (error) {
+    if (error instanceof QuestionSchemaError) {
+      throw new Error(`${full}: --allow-questions cannot be used with this schema: ${error.rule}`);
+    }
+    throw error;
+  }
+  return { prompt, schema: augmentSchemaForQuestions(schema), schemaPath: full };
+}
+
+// ---------------------------------------------------------------------------------------------
+// The review handoff of a session
+
+/**
+ * The prompt that asks a delegate to address the newest review of a session: the newest job of
+ * kind review, of any provider, requested by `sessionId`, with end state completed and stored
+ * output (text, else its structured result). Its output fills the review-handoff template of `rootDir`. Without such a job it throws,
+ * naming each provider's review command.
+ */
+export function buildSessionReviewHandoff(store, { sessionId, userRequest = "", rootDir }) {
+  const registry = requireModule("./providers.mjs");
+  const review = store.read((db) =>
+    db
+      .prepare(
+        `SELECT * FROM jobs WHERE kind = 'review' AND session_id IS ? AND end_state = 'completed'
+           AND ((result_text IS NOT NULL AND trim(result_text) <> '') OR result_json IS NOT NULL)
+           ORDER BY created_at DESC, id DESC LIMIT 1`
+      )
+      .get(sessionId ?? null)
+  );
+  if (!review) {
+    const commands = registry.listProviders().map((provider) => provider.reviewCommands.review);
+    throw new Error(`No finished review with output was found in this session. Run ${commands.join(" or ")} first.`);
+  }
+  let request = {};
+  try {
+    request = JSON.parse(review.request_json);
+  } catch {
+    request = {};
+  }
+  const userText = String(userRequest ?? "").trim();
+  return interpolateTemplate(loadPromptTemplate(rootDir, "review-handoff"), {
+    REVIEWER_LABEL: registry.getProvider(review.provider).label,
+    REVIEW_JOB_ID: review.id,
+    TARGET_LABEL: request.review?.targetLabel ?? "the reviewed changes",
+    REVIEW_OUTPUT: String(review.result_text ?? "").trim() || review.result_json,
+    USER_REQUEST: userText ? `Instructions from the user:\n${userText}` : ""
+  });
 }

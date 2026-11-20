@@ -2,36 +2,31 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { resolveCommandCwd, resolveCommandWorkspace, runForegroundCommand } from "../../../lib/companion-cli.mjs";
+import { outputCommandResult, resolveCommandCwd, resolveCommandWorkspace } from "../../../lib/companion-cli.mjs";
 import { collectReviewContext } from "../../../lib/git.mjs";
 import { resolveModelSelection } from "../../../lib/model-selection.mjs";
 import { renderNativeReviewResult, renderReviewResult } from "../../../lib/render.mjs";
 import {
   buildReviewPrompt,
-  enqueueBackgroundReview,
   parseReviewArguments,
-  resolveReviewStance,
   resolveReviewTarget
 } from "../../../lib/review-target.mjs";
-import { getConfig, upsertJob } from "../../../lib/state.mjs";
-import { createProviderJob, firstMeaningfulLine } from "../../../lib/task-launch.mjs";
-import { resolveWorkspaceRoot } from "../../../lib/workspace.mjs";
+import { readRequesterIdentity } from "../../../lib/host.mjs";
+import { getConfig } from "../../../lib/state.mjs";
 import { codexProvider } from "../index.mjs";
 import { KNOWN_REASONING_EFFORTS } from "../model-catalog.mjs";
+import { buildTaskJobFields, startStoreJob, waitStoreJob } from "./task.mjs";
 import {
-  buildReviewThreadName,
   ensureCodexAvailable,
   parseStructuredOutput,
-  readOutputSchema,
-  runAppServerReview,
-  runAppServerTurn
+  readOutputSchema
 } from "../runtime.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("../../../..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const EFFORT_USAGE = `<${KNOWN_REASONING_EFFORTS.join("|")}>`;
 
-export const usage = `review [--target auto|changes|project] [--path <path>]... [--stance peer|critical] [--base <ref>] [--scope auto|working-tree|branch] [--wait|--background] [--model <id|family|default|configured>] [--effort ${EFFORT_USAGE}] [--] [instructions]`;
+export const usage = `review [--target auto|changes|project] [--path <path>]... [--stance peer|critical] [--base <ref>] [--scope auto|working-tree|branch] [--wait|--background] [--json] [--label <name>] [--model <id|family|default|configured>] [--effort ${EFFORT_USAGE}] [--] [instructions]`;
 
 export function buildNativeReviewTarget(target) {
   if (target.mode === "working-tree") {
@@ -63,167 +58,70 @@ function reviewLabelFor(stance) {
   return stance === "critical" ? "Critical Review" : "Review";
 }
 
-// The job record keeps the model and effort Codex reports for the review's thread.
-function recordReportedSelection(workspaceRoot, jobId) {
-  if (!jobId) {
-    return null;
-  }
-  return (reported) =>
-    upsertJob(workspaceRoot, {
-      id: jobId,
-      ...(reported.model ? { model: reported.model } : {}),
-      ...(reported.effort ? { effort: reported.effort } : {})
-    });
-}
-
-/**
- * Runs one Codex review. `request.reviewTarget` is a `resolveReviewTarget` result; `stance`,
- * `instructions` and `native` say how it runs. A native review uses Codex's built-in reviewer
- * on an ephemeral thread; a schema-bound review runs a read-only turn on a persistent thread.
- */
-export async function executeReviewRun(request) {
-  ensureCodexAvailable(request.cwd);
-  const target =
-    request.reviewTarget ??
-    resolveReviewTarget(request.cwd, { target: request.target, paths: request.paths, base: request.base, scope: request.scope });
-  const stance = resolveReviewStance(request.stance);
-  const instructions = String(request.instructions ?? "").trim();
-  const native = request.native ?? usesNativeReview(target, stance, instructions);
-  const reviewLabel = reviewLabelFor(stance);
-  const jobTitle = `Codex ${reviewLabel}`;
-  const onThreadReady = recordReportedSelection(resolveWorkspaceRoot(request.cwd), request.jobId);
-
-  if (native) {
-    const result = await runAppServerReview(request.cwd, {
-      target: buildNativeReviewTarget(target.changes),
-      model: request.model,
-      effort: request.effort,
-      onThreadReady,
-      onProgress: request.onProgress
-    });
-    const payload = {
-      review: reviewLabel,
-      target: { ...target.changes, ...target },
-      threadId: result.threadId,
-      sourceThreadId: result.sourceThreadId,
-      ...(result.warnings?.length > 0 ? { notes: result.warnings } : {}),
-      codex: {
-        status: result.status,
-        stderr: result.stderr,
-        stdout: result.reviewText,
-        reasoning: result.reasoningSummary
-      }
-    };
-    const rendered = renderNativeReviewResult(
-      {
-        status: result.status,
-        stdout: result.reviewText,
-        stderr: result.stderr
-      },
-      { reviewLabel, targetLabel: target.label, reasoningSummary: result.reasoningSummary }
-    );
-
-    return {
-      exitStatus: result.status,
-      threadId: result.threadId,
-      turnId: result.turnId,
-      payload,
-      rendered,
-      summary: firstMeaningfulLine(result.reviewText, `${reviewLabel} completed.`),
-      jobTitle,
-      jobClass: "review",
-      targetLabel: target.label
-    };
-  }
-
-  const context = target.kind === "changes" ? collectReviewContext(request.cwd, target.changes, { paths: target.paths }) : null;
-  const prompt = buildReviewPrompt({
-    rootDir: ROOT_DIR,
-    providerLabel: codexProvider.label,
-    target,
-    stance,
-    instructions,
-    context
-  });
-  const result = await runAppServerTurn(context?.repoRoot ?? target.root, {
-    prompt,
-    model: request.model,
-    effort: request.effort,
-    onThreadReady,
-    sandbox: "read-only",
-    outputSchema: readOutputSchema(REVIEW_SCHEMA),
-    onProgress: request.onProgress,
-    persistThread: true,
-    threadName: buildReviewThreadName(`${reviewLabel} of ${target.label}`)
-  });
-  const parsed = parseStructuredOutput(result.finalMessage, {
-    status: result.status,
-    failureMessage: result.error?.message ?? result.stderr
-  });
-  const payload = {
-    review: reviewLabel,
-    target: { ...target.changes, ...target },
-    threadId: result.threadId,
-    context: context
-      ? {
-          repoRoot: context.repoRoot,
-          branch: context.branch,
-          summary: context.summary
-        }
-      : { root: target.root, paths: target.paths },
-    codex: {
-      status: result.status,
-      stderr: result.stderr,
-      stdout: result.finalMessage,
-      reasoning: result.reasoningSummary
-    },
-    result: parsed.parsed,
-    rawOutput: parsed.rawOutput,
-    parseError: parsed.parseError,
-    reasoningSummary: result.reasoningSummary,
-    ...(result.warnings?.length > 0 ? { notes: result.warnings } : {})
-  };
-
-  // A turn that ends without valid JSON is a failed review, so it is never handed off as findings.
-  return {
-    exitStatus: result.status !== 0 ? result.status : parsed.parsed ? 0 : 1,
-    threadId: result.threadId,
-    turnId: result.turnId,
-    payload,
-    rendered: renderReviewResult(parsed, {
-      reviewLabel,
-      targetLabel: target.label,
-      targetKind: target.kind,
-      reasoningSummary: result.reasoningSummary
-    }),
-    summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewLabel} finished.`),
-    jobTitle,
-    jobClass: "review",
-    targetLabel: target.label
-  };
-}
-
-export function getJobKindLabel(kind, jobClass) {
-  if (kind === "adversarial-review") {
-    return "adversarial-review";
-  }
-  return jobClass === "review" ? "review" : "rescue";
-}
-
 function printWarnings(selection) {
   for (const warning of selection.warnings ?? []) {
     process.stderr.write(`${warning}\n`);
   }
 }
 
+// Takes `--label <name>` and `--run-id <id>` (also written `--label=<name>`) out of the review
+// arguments; resolves to `{ argv, label, runId }`.
+function takeJobFlags(argv) {
+  const rest = [];
+  const found = { label: null, runId: null };
+  const names = { "--label": "label", "--run-id": "runId" };
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--") {
+      rest.push(...argv.slice(index));
+      break;
+    }
+    const equalsAt = token.indexOf("=");
+    const flag = equalsAt === -1 ? token : token.slice(0, equalsAt);
+    if (names[flag]) {
+      const value = equalsAt === -1 ? argv[index + 1] : token.slice(equalsAt + 1);
+      if (value === undefined) {
+        throw new Error(`Missing value for ${flag}`);
+      }
+      found[names[flag]] = value;
+      if (equalsAt === -1) {
+        index += 1;
+      }
+      continue;
+    }
+    rest.push(token);
+  }
+  return { argv: rest, ...found };
+}
+
+// The rendered result of a finished Codex review, read from its job row.
+function renderStoredReview(view, { reviewLabel, targetLabel, targetKind, native }) {
+  const row = view?.row ?? {};
+  const text = row.result_text ?? "";
+  const status = view?.state === "completed" ? 0 : 1;
+  if (native) {
+    return {
+      payload: { review: reviewLabel, threadId: row.thread_id ?? null, codex: { status, stdout: text } },
+      rendered: renderNativeReviewResult({ status, stdout: text, stderr: row.error ?? "" }, { reviewLabel, targetLabel, reasoningSummary: [] })
+    };
+  }
+  // The stored structured result is the review; the text may lead with a model warning.
+  const parsed = { ...parseStructuredOutput(row.result_json ?? text, { status, failureMessage: row.error ?? "" }), rawOutput: text };
+  return {
+    payload: { review: reviewLabel, threadId: row.thread_id ?? null, result: parsed.parsed, rawOutput: parsed.rawOutput, parseError: parsed.parseError },
+    rendered: renderReviewResult(parsed, { reviewLabel, targetLabel, targetKind, reasoningSummary: [] })
+  };
+}
+
 /**
- * Runs the review command in the foreground, or with --background as a job of the background
- * worker. The target, the stance and the model are resolved before the job is created, so a bad
- * value exits with no job record. The job record names the target, the paths,
- * the stance, whether the built-in reviewer runs, and the model and effort with their sources.
+ * Runs the review command as a job of the job store, in the foreground or with --background. The
+ * target, the stance and the model are resolved before the job is created, so a bad value exits
+ * with no job row. A native review runs the built-in Codex reviewer on a single-use thread; every
+ * other review is a turn bound to the review schema on a thread that can be continued.
  */
 export async function handleReviewCommand(argv) {
-  const { options, paths, stance, instructions, background } = parseReviewArguments(argv, { aliasMap: { m: "model" } });
+  const jobFlags = takeJobFlags(argv);
+  const { options, paths, stance, instructions, background } = parseReviewArguments(jobFlags.argv, { aliasMap: { m: "model" } });
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const target = resolveReviewTarget(cwd, { target: options.target, paths, base: options.base, scope: options.scope });
@@ -237,39 +135,52 @@ export async function handleReviewCommand(argv) {
     cwd
   });
   printWarnings(selection);
+  const context = !native && target.kind === "changes" ? collectReviewContext(cwd, target.changes, { paths: target.paths }) : null;
+  const prompt = native
+    ? `${reviewLabel} of ${target.label}`
+    : buildReviewPrompt({ rootDir: ROOT_DIR, providerLabel: codexProvider.label, target, stance, instructions, context });
+  const requester = await readRequesterIdentity();
+  const title = `Codex ${reviewLabel}`;
+  const built = buildTaskJobFields(
+    {
+      kind: "review",
+      title,
+      prompt,
+      write: false,
+      sandbox: "read-only",
+      model: selection.model,
+      effort: selection.effort,
+      modelSource: selection.modelSource,
+      effortSource: selection.effortSource,
+      outputSchema: native ? null : readOutputSchema(REVIEW_SCHEMA),
+      review: { target: target.kind, paths: target.paths, stance, native, nativeTarget: native ? buildNativeReviewTarget(target.changes) : null },
+      // A native review runs on a single-use thread that Codex does not keep, so it cannot be continued.
+      ephemeral: native,
+      background,
+      label: jobFlags.label,
+      runId: jobFlags.runId
+    },
+    { cwd: context?.repoRoot ?? cwd, requester }
+  );
+  const { jobId, stateDir } = await startStoreJob(cwd, built, { background, json: options.json, title });
+  if (!background) {
+    await waitStoredReview(stateDir, jobId, options.json, { reviewLabel, targetLabel: target.label, targetKind: target.kind, native });
+  }
+}
 
-  // A native review runs on a single-use thread that Codex does not keep, so no resume command
-  // applies to it; a schema-bound review's thread can be continued.
-  const job = createProviderJob(codexProvider, {
-    prefix: "review",
-    kind: "review",
-    kindLabel: getJobKindLabel("review", "review"),
-    title: `Codex ${reviewLabel}`,
-    workspaceRoot,
-    jobClass: "review",
-    summary: `${reviewLabel} ${target.label}`,
-    ephemeralThread: native,
-    review: { target: target.kind, paths: target.paths, stance, native },
-    model: selection.model,
-    effort: selection.effort,
-    modelSource: selection.modelSource,
-    effortSource: selection.effortSource
-  });
-  const request = {
-    cwd,
-    reviewTarget: target,
-    stance,
-    instructions,
-    native,
-    model: selection.model,
-    effort: selection.effort,
-    jobId: job.id
-  };
-  if (background) {
-    enqueueBackgroundReview(cwd, job, request, { workerScript: codexProvider.companionScript, json: options.json });
+async function waitStoredReview(stateDir, jobId, json, labels) {
+  const outcome = await waitStoreJob(stateDir, jobId, { json });
+  if (outcome.timedOut) {
+    process.stderr.write(`Job ${jobId} is still running; check /agent:status ${jobId}.\n`);
+    process.exitCode = 75;
     return;
   }
-  await runForegroundCommand(job, (progress) => executeReviewRun({ ...request, onProgress: progress }), { json: options.json });
+  const { payload, rendered } = renderStoredReview(outcome.view, labels);
+  const state = outcome.view?.state ?? "failed";
+  outputCommandResult({ ...payload, jobId, status: state }, rendered, json);
+  // A schema-bound review that ended without valid JSON is a failed review.
+  const parsedOk = labels.native || payload.result !== null;
+  process.exitCode = (state === "completed" || state === "waiting") && parsedOk ? 0 : 1;
 }
 
 export async function run(argv) {

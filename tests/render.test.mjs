@@ -1,13 +1,16 @@
 import test from "node:test";
+import { renderTaskResult } from "../plugins/agent/scripts/lib/render.mjs";
 import assert from "node:assert/strict";
 
 import {
   fenceFor,
-  renderJobStatusReport,
   renderNativeReviewResult,
   renderReviewResult,
-  renderStoredJobResult
+  renderStatusJson
 } from "../plugins/agent/scripts/lib/render.mjs";
+import { listJobViews } from "../plugins/agent/scripts/lib/state.mjs";
+import { openStore } from "../plugins/agent/scripts/lib/store.mjs";
+import { makeStoreDir, seedStore } from "./store-fixtures.mjs";
 import { renderSetupReport, renderUsageReport } from "../plugins/agent/scripts/providers/codex/render.mjs";
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
@@ -32,37 +35,6 @@ test("renderReviewResult degrades gracefully when JSON is missing required revie
   assert.match(output, /Codex returned JSON with an unexpected review shape\./);
   assert.match(output, /Missing array `findings`\./);
   assert.match(output, /Raw final message:/);
-});
-
-test("renderStoredJobResult prefers rendered output for structured review jobs", () => {
-  const output = renderStoredJobResult(
-    {
-      id: "review-123",
-      status: "completed",
-      title: "Codex Adversarial Review",
-      jobClass: "review",
-      threadId: "thr_123"
-    },
-    {
-      threadId: "thr_123",
-      rendered: "# Codex Adversarial Review\n\nTarget: working tree diff\nVerdict: needs-attention\n",
-      result: {
-        result: {
-          verdict: "needs-attention",
-          summary: "One issue.",
-          findings: [],
-          next_steps: []
-        },
-        rawOutput:
-          '{"verdict":"needs-attention","summary":"One issue.","findings":[],"next_steps":[]}'
-      }
-    }
-  );
-
-  assert.match(output, /^# Codex Adversarial Review/);
-  assert.doesNotMatch(output, /^\{/);
-  assert.match(output, /Codex session ID: thr_123/);
-  assert.match(output, /Resume in Codex: codex resume thr_123/);
 });
 
 const NOW = Date.UTC(2026, 9, 2, 12, 0, 0);
@@ -184,21 +156,6 @@ test("a window without a percent prints usage unknown, never undefined%", () => 
   assert.doesNotMatch(output, /undefined%/);
 });
 
-test("status and result print no resume command for an ephemeral thread", () => {
-  const job = { id: "task-eph", status: "completed", jobClass: "task", threadId: "thr_eph", ephemeralThread: true };
-  const stored = { ...job, rendered: "Done.\n" };
-
-  const status = renderJobStatusReport(job);
-  assert.match(status, /Codex session ID: thr_eph/);
-  assert.doesNotMatch(status, /codex resume/);
-  assert.doesNotMatch(renderStoredJobResult(job, stored), /codex resume/);
-  assert.doesNotMatch(renderStoredJobResult(job, { threadId: "thr_eph" }), /codex resume/);
-
-  const durable = { ...job, ephemeralThread: undefined };
-  assert.match(renderJobStatusReport(durable), /Resume in Codex: codex resume thr_eph/);
-  assert.match(renderStoredJobResult(durable, { ...durable, rendered: "Done.\n" }), /Resume in Codex: codex resume thr_eph/);
-});
-
 test("fenceFor handles text with very many backtick runs", () => {
   assert.equal(fenceFor("` x ".repeat(200000)), "```");
   assert.equal(fenceFor(`${"` x ".repeat(200000)}`.concat("`````")), "``````");
@@ -265,4 +222,234 @@ test("the review heading names the target the job resolved, not the one the resu
   );
   assert.match(output, /^# Codex Review \(project\)$/m);
   assert.doesNotMatch(output, /\(changes\)/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// status --json on the job store
+
+const STATUS_JSON_FIELDS = [
+  "id",
+  "label",
+  "runId",
+  "provider",
+  "model",
+  "status",
+  "chainId",
+  "continues",
+  "threadId",
+  "resumable",
+  "resumeMethod",
+  "stopFailed",
+  "stoppingCause",
+  "providerExitUnobserved",
+  "pendingMessages",
+  "unreadEvents",
+  "question",
+  "resultTruncated",
+  "structuredResultTooLarge",
+  "createdAt",
+  "updatedAt"
+];
+
+const T0 = Date.UTC(2026, 10, 18, 9, 0, 0);
+
+function seededJob(id, fields = {}) {
+  return {
+    id,
+    chain_id: fields.chain_id ?? id,
+    provider: "codex",
+    kind: "task",
+    title: `job ${id}`,
+    prompt: "do it",
+    request_json: "{}",
+    cwd: ".",
+    created_at: T0,
+    updated_at: T0 + 1000,
+    session_id: "session-1",
+    ...fields
+  };
+}
+
+async function viewsOf(t, spec) {
+  const stateDir = makeStoreDir(t);
+  await seedStore(stateDir, spec);
+  const store = openStore(stateDir);
+  try {
+    return listJobViews(store, { all: true });
+  } finally {
+    store.close();
+  }
+}
+
+test("status --json carries the contract fields", async (t) => {
+  const views = await viewsOf(t, {
+    chains: [{ id: "task-a", tip_job_id: "task-b", live_label: "fix", created_at: T0, activity_at: T0 }],
+    jobs: [
+      seededJob("task-a", {
+        label: "fix",
+        run_id: "run-1",
+        model: "m-1",
+        thread_id: "th-1",
+        resume_method: "thread",
+        submit_intent_at: T0,
+        end_state: "waiting",
+        end_at: T0 + 500,
+        question: "which branch?",
+        result_text: "partial",
+        result_truncated: 1,
+        result_json_too_large: 1,
+        next_action: "continue",
+        next_at: T0 + 600
+      }),
+      seededJob("task-b", { chain_id: "task-a", continues: "task-a", label: "fix", thread_id: "th-1", created_at: T0 + 700 })
+    ],
+    messages: [{ chain_id: "task-a", text: "hello", created_at: T0 + 800 }],
+    events: [{ job_id: "task-a", kind: "waiting", text: "which branch?", created_at: T0 + 500 }]
+  });
+
+  const { jobs } = renderStatusJson(views);
+
+  assert.equal(jobs.length, 2);
+  for (const job of jobs) {
+    assert.deepEqual(Object.keys(job), STATUS_JSON_FIELDS);
+  }
+  const [b, a] = jobs;
+  assert.deepEqual(a, {
+    id: "task-a",
+    label: "fix",
+    runId: "run-1",
+    provider: "codex",
+    model: "m-1",
+    status: "waiting",
+    chainId: "task-a",
+    continues: null,
+    threadId: "th-1",
+    resumable: true,
+    resumeMethod: "thread",
+    stopFailed: false,
+    stoppingCause: null,
+    providerExitUnobserved: false,
+    pendingMessages: 1,
+    unreadEvents: 1,
+    question: "which branch?",
+    resultTruncated: true,
+    structuredResultTooLarge: true,
+    createdAt: new Date(T0).toISOString(),
+    updatedAt: new Date(T0 + 1000).toISOString()
+  });
+  assert.equal(b.status, "queued");
+  assert.equal(b.continues, "task-a");
+  assert.equal(b.chainId, "task-a");
+  assert.equal(b.question, null);
+});
+
+test("stopFailed is true for a stopping job", async (t) => {
+  const views = await viewsOf(t, {
+    chains: [{ id: "task-s", tip_job_id: "task-s", created_at: T0, activity_at: T0 }],
+    jobs: [
+      seededJob("task-s", {
+        claimed_at: T0,
+        exec_gen: 1,
+        started_at: T0 + 10,
+        stop_requested_at: T0 + 20,
+        stop_reason: "session-end",
+        stopping_since: T0 + 30,
+        stopping_cause: "unconfirmed-stop"
+      })
+    ]
+  });
+
+  const [job] = renderStatusJson(views).jobs;
+
+  assert.equal(job.status, "stopping");
+  assert.equal(job.stopFailed, true);
+  assert.equal(job.stoppingCause, "unconfirmed-stop");
+});
+
+test("a task result shows its structured output", () => {
+  const text = renderTaskResult(
+    { rawOutput: "Here is the answer.", failureMessage: "", structuredOutput: { answer: "x", parts: [1, 2] } },
+    { title: "Antigravity Task", jobId: "task-1", write: false, providerLabel: "Antigravity" }
+  );
+  assert.match(text, /^Here is the answer\.$/m);
+  assert.ok(text.includes('Structured output:\n{\n  "answer": "x",\n  "parts": [\n    1,\n    2\n  ]\n}'), text);
+  const tooLarge = renderTaskResult({ rawOutput: "done", structuredResultTooLarge: true }, { title: "Antigravity Task", providerLabel: "Antigravity" });
+  assert.match(tooLarge, /structured-result-too-large/);
+});
+
+test("a failed task result shows its failure reason beside its output", () => {
+  const reason = "agy returned no structured output for the output schema.";
+  const prose = renderTaskResult(
+    { rawOutput: "Here is my answer.", failureMessage: reason, structuredOutput: null },
+    { title: "Antigravity Task", jobId: "task-1", write: false, providerLabel: "Antigravity" }
+  );
+  assert.match(prose, /^Here is my answer\.$/m);
+  assert.ok(prose.includes(reason), prose);
+  const structured = renderTaskResult({ rawOutput: "", failureMessage: reason, structuredOutput: { answer: "x" } }, { providerLabel: "Antigravity" });
+  assert.ok(structured.includes("Structured output:"), structured);
+  assert.ok(structured.includes(reason), structured);
+});
+
+function storedView(row, request) {
+  return {
+    id: "job-1",
+    provider: "agy",
+    state: row.end_state ?? "completed",
+    isTip: true,
+    successorId: null,
+    providerExitUnobserved: false,
+    request,
+    row: { kind: "task", title: "A job", result_text: null, result_json: null, error: null, question: null, thread_id: null, ...row }
+  };
+}
+
+test("a stored schema-bound review is rendered as a review, with its model line", async () => {
+  const { renderStoreResult } = await import("../plugins/agent/scripts/lib/render.mjs");
+  const review = {
+    verdict: "needs-attention",
+    summary: "One problem found.",
+    findings: [{ severity: "high", title: "Unchecked input", body: "The value is used unchecked.", file: "a.js", line_start: 3, line_end: 3, confidence: 0.9, recommendation: "Check it." }],
+    next_steps: ["Add the check."]
+  };
+  const view = storedView(
+    { kind: "review", result_text: "prose the model also wrote", result_json: JSON.stringify(review) },
+    { model: null, providerModel: "Fake Model (High)", review: { target: "changes", stance: "critical", native: false, targetLabel: "working tree changes" } }
+  );
+  const text = renderStoreResult(view);
+  assert.match(text, /^# Antigravity Critical Review \(changes\)$/m);
+  assert.match(text, /^Target: working tree changes$/m);
+  assert.match(text, /^Verdict: needs-attention$/m);
+  assert.match(text, /^- \[high\] Unchecked input/m);
+  assert.doesNotMatch(text, /Structured output:/);
+  assert.match(text, /^Model: Fake Model \(High\) \(from the Antigravity settings\)$/m);
+});
+
+test("a stored result names the model only when the request named none", async () => {
+  const { renderStoreResult } = await import("../plugins/agent/scripts/lib/render.mjs");
+  const chosen = renderStoreResult(storedView({ result_text: "done" }, { model: null, providerModel: null }));
+  assert.match(chosen, /^Model: chosen by Antigravity$/m);
+  const named = renderStoreResult(storedView({ result_text: "done" }, { model: "some-model", providerModel: null }));
+  assert.doesNotMatch(named, /^Model:/m);
+  const unrecorded = renderStoreResult(storedView({ result_text: "done" }, { model: null }));
+  assert.doesNotMatch(unrecorded, /^Model:/m);
+});
+
+test("a stored review without a structured result says so and keeps a native review as prose", async () => {
+  const { renderStoreResult } = await import("../plugins/agent/scripts/lib/render.mjs");
+  const failed = renderStoreResult(
+    storedView({ kind: "review", end_state: "failed", error: "Antigravity ended the turn without an answer." }, { model: "m", review: { target: "changes", stance: "neutral", native: false, targetLabel: "working tree changes" } })
+  );
+  assert.match(failed, /did not return valid structured JSON/);
+  assert.match(failed, /Parse error: Antigravity ended the turn without an answer\./);
+  const native = renderStoreResult(storedView({ kind: "review", result_text: "native review prose" }, { model: "m", review: { target: "changes", stance: "neutral", native: true } }));
+  assert.equal(native.split("\n")[0], "native review prose");
+});
+test("a stored task result names the command that opens its thread, unless the thread is ephemeral or a review", async () => {
+  const { renderStoreResult, renderStoreJobStatus } = await import("../plugins/agent/scripts/lib/render.mjs");
+  const view = (row) => ({ ...storedView({ result_text: "done", thread_id: "thr_9", ...row }, { model: "m" }), provider: "codex", pendingMessages: 0, unreadEvents: 0, label: null });
+  assert.match(renderStoreResult(view({})), /^Resume in Codex: codex resume thr_9$/m);
+  assert.match(renderStoreJobStatus(view({})), /^Resume in Codex: codex resume thr_9$/m);
+  assert.doesNotMatch(renderStoreResult(view({ ephemeral: 1 })), /codex resume/);
+  assert.doesNotMatch(renderStoreResult(view({ kind: "review" })), /codex resume/);
+  assert.doesNotMatch(renderStoreResult(view({ thread_id: null })), /codex resume/);
 });

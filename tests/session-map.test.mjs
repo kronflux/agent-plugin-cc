@@ -347,20 +347,34 @@ test("the map and manifest copy no private text", async (t) => {
         ]
       }
     },
-    { type: "user", timestamp: "2026-11-01T10:05:00.000Z", message: { role: "user", content: "Last request LASTREQUEST-MARKER-DUNLIN" } }
+    { type: "user", timestamp: "2026-11-01T10:05:00.000Z", message: { role: "user", content: "Last request LASTREQUEST-MARKER-DUNLIN" } },
+    // The title is session text: it is redacted and cut like the excerpts.
+    { type: "custom-title", customTitle: `Deploy with GITHUB_TOKEN=titlesecret99\nand ${"x".repeat(300)} TITLETAIL-MARKER-SANDERLING` }
   ];
   fs.writeFileSync(transcript, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf8");
 
   const summary = await readClaudeSession(transcript, { snapshot: snapshotOf(transcript), profileDir: profile, now: FIXED_NOW });
   const manifest = buildManifest(summary, TARGET, { toolVersion: "2.0.0", now: FIXED_NOW });
+  assert.ok(manifest.source.title.startsWith("Deploy with GITHUB_TOKEN=[redacted] and xxx"), manifest.source.title);
+  assert.ok(manifest.source.title.length <= 200, `title of ${manifest.source.title.length} characters`);
   const files = { manifest: JSON.stringify(manifest, null, 2), map: renderSessionMap(manifest) };
 
   for (const [name, text] of Object.entries(files)) {
-    for (const marker of ["USERTEXT-MARKER", "THINKING-MARKER", "ASSISTANT-MARKER", "TOOLINPUT-MARKER", "TOOLOUTPUT-MARKER", "TOOLFILE-MARKER"]) {
+    for (const marker of [
+      "USERTEXT-MARKER",
+      "THINKING-MARKER",
+      "ASSISTANT-MARKER",
+      "TOOLINPUT-MARKER",
+      "TOOLOUTPUT-MARKER",
+      "TOOLFILE-MARKER",
+      "TITLETAIL-MARKER"
+    ]) {
       assert.equal(text.includes(marker), false, `${name} contains ${marker}`);
     }
     assert.ok(text.includes("LASTREQUEST-MARKER-DUNLIN"), name);
     assert.equal(text.includes("abcd1234efgh"), false, name);
+    assert.equal(text.includes("titlesecret99"), false, name);
+    assert.ok(text.includes("GITHUB_TOKEN=[redacted]"), name);
     assert.ok(text.includes("AWS_SECRET_ACCESS_KEY=[redacted]"), name);
   }
 });

@@ -2,7 +2,6 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-import { getHostPid, getSessionId, SESSION_ID_ENV } from "./host.mjs";
 import { removeLiveFile, writeLiveFile } from "./live.mjs";
 import {
   composeRequestText,
@@ -21,14 +20,12 @@ import {
   capUtf8,
   claimExecution,
   decideRelease,
-  isJobCancelled,
   leaderState,
   leaveExecutionUnconfirmed,
   localDeadlineFrom,
   observeClosure,
   readEvidenceInput,
   readExecutionFence,
-  readJobFile,
   readJobView,
   readMaxParallel,
   recordEnd,
@@ -36,244 +33,11 @@ import {
   recordThread,
   releaseExecution,
   requestStop,
-  resolveJobFile,
-  resolveJobLogFile,
   resumability,
-  storeLateResult,
-  upsertJob,
-  writeJobFile
+  storeLateResult
 } from "./state.mjs";
 import { boundary, checkRuntime, openStore, RETRY_BUDGETS, runtimeGateMessage, StoreError, testPoint, wallNow, withRetry } from "./store.mjs";
 import { extractQuestion, launchEligible, QUESTION_INSTRUCTION } from "./task-launch.mjs";
-
-// Text that the command line of a job's process contains. A background worker has its job id
-// in its arguments; a foreground run is identified by the companion script name.
-
-function processMarkerFor(jobId) {
-  return process.argv.includes(jobId) ? jobId : path.basename(process.argv[1] ?? "") || null;
-}
-
-export function nowIso() {
-  return new Date().toISOString();
-}
-
-function normalizeProgressEvent(value) {
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    return {
-      message: String(value.message ?? "").trim(),
-      phase: typeof value.phase === "string" && value.phase.trim() ? value.phase.trim() : null,
-      threadId: typeof value.threadId === "string" && value.threadId.trim() ? value.threadId.trim() : null,
-      turnId: typeof value.turnId === "string" && value.turnId.trim() ? value.turnId.trim() : null,
-      stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
-      logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
-      logBody: value.logBody == null ? null : String(value.logBody).trimEnd()
-    };
-  }
-
-  return {
-    message: String(value ?? "").trim(),
-    phase: null,
-    threadId: null,
-    turnId: null,
-    stderrMessage: String(value ?? "").trim(),
-    logTitle: null,
-    logBody: null
-  };
-}
-
-export function appendLogLine(logFile, message) {
-  const normalized = String(message ?? "").trim();
-  if (!logFile || !normalized) {
-    return;
-  }
-  fs.appendFileSync(logFile, `[${nowIso()}] ${normalized}\n`, "utf8");
-}
-
-export function appendLogBlock(logFile, title, body) {
-  if (!logFile || !body) {
-    return;
-  }
-  fs.appendFileSync(logFile, `\n[${nowIso()}] ${title}\n${String(body).trimEnd()}\n`, "utf8");
-}
-
-export function createJobLogFile(workspaceRoot, jobId, title) {
-  const logFile = resolveJobLogFile(workspaceRoot, jobId);
-  fs.writeFileSync(logFile, "", "utf8");
-  if (title) {
-    appendLogLine(logFile, `Starting ${title}.`);
-  }
-  return logFile;
-}
-
-export function createJobRecord(base, options = {}) {
-  const env = options.env ?? process.env;
-  const sessionId = getSessionId(env, options.sessionIdEnv ?? SESSION_ID_ENV);
-  // The host process id names the Claude Code process the job was started from; the job monitor
-  // of that process announces the job.
-  const claudePid = getHostPid(env);
-  return {
-    ...base,
-    createdAt: nowIso(),
-    ...(sessionId ? { sessionId } : {}),
-    ...(claudePid ? { claudePid } : {})
-  };
-}
-
-export function createJobProgressUpdater(workspaceRoot, jobId) {
-  let lastPhase = null;
-  let lastThreadId = null;
-  let lastTurnId = null;
-
-  return (event) => {
-    const normalized = normalizeProgressEvent(event);
-    const patch = { id: jobId };
-    let changed = false;
-
-    if (normalized.phase && normalized.phase !== lastPhase) {
-      lastPhase = normalized.phase;
-      patch.phase = normalized.phase;
-      changed = true;
-    }
-
-    if (normalized.threadId && normalized.threadId !== lastThreadId) {
-      lastThreadId = normalized.threadId;
-      patch.threadId = normalized.threadId;
-      changed = true;
-    }
-
-    if (normalized.turnId && normalized.turnId !== lastTurnId) {
-      lastTurnId = normalized.turnId;
-      patch.turnId = normalized.turnId;
-      changed = true;
-    }
-
-    if (!changed) {
-      return;
-    }
-
-    upsertJob(workspaceRoot, patch);
-  };
-}
-
-export function createProgressReporter({ stderr = false, logFile = null, onEvent = null, label = "agent" } = {}) {
-  if (!stderr && !logFile && !onEvent) {
-    return null;
-  }
-
-  return (eventOrMessage) => {
-    const event = normalizeProgressEvent(eventOrMessage);
-    const stderrMessage = event.stderrMessage ?? event.message;
-    if (stderr && stderrMessage) {
-      process.stderr.write(`[${label}] ${stderrMessage}\n`);
-    }
-    appendLogLine(logFile, event.message);
-    appendLogBlock(logFile, event.logTitle, event.logBody);
-    onEvent?.(event);
-  };
-}
-
-function readStoredJobOrNull(workspaceRoot, jobId) {
-  const jobFile = resolveJobFile(workspaceRoot, jobId);
-  if (!fs.existsSync(jobFile)) {
-    return null;
-  }
-  return readJobFile(jobFile);
-}
-
-const CANCELLED_BEFORE_START = "Cancelled before the turn started.";
-
-function failureMessageOf(execution) {
-  const message = execution.payload?.failureMessage;
-  if (typeof message === "string" && message.trim()) {
-    return message.trim();
-  }
-  return typeof execution.summary === "string" && execution.summary.trim() ? execution.summary.trim() : null;
-}
-
-/**
- * Runs a job and records its outcome. The running record publishes this process's id; then
- * `options.onStarted` runs, and a job cancelled by then returns a cancelled result without
- * calling `runner` (its stored status reads as cancelled through the cancel marker). A
- * failure to write the log block leaves the completed record in place.
- */
-export async function runTrackedJob(job, runner, options = {}) {
-  const logFile = options.logFile ?? job.logFile ?? null;
-  // The prompt of a legacy record is handed to the worker separately and never stored again.
-  const { request: _request, ...jobFields } = job;
-  const runningRecord = {
-    ...jobFields,
-    status: "running",
-    startedAt: nowIso(),
-    phase: "starting",
-    pid: process.pid,
-    processMarker: processMarkerFor(job.id),
-    logFile
-  };
-  writeJobFile(job.workspaceRoot, job.id, runningRecord);
-
-  // A cancel that ran before this process's id was recorded could not stop it, so it is
-  // honoured here, before the turn starts.
-  options.onStarted?.();
-  if (isJobCancelled(job.workspaceRoot, job.id)) {
-    return {
-      exitStatus: 1,
-      cancelled: true,
-      threadId: null,
-      turnId: null,
-      payload: { status: "cancelled", jobId: job.id },
-      rendered: `${CANCELLED_BEFORE_START}\n`,
-      summary: CANCELLED_BEFORE_START
-    };
-  }
-
-  let execution;
-  try {
-    execution = await runner();
-    const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
-    const completedAt = nowIso();
-    const stored = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
-    // A failed run keeps its message in errorMessage, the field a thrown failure fills too.
-    const failureMessage = completionStatus === "failed" ? failureMessageOf(execution) : null;
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...stored,
-      ...(failureMessage ? { errorMessage: failureMessage } : {}),
-      status: completionStatus,
-      threadId: execution.threadId ?? stored.threadId ?? null,
-      turnId: execution.turnId ?? stored.turnId ?? null,
-      ...(execution.summary === undefined ? {} : { summary: execution.summary }),
-      pid: null,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      completedAt,
-      result: execution.payload,
-      rendered: execution.rendered
-    });
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    let existing;
-    try {
-      existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
-    } catch {
-      existing = runningRecord;
-    }
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...existing,
-      status: "failed",
-      phase: "failed",
-      errorMessage,
-      pid: null,
-      completedAt: nowIso(),
-      logFile: logFile ?? existing.logFile ?? null
-    });
-    throw error;
-  }
-
-  try {
-    appendLogBlock(logFile, "Final output", execution.rendered);
-  } catch {
-    // The completed record already holds the output; a log that cannot be written loses only its copy.
-  }
-  return execution;
-}
 
 // ---------------------------------------------------------------------------------------------
 // The worker harness of the job store. A worker runs exactly one provider turn for one job: it
@@ -322,6 +86,8 @@ const EXIT_MARGIN_MS = 500;
 // The most one process-identity query may take; a busy Windows machine can need several seconds
 // to start PowerShell.
 const IDENTITY_QUERY_MS = 10000;
+// How often a worker reads its own process identity before it gives up claiming.
+const OWN_IDENTITY_ATTEMPTS = 3;
 
 class Aborted extends Error {
   constructor(reason) {
@@ -678,8 +444,18 @@ export class WorkerRun {
       return 0;
     }
     this.job = view.row;
-    const own = await readProcessIdentity(process.pid, { deadline: performance.now() + IDENTITY_QUERY_MS });
-    this.self = { pid: process.pid, startToken: own.state === "present" ? own.startToken : null, groupId: currentGroupId() };
+    // A claim without the worker's start token could never be stopped by verified identity, by the
+    // session-end hook or the monitor. The worker reads its own identity up to three times and
+    // claims nothing without it; the job stays queued for the next launch.
+    let own = { state: "unknown" };
+    for (let attempt = 0; attempt < OWN_IDENTITY_ATTEMPTS && own.state !== "present"; attempt += 1) {
+      own = await readProcessIdentity(process.pid, { deadline: performance.now() + IDENTITY_QUERY_MS });
+    }
+    if (own.state !== "present") {
+      this.log(`the worker could not read its own process identity (${own.reason ?? own.state}); it claims nothing`);
+      return 0;
+    }
+    this.self = { pid: process.pid, startToken: own.startToken, groupId: currentGroupId() };
     const maxParallel = readMaxParallel(this.stateDir, view.provider);
     const claimStarted = performance.now();
     for (;;) {
@@ -714,8 +490,26 @@ export class WorkerRun {
         return this.shutdown(this.shutdownReason ?? error.reason);
       }
       this.log(`worker error: ${error?.stack ?? error}`);
-      this.requestShutdown("error");
-      return this.shutdown("error");
+      // An error before anything was sent to the provider (it could not start, or could not open
+      // its thread) is the job's failure, with the provider's own message: the job ends failed
+      // through the ordinary release path. A later error keeps the job for the scan, which ends
+      // it interrupted, so its turn can be continued.
+      const reason = this.requestWritten ? "error" : "start-failed";
+      if (reason === "start-failed") {
+        this.startFailure = `The job could not start: ${error?.message ?? String(error)}`;
+        // The failure is recorded at once, before the provider's processes are confirmed gone:
+        // nothing was sent, so there is no turn or thread a continuation could collide with, and
+        // the user sees the reason now and not after the release is decided.
+        try {
+          await this.write((opts) =>
+            recordEnd(this.store, this.jobId, { state: "failed", by: "worker", execGen: this.execGen, reason: "start-failed", error: this.startFailure }, opts)
+          );
+        } catch (writeError) {
+          this.log(`the start failure could not be recorded: ${writeError?.message ?? writeError}`);
+        }
+      }
+      this.requestShutdown(reason);
+      return this.shutdown(reason);
     }
   }
 
@@ -984,6 +778,8 @@ export class WorkerRun {
         end = { state: "failed", error: "the provider reported a thread that is held or barred", reason: "thread-refused" };
       } else if (cancel) {
         end = { state: "cancelled", reason: stopResult === "stopped" ? "tree-stop" : null };
+      } else if (reason === "start-failed") {
+        end = { state: "failed", error: this.startFailure, reason: "start-failed" };
       } else if (resumable) {
         end = { state: "interrupted", reason: row.stop_reason ?? reason };
       } else {
@@ -993,7 +789,37 @@ export class WorkerRun {
       pendingEnd = { end, result };
     }
     await this.releaseByEvidence({ deadline: local, rootExitSeenAt, stopResult, stoppedAt, pendingEnd });
-    return this.finish(0);
+    if (reason === "start-failed") {
+      await this.discardUnusedWorktree();
+    }
+    return this.finish(reason === "start-failed" ? 1 : 0);
+  }
+
+  // A worktree made for this job, which failed before the provider did anything in it, is removed
+  // with its branch. A continuation works in the worktree of the job it continues, and a job that
+  // has a thread may have changed files there; both are kept.
+  async discardUnusedWorktree() {
+    const row = this.read(() => readJobView(this.store, this.jobId))?.row ?? this.job;
+    if (!row || row.end_state !== "failed" || row.end_reason !== "start-failed" || row.continues || row.thread_id) {
+      return;
+    }
+    let worktree = null;
+    try {
+      worktree = JSON.parse(row.request_json ?? "{}").worktree ?? null;
+    } catch {
+      worktree = null;
+    }
+    if (!worktree?.path || !worktree.branch) {
+      return;
+    }
+    try {
+      // Loaded here, not at the top: the git module's own imports lead back to this file.
+      const [{ removeWorktree }, { resolveWorkspaceRoot }] = await Promise.all([import("./git.mjs"), import("./workspace.mjs")]);
+      removeWorktree(resolveWorkspaceRoot(row.cwd), worktree.path, worktree.branch);
+      this.log(`removed the unused worktree ${worktree.path}`);
+    } catch (error) {
+      this.log(`the unused worktree ${worktree.path} could not be removed: ${error?.message ?? error}`);
+    }
   }
 
   resultOf(turn) {

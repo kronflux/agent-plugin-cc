@@ -7,7 +7,7 @@ import { writeExecutable } from "./helpers.mjs";
 const PROCESS_LIB = pathToFileURL(path.join(import.meta.dirname, "..", "plugins", "agent", "scripts", "lib", "process.mjs")).href;
 
 // The behaviours whose processes outlive a quick test and are stopped by it.
-const LINGERING = new Set(["slow", "hang", "silent", "chatty-silent"]);
+const LINGERING = new Set(["slow", "hang", "silent", "chatty-silent", "replay-then-stall"]);
 
 // A stand-in for the Antigravity CLI (agy 1.5.10). In stream-json print mode it answers each
 // stdin line with the init, step_update and result events agy emits, one turn at a time, with
@@ -35,9 +35,30 @@ const LINGERING = new Set(["slow", "hang", "silent", "chatty-silent"]);
 //   event and an unterminated fragment, one every 300 ms, and runs until it is stopped.
 // - "opening-then-empty": a completed agent step with an opening sentence, then a SUCCESS
 //   result with an empty response and no structured output.
-// - "silent": writes nothing, not even init, and runs until it is stopped. With
-//   `{ spawnChild: true }` it first starts a sleeping child process and records its id in
-//   `childPids`.
+// - "silent": writes nothing, not even init, and runs until it is stopped.
+// With `{ spawnChild: true }` any behaviour first starts a sleeping child process and records its id
+// in `childPids`; the child outlives a fake that exits by itself.
+// - "question": the reply ends with the line "AGENT-QUESTION: which branch?", and with
+//   --json-schema the structured output is {"question":"which branch?"}. The schema each run
+//   received is recorded as `schema`.
+// - "denied-actions-only": agent prose "I read the file.", then a SUCCESS result with that prose
+//   and denied_actions [{"action":"command","display_name":"Bash"}], and no TOOL_ERROR step.
+// - "tool-error-only": a TOOL_ERROR step refusing "permission to run command: ping ...", agent
+//   prose, then a SUCCESS result with the prose and no denied_actions.
+// - "schema-only": no agent text, a SUCCESS result with an empty response and the structured output.
+// - "schema-no-output": agent prose and a SUCCESS result without structured output.
+// - "schema-prose-json": prose ending in {"answer":"x"} and no structured output.
+// - "denied-with-schema": denied_actions and the structured output in one SUCCESS result.
+// - "write-tool": a write_file tool step on a path outside the working folder, then the answer.
+// - "edit-readme": appends one line to README.md in the working folder, then answers.
+// With --json-schema the structured output is a review object for the review schema (which has a
+// verdict property), and otherwise holds each of the schema's required keys with a string value.
+// - `agy --print /usage --output-format json` prints the quota object of agy 1.5.10 and exits;
+//   the run is recorded with no input. "usage-text-only" drops its structured data (`command`), and
+//   "usage-error" reports status ERROR with "quota service unavailable"; "usage-fake-model" adds a
+//   group described with the fake model list's "Fake Model".
+// - "replay-then-stall": after its stdin line, writes init again and a replayed user_input
+//   step of an earlier turn (step_index 0), then nothing, and runs until it is stopped.
 // - "replayed-events": a continued conversation writes init twice and repeats the previous
 //   turn's user_input step before its own.
 // - "fail-first-turn": ends turn 1 at once with status ERROR and a response whose braces are not
@@ -75,7 +96,20 @@ function loadState() {
 function saveState(state) {
   const temp = STATE_PATH + "." + process.pid + ".tmp";
   fs.writeFileSync(temp, JSON.stringify(state, null, 2));
-  fs.renameSync(temp, STATE_PATH);
+  // On Windows a rename over a file another process is reading fails with EPERM or EBUSY for a
+  // moment; the reader is a test or another fake, so try again for up to 2 s.
+  const giveUpAt = Date.now() + 2000;
+  for (;;) {
+    try {
+      fs.renameSync(temp, STATE_PATH);
+      return;
+    } catch (error) {
+      if ((error.code !== "EPERM" && error.code !== "EBUSY" && error.code !== "EACCES") || Date.now() > giveUpAt) {
+        throw error;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+  }
 }
 
 // Parallel fake agy processes share the state file. Each change is read, applied and written
@@ -105,12 +139,21 @@ function updateState(change) {
   }
 }
 
+// Identity records still being read; a fake that exits by itself waits for them first.
+const pendingIdentities = [];
+
+// Exits once every identity record is written, so that a child is recorded even when the input
+// ends right after the answer.
+function exitAfterIdentities() {
+  Promise.all(pendingIdentities).then(() => process.exit(0));
+}
+
 // Adds the identity of pid (this process, or a child it holds), once read, to identities.
 function recordIdentity(pid) {
   if (!RECORD_IDENTITIES) {
     return;
   }
-  import(PROCESS_LIB)
+  const pending = import(PROCESS_LIB)
     .then((lib) => lib.readProcessIdentity(pid, { deadline: performance.now() + 30000 }))
     .then((identity) => {
       if (identity.state === "present") {
@@ -120,6 +163,7 @@ function recordIdentity(pid) {
       }
     })
     .catch(() => {});
+  pendingIdentities.push(pending);
 }
 
 function argValue(name) {
@@ -149,6 +193,57 @@ if (args[0] === "models") {
   process.exit(0);
 }
 
+// The quota groups of the /usage fixture.
+const USAGE_GROUPS = [
+  {
+    name: "Gemini Models",
+    description: "Models within this group: Gemini 4 Hydrogen, Gemini 3.8 Flash",
+    buckets: [
+      { id: "gemini-weekly", name: "Weekly Limit Remaining", window: "weekly", remaining_fraction: 1, reset_time: "2026-11-24T09:01:29Z" },
+      { id: "gemini-5h", name: "Five Hour Limit Remaining", window: "five_hour", remaining_fraction: 1, reset_time: "2026-11-17T14:01:29Z" }
+    ]
+  },
+  {
+    name: "Gemini 4 Argon",
+    description: "Models within this group: Gemini 4 Argon",
+    buckets: [
+      { id: "argon-weekly", name: "Weekly Limit Remaining", window: "weekly", remaining_fraction: 0.75, reset_time: "2026-11-24T09:01:29Z" },
+      { id: "argon-5h", name: "Five Hour Limit Remaining", window: "five_hour", remaining_fraction: 0.5, reset_time: "2026-11-17T14:01:29Z" }
+    ]
+  },
+  {
+    name: "Claude Models",
+    description: "Models within this group: Claude Opus 5.5, Claude Sonnet 5.5",
+    buckets: [{ id: "claude-weekly", name: "Weekly Limit Remaining", window: "weekly", remaining_fraction: 0.2, reset_time: "2026-11-24T09:01:29Z" }]
+  }
+];
+
+function usageGroups() {
+  return BEHAVIOR === "usage-fake-model"
+    ? [...USAGE_GROUPS, { name: "Fake Group", description: "Models within this group: Fake Model", buckets: [{ id: "fake-weekly", name: "Weekly Limit Remaining", window: "weekly", remaining_fraction: 0.4, reset_time: "2026-11-24T09:01:29Z" }] }]
+    : USAGE_GROUPS;
+}
+
+function usageObject() {
+  if (BEHAVIOR === "usage-error") {
+    return { conversation_id: "", status: "ERROR", response: "quota service unavailable", duration_seconds: 0, num_turns: 0, usage: { total_tokens: 0 } };
+  }
+  const response = usageGroups().flatMap((group) => group.buckets.map((bucket) => [group.name, bucket.name, Math.round(bucket.remaining_fraction * 100) + "%", bucket.reset_time].join("\\t"))).join("\\n") + "\\n";
+  const object = { conversation_id: "", status: "SUCCESS", response, duration_seconds: 0, num_turns: 0, usage: { total_tokens: 0 } };
+  if (BEHAVIOR !== "usage-text-only") {
+    object.command = { name: "usage", data: { description: "Within each group, models share a weekly limit and a 5-hour limit.", groups: usageGroups() } };
+  }
+  return object;
+}
+
+if (args.includes("/usage")) {
+  updateState((state) => {
+    state.runs.push({ args, inputs: [], pid: process.pid });
+  });
+  process.stdout.write(JSON.stringify(usageObject()) + "\\n");
+  process.exit(0);
+}
+
 const CONTINUED = Boolean(argValue("--conversation"));
 const { conversationId, runIndex, conversation } = updateState((state) => {
   const id = argValue("--conversation") || "conv-" + state.nextConversation++;
@@ -167,6 +262,86 @@ function readSchema() {
   }
 }
 const SCHEMA = args.includes("--json-schema") ? readSchema() : null;
+
+// The structured output this fake returns for a non-review schema: each required key with a string.
+function placeholderOutput() {
+  return Object.fromEntries((Array.isArray(SCHEMA && SCHEMA.required) ? SCHEMA.required : []).map((key) => [key, key + "-value"]));
+}
+
+function agentText(text) {
+  emit({ event: "step_update", step_update: { conversation_id: conversationId, step_index: step, state: "ACTIVE", step_type: "agent_response", text_delta: text } });
+  emit({ event: "step_update", step_update: { conversation_id: conversationId, step_index: step++, state: "DONE", step_type: "agent_response", text_delta: "\\n", duration_seconds: 0.1, usage: USAGE } });
+}
+
+function finishTurn(result) {
+  if (SCHEMA) {
+    emit({ event: "step_update", step_update: { conversation_id: conversationId, step_index: step++, state: "DONE", step_type: "finish", duration_seconds: 0.1 } });
+    result.json_schema = SCHEMA;
+  }
+  saveConversation();
+  emit({ event: "result", result: { conversation_id: conversationId, status: "SUCCESS", duration_seconds: 0.1, num_turns: turns, usage: USAGE, ...result } });
+  busy = false;
+  runNext();
+}
+
+// The turns of the behaviours that end differently from the plain answer; true when one ran.
+function specialTurn() {
+  switch (BEHAVIOR) {
+    case "denied-actions-only":
+      agentText("I read the file.");
+      finishTurn({ response: "I read the file.\\n", denied_actions: [{ action: "command", display_name: "Bash" }] });
+      return true;
+    case "tool-error-only": {
+      const toolInfo = { name: "run_command", parameters: { CommandLine: "ping -n 90 127.0.0.1" } };
+      emit({ event: "step_update", step_update: { conversation_id: conversationId, step_index: step, state: "ACTIVE", step_type: "tool", tool_name: "run_command", tool_info: toolInfo } });
+      emit({ event: "step_update", step_update: { conversation_id: conversationId, step_index: step++, state: "ERROR", step_type: "tool", tool_name: "run_command", duration_seconds: 0.1, tool_info: { ...toolInfo, error: { type: "TOOL_ERROR", message: "permission to run command: ping -n 90 127.0.0.1 was not granted. Proceed without performing this action." } } } });
+      agentText("I could not run the command.");
+      finishTurn({ response: "I could not run the command.\\n" });
+      return true;
+    }
+    case "schema-only":
+      emit({ event: "step_update", step_update: { conversation_id: conversationId, step_index: step++, state: "DONE", step_type: "agent_response", duration_seconds: 0.1, usage: USAGE } });
+      finishTurn({ response: "", structured_output: placeholderOutput() });
+      return true;
+    case "empty-structured-output":
+      emit({ event: "step_update", step_update: { conversation_id: conversationId, step_index: step++, state: "DONE", step_type: "agent_response", duration_seconds: 0.1, usage: USAGE } });
+      finishTurn({ response: "", structured_output: {} });
+      return true;
+    case "schema-no-output":
+      agentText("Here is my answer.");
+      finishTurn({ response: "Here is my answer.\\n" });
+      return true;
+    case "schema-prose-json":
+      agentText('The answer is {"answer":"x"}');
+      finishTurn({ response: 'The answer is {"answer":"x"}\\n' });
+      return true;
+    case "denied-with-schema":
+      agentText("Done.");
+      finishTurn({ response: "Done.\\n", structured_output: placeholderOutput(), denied_actions: [{ action: "command", display_name: "Bash" }] });
+      return true;
+    case "write-tool": {
+      const outside = require("node:path").join(require("node:os").tmpdir(), "agy-fake-outside", "notes.txt");
+      const toolInfo = { name: "write_file", parameters: { Path: outside } };
+      emit({ event: "step_update", step_update: { conversation_id: conversationId, step_index: step, state: "ACTIVE", step_type: "tool", tool_name: "write_file", tool_info: toolInfo } });
+      emit({ event: "step_update", step_update: { conversation_id: conversationId, step_index: step++, state: "DONE", step_type: "tool", tool_name: "write_file", duration_seconds: 0.1, tool_info: { ...toolInfo, output: "1 line written" } } });
+      agentText("I wrote the notes.");
+      finishTurn({ response: "I wrote the notes.\\n" });
+      return true;
+    }
+    case "edit-readme":
+      fs.appendFileSync(require("node:path").join(process.cwd(), "README.md"), "edited by the fake agy\\n");
+      agentText("I edited the README.");
+      finishTurn({ response: "I edited the README.\\n" });
+      return true;
+    default:
+      return false;
+  }
+}
+if (SCHEMA) {
+  updateState((current) => {
+    current.runs[runIndex].schema = SCHEMA;
+  });
+}
 
 if (BEHAVIOR === "exit-before-stdin") {
   process.exit(2);
@@ -214,6 +389,17 @@ let turns = conversation.turns;
 let step = conversation.steps;
 let lastUserInput = conversation.lastUserInput;
 
+// A sleeping child of this process, which outlives it when this process exits by itself. On
+// Windows it is detached, because Node ends the children it spawns otherwise when it exits; a tree
+// stop of this process still reaches it as a descendant. On Linux it stays in this process's group.
+if (SPAWN_CHILD) {
+  const sleeper = require("node:child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true, detached: process.platform === "win32" });
+  updateState((current) => {
+    current.childPids = [...(current.childPids || []), sleeper.pid];
+  });
+  recordIdentity(sleeper.pid);
+}
+
 if (BEHAVIOR === "chatty-silent") {
   const noise = ["diagnostic: still working\\n", JSON.stringify({ event: "heartbeat", at: 1 }) + "\\n", "unterminated fragment "];
   let next = 0;
@@ -224,13 +410,6 @@ if (BEHAVIOR === "chatty-silent") {
 } else if (BEHAVIOR === "silent") {
   // Writes nothing and never exits on its own.
   setInterval(() => {}, 1000);
-  if (SPAWN_CHILD) {
-    const sleeper = require("node:child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });
-    updateState((current) => {
-      current.childPids = [...(current.childPids || []), sleeper.pid];
-    });
-    recordIdentity(sleeper.pid);
-  }
 } else if (BEHAVIOR !== "result-then-exit") {
   emit(initEvent);
   if (BEHAVIOR === "replayed-events" && CONTINUED) {
@@ -245,7 +424,7 @@ function runNext() {
   const content = queue.shift();
   if (content === undefined) {
     if (inputClosed) {
-      process.exit(0);
+      exitAfterIdentities();
     }
     return;
   }
@@ -262,6 +441,9 @@ function runNext() {
   saveConversation();
   if (BEHAVIOR === "exit-without-result") {
     process.exit(0);
+  }
+  if (specialTurn()) {
+    return;
   }
   if (BEHAVIOR === "denied") {
     // The headless auto-denial: a TOOL_ERROR tool step, then SUCCESS with an empty response and
@@ -298,7 +480,7 @@ function runNext() {
   const delay = BEHAVIOR === "slow" ? SLOW_MS : BEHAVIOR === "hang" ? 600000 : 50;
   setTimeout(() => {
     // The reply quotes the prompt's first line; the plugin's fixed lines follow it.
-    const response = "reply: " + String(content).split("\\n")[0];
+    const response = BEHAVIOR === "question" ? "I need a decision first.\\nAGENT-QUESTION: which branch?" : "reply: " + String(content).split("\\n")[0];
     if (BEHAVIOR === "two-messages") {
       emit({ event: "step_update", step_update: { conversation_id: conversationId, step_index: step++, state: "DONE", step_type: "agent_response", text_delta: "Working on it.", duration_seconds: 0.1, usage: USAGE } });
     }
@@ -313,7 +495,9 @@ function runNext() {
       emit({ event: "step_update", step_update: { conversation_id: conversationId, step_index: step++, state: "DONE", step_type: "finish", duration_seconds: 0.1 } });
       result.json_schema = SCHEMA;
       // A project review prompt gets one finding without a location.
-      result.structured_output = String(content).includes("This is a project review")
+      result.structured_output = !(SCHEMA && SCHEMA.properties && SCHEMA.properties.verdict)
+        ? placeholderOutput()
+        : String(content).includes("This is a project review")
         ? {
             verdict: "needs-attention",
             summary: "One project-wide concern surfaced by the fake agy.",
@@ -322,6 +506,9 @@ function runNext() {
             next_steps: []
           }
         : { verdict: "approve", summary: "No material issues found by the fake agy.", target: "changes", findings: [], next_steps: [] };
+      if (BEHAVIOR === "question") {
+        result.structured_output = { question: "which branch?" };
+      }
     }
     result.usage = USAGE;
     saveConversation();
@@ -339,8 +526,15 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const content = message && message.message ? message.message.content : "";
   updateState((current) => {
     current.runs[runIndex].inputs.push(content);
+    current.runs[runIndex].inputsAt = [...(current.runs[runIndex].inputsAt || []), Date.now()];
   });
   if (BEHAVIOR === "silent" || BEHAVIOR === "chatty-silent") {
+    return;
+  }
+  if (BEHAVIOR === "replay-then-stall") {
+    emit(initEvent);
+    emit({ event: "step_update", step_update: { conversation_id: conversationId, step_index: 0, state: "DONE", step_type: "user_input" } });
+    setInterval(() => {}, 1000);
     return;
   }
   if (BEHAVIOR === "result-then-exit") {
@@ -348,15 +542,16 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     emitNow(initEvent);
     emitNow({ event: "step_update", step_update: { conversation_id: conversationId, step_index: 0, state: "DONE", step_type: "agent_response", text_delta: answer } });
     emitNow({ event: "result", result: { conversation_id: conversationId, status: "SUCCESS", response: answer, duration_seconds: 0.1, num_turns: 1 } });
-    process.exit(0);
+    Promise.all(pendingIdentities).then(() => process.exit(0));
+    return;
   }
   queue.push(content);
   runNext();
 }).on("close", () => {
   inputClosed = true;
   record({ stdinClosed: true });
-  if (!busy && queue.length === 0 && BEHAVIOR !== "silent") {
-    process.exit(0);
+  if (!busy && queue.length === 0 && BEHAVIOR !== "silent" && BEHAVIOR !== "replay-then-stall") {
+    exitAfterIdentities();
   }
 });
 `;

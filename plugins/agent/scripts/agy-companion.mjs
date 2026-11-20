@@ -2,20 +2,20 @@
 
 import process from "node:process";
 
-import { HelpRequested, parseCommandInput, resolveCommandWorkspace, createTrackedProgress } from "./lib/companion-cli.mjs";
-import { readStoredJob } from "./lib/job-control.mjs";
-import { takeJobRequest, writeJobFile } from "./lib/state.mjs";
-import { nowIso, runTrackedJob } from "./lib/tracked-jobs.mjs";
+import { HelpRequested, parseCommandInput } from "./lib/companion-cli.mjs";
+import { checkRuntime, runtimeGateMessage } from "./lib/store.mjs";
+import { runJobExecution } from "./lib/tracked-jobs.mjs";
+import { createAgyDriver } from "./providers/agy/driver.mjs";
 import * as reviewCommand from "./providers/agy/commands/review.mjs";
-import { executeAgyReview } from "./providers/agy/commands/review.mjs";
 import * as setupCommand from "./providers/agy/commands/setup.mjs";
 import * as taskCommand from "./providers/agy/commands/task.mjs";
-import { executeAgyTask } from "./providers/agy/commands/task.mjs";
+import * as usageCommand from "./providers/agy/commands/usage.mjs";
 
 const SUBCOMMAND_USAGE = {
   setup: setupCommand.usage,
   task: taskCommand.usage,
-  review: reviewCommand.usage
+  review: reviewCommand.usage,
+  usage: usageCommand.usage
 };
 
 function printUsage(subcommand = null) {
@@ -23,30 +23,14 @@ function printUsage(subcommand = null) {
   console.log(["Usage:", ...names.map((name) => `  node scripts/agy-companion.mjs ${SUBCOMMAND_USAGE[name]}`)].join("\n"));
 }
 
-async function handleTaskWorker(argv) {
-  const { options } = parseCommandInput(argv, { valueOptions: ["cwd", "job-id"] });
-  if (!options["job-id"]) {
-    throw new Error("Missing required --job-id for task-worker.");
+// The store worker of one Antigravity job: claims it, runs its one turn and releases it.
+async function handleWorker(argv) {
+  const { options } = parseCommandInput(argv, { valueOptions: ["state-dir", "job"] });
+  if (!options["state-dir"] || !options.job) {
+    throw new Error("Usage: worker --state-dir <path> --job <id>");
   }
-  const workspaceRoot = resolveCommandWorkspace(options);
-  const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
-  if (!storedJob) {
-    throw new Error(`No stored job found for ${options["job-id"]}.`);
-  }
-  // A job cancelled or failed while queued is not run.
-  if (storedJob.status !== "queued") {
-    return;
-  }
-  const request = takeJobRequest(workspaceRoot, options["job-id"]);
-  if (!request || typeof request !== "object") {
-    const errorMessage = `Stored job ${options["job-id"]} is missing its task request payload.`;
-    writeJobFile(workspaceRoot, storedJob.id, { ...storedJob, status: "failed", phase: "failed", errorMessage, completedAt: nowIso() });
-    throw new Error(errorMessage);
-  }
-  const { logFile, progress } = createTrackedProgress({ ...storedJob, workspaceRoot }, { logFile: storedJob.logFile ?? null });
-  // A queued review request runs as a review; every other request runs as a task.
-  const execute = request.requestKind === "review" ? executeAgyReview : executeAgyTask;
-  await runTrackedJob({ ...storedJob, workspaceRoot, logFile }, () => execute({ ...request, onProgress: progress }), { logFile });
+  const code = await runJobExecution(options["state-dir"], options.job, createAgyDriver(null, { env: process.env }), { env: process.env });
+  process.exit(code);
 }
 
 async function runSubcommand(subcommand, argv) {
@@ -55,10 +39,14 @@ async function runSubcommand(subcommand, argv) {
       return setupCommand.run(argv);
     case "task":
       return taskCommand.run(argv);
-    case "task-worker":
-      return handleTaskWorker(argv);
+    case "worker":
+      return handleWorker(argv);
+    case "task-resume-candidate":
+      return taskCommand.handleResumeCandidate(argv);
     case "review":
       return reviewCommand.run(argv);
+    case "usage":
+      return usageCommand.run(argv);
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);
   }
@@ -68,6 +56,14 @@ async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help" || subcommand === "-h") {
     printUsage(argv[0] ?? null);
+    return;
+  }
+  // Every subcommand needs the job store, so the runtime gate runs first.
+  const gate = checkRuntime();
+  if (!gate.ok) {
+    process.stderr.write(`${runtimeGateMessage(gate)}
+`);
+    process.exitCode = 1;
     return;
   }
   try {

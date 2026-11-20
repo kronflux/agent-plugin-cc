@@ -99,6 +99,11 @@ export function readHookInput(options = {}) {
   return readHookInputJson(options);
 }
 
+/** The `reason` field of a hook's input (SessionEnd sends `clear`, `logout`, `other` and others); null when absent. */
+export function readHookReason(input) {
+  return typeof input?.reason === "string" && input.reason ? input.reason : null;
+}
+
 function shellEscape(value) {
   return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
 }

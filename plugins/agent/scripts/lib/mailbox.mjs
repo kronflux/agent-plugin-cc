@@ -323,13 +323,16 @@ export function markDelivered(store, jobId, opts = {}) {
   );
 }
 
-/** Records that jobs were noted to a session; returns the ids not noted to it before. */
+/**
+ * Records that jobs were noted to a session; returns the ids not noted to it before. A job that
+ * is no longer its chain's tip (it was continued since it was read) is not noted.
+ */
 export function noteJobs(store, jobIds, sessionId, opts = {}) {
   return store.transact((db) => {
     const at = wallNow();
     const noted = [];
     for (const jobId of jobIds) {
-      if (!getJobRow(db, jobId)) {
+      if (!getJobRow(db, jobId) || !db.prepare("SELECT 1 FROM chains WHERE tip_job_id = ?").get(jobId)) {
         continue;
       }
       if (db.prepare("INSERT OR IGNORE INTO job_notes (job_id, session_id, noted_at) VALUES (?, ?, ?)").run(jobId, sessionId, at).changes === 1) {

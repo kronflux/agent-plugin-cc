@@ -4,16 +4,21 @@ import process from "node:process";
 
 import * as cancelCommand from "./commands/cancel.mjs";
 import * as resultCommand from "./commands/result.mjs";
+import * as resumeCommand from "./commands/resume.mjs";
 import * as sendCommand from "./commands/send.mjs";
 import * as statusCommand from "./commands/status.mjs";
+import * as storeCommand from "./commands/store.mjs";
 import { HelpRequested } from "./lib/companion-cli.mjs";
+import { checkRuntime, runtimeGateMessage } from "./lib/store.mjs";
 
 // The subcommands that work on any provider's jobs; each job names the provider that runs it.
 const SUBCOMMANDS = {
   status: statusCommand,
   result: resultCommand,
   send: sendCommand,
-  cancel: cancelCommand
+  resume: resumeCommand,
+  cancel: cancelCommand,
+  store: storeCommand
 };
 
 function printUsage(subcommand = null) {
@@ -31,6 +36,11 @@ async function main() {
   if (!command) {
     throw new Error(`Unknown subcommand: ${subcommand}`);
   }
+  // The runtime gate runs before any store folder or file is created.
+  const gate = checkRuntime();
+  if (!gate.ok) {
+    throw new Error(runtimeGateMessage(gate));
+  }
   try {
     await command.run(argv);
   } catch (error) {
@@ -42,7 +52,7 @@ async function main() {
 }
 
 main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = storeCommand.storeErrorMessage(error) ?? (error instanceof Error ? error.message : String(error));
   process.stderr.write(`${message}\n`);
   process.exitCode = 1;
 });

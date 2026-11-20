@@ -282,6 +282,12 @@ export class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
+    this.startProcess();
+    await this.handshake();
+  }
+
+  /** Starts the app-server process and takes ownership of it, without the handshake. */
+  startProcess() {
     const env = this.options.env ?? process.env;
     const spawnPlan = resolveCommand("codex", ["app-server"], env);
     // `ownProcessGroup: true` (the background worker's driver passes it; off by default) makes the
@@ -298,7 +304,10 @@ export class SpawnedCodexAppServerClient extends AppServerClientBase {
         windowsHide: true
       })
     );
+  }
 
+  /** Sends the initialize request and the initialized notification to a started app server. */
+  async handshake() {
     this.serverInfo = await this.request("initialize", {
       clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
       capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
@@ -451,6 +460,29 @@ export class SpawnedCodexAppServerClient extends AppServerClientBase {
     }
     stdin.write(line);
   }
+}
+
+/**
+ * Starts one app server for one worker or one command and resolves to `{ client, child, pid }`:
+ * the initialized client, its ChildProcess (stdin and stdout piped; the caller holds it) and its
+ * pid. `ownProcessGroup` is passed on to the client (see initialize). With `handshake: false` it
+ * resolves as soon as the process exists, with a client the caller initializes through
+ * `client.handshake()`; a process that could not be started rejects.
+ */
+export async function spawnAppServer(cwd, { env = undefined, ownProcessGroup = false, handshake = true } = {}) {
+  if (!handshake) {
+    const client = new SpawnedCodexAppServerClient(cwd, { env, ownProcessGroup });
+    client.startProcess();
+    if (client.proc.pid === undefined) {
+      // A process that was not started reports its error on the next turn of the event loop.
+      await client.exitPromise;
+      await client.close().catch(() => {});
+      throw client.exitError ?? new Error("codex app-server could not be started.");
+    }
+    return { client, child: client.proc, pid: client.proc.pid };
+  }
+  const client = await CodexAppServerClient.connect(cwd, { env, ownProcessGroup });
+  return { client, child: client.proc, pid: client.proc.pid };
 }
 
 export class CodexAppServerClient {

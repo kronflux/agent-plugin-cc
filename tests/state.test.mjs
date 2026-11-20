@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -5,11 +6,10 @@ import process from "node:process";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { makeTempDir } from "./helpers.mjs";
+import { makeTempDir, stopOwnedProcess } from "./helpers.mjs";
 import * as state from "../plugins/agent/scripts/lib/state.mjs";
 
-const { listJobs, queueJobMessage, readJobFile, resolveJobFile, resolveJobsDir, resolveStateDir, takeJobMessages, takeJobRequest, writeJobFile } =
-  state;
+const { getConfig, resolveStateDir } = state;
 
 test("resolveStateDir uses a temp-backed per-workspace directory", (t) => {
   const workspace = makeTempDir(t);
@@ -53,58 +53,22 @@ test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", (t) => {
   }
 });
 
-// Writes a record in the format used before prompts had their own request file.
-function writeLegacyRecord(workspace, id, fields = {}) {
-  const jobFile = resolveJobFile(workspace, id);
+test("a legacy state.json index becomes a config file", (t) => {
+  const workspace = makeTempDir(t);
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
   fs.writeFileSync(
-    jobFile,
+    path.join(stateDir, "state.json"),
     JSON.stringify({
-      id,
-      status: "queued",
-      updatedAt: "2020-01-01T00:00:00.000Z",
-      request: { prompt: "old prompt" },
-      ...fields
+      version: 1,
+      config: { stopReviewGate: true },
+      jobs: [{ id: "legacy-1", status: "completed", summary: "one" }]
     })
   );
-  return jobFile;
-}
 
-test("listing jobs does not write legacy records", (t) => {
-  const workspace = makeTempDir(t);
-  const jobFile = writeLegacyRecord(workspace, "task-legacy-list", { status: "completed" });
-  const before = fs.readFileSync(jobFile, "utf8");
-
-  const jobs = listJobs(workspace);
-
-  assert.equal(jobs.length, 1);
-  assert.equal("request" in jobs[0], false);
-  assert.equal(fs.readFileSync(jobFile, "utf8"), before);
-  assert.equal(fs.existsSync(jobFile.replace(/\.json$/, ".request.json")), false);
-});
-
-test("a legacy prompt reaches the worker and leaves the record", (t) => {
-  const workspace = makeTempDir(t);
-  const jobFile = writeLegacyRecord(workspace, "task-legacy-take");
-
-  assert.deepEqual(takeJobRequest(workspace, "task-legacy-take"), { prompt: "old prompt" });
-
-  assert.equal(fs.readFileSync(jobFile, "utf8").includes("old prompt"), false);
-  assert.equal(readJobFile(jobFile).status, "queued");
-  assert.equal(takeJobRequest(workspace, "task-legacy-take"), null);
-});
-
-test("a newer write during the legacy prompt hand-over is kept", (t) => {
-  const workspace = makeTempDir(t);
-  const jobFile = writeLegacyRecord(workspace, "task-legacy-race");
-
-  const request = takeJobRequest(workspace, "task-legacy-race", {
-    beforeReplace() {
-      writeJobFile(workspace, "task-legacy-race", { id: "task-legacy-race", status: "queued", summary: "newer" });
-    }
-  });
-
-  assert.deepEqual(request, { prompt: "old prompt" });
-  assert.equal(readJobFile(jobFile).summary, "newer");
+  assert.equal(getConfig(workspace).stopReviewGate, true);
+  assert.equal(fs.existsSync(path.join(stateDir, "state.json")), false);
+  assert.equal(fs.existsSync(path.join(stateDir, "state.json.migrated")), true);
 });
 
 test("a corrupt legacy state file is kept and warned about", (t) => {
@@ -119,7 +83,7 @@ test("a corrupt legacy state file is kept and warned about", (t) => {
     return true;
   });
 
-  listJobs(workspace);
+  getConfig(workspace);
 
   t.mock.restoreAll();
   assert.equal(fs.existsSync(legacyFile), true);
@@ -146,24 +110,58 @@ test("the state root must be a private folder of the caller", () => {
   assert.doesNotThrow(() => assertPrivateStateRoot(dir, { lstat: stat({}), getuid: () => 1000 }));
 });
 
-test("a bad message file does not lose messages claimed with it", async (t) => {
-  const workspace = makeTempDir(t);
-  writeJobFile(workspace, "task-msg", { id: "task-msg", status: "running" });
-  const ids = [];
-  for (const text of ["first", "broken", "third"]) {
-    ids.push(queueJobMessage(workspace, "task-msg", text));
-    await new Promise((resolve) => setTimeout(resolve, 5));
+test("the job store is opened only in folders the caller owns", async () => {
+  const { assertPrivateStoreFolders } = await import("../plugins/agent/scripts/lib/store.mjs");
+  const dirs = ["/tmp/agent-plugin-1000", "/tmp/agent-plugin-1000/repo-0123", "/tmp/agent-plugin-1000/repo-0123/store"];
+  const lstat = (foreign, overrides = {}) => (dir) => ({
+    isSymbolicLink: () => false,
+    isDirectory: () => true,
+    uid: 1000,
+    ...(dir === foreign ? overrides : {})
+  });
+  const posix = { platform: "linux", getuid: () => 1000 };
+  const refused = (dir) => ({ message: `The job store folder ${dir} is not a private folder owned by you; set CLAUDE_PLUGIN_DATA to a folder of your own.` });
+
+  assert.doesNotThrow(() => assertPrivateStoreFolders(dirs, { ...posix, lstat: lstat(null) }));
+  for (const dir of dirs) {
+    assert.throws(() => assertPrivateStoreFolders(dirs, { ...posix, lstat: lstat(dir, { uid: 2000 }) }), refused(dir));
   }
-  const dir = path.join(resolveJobsDir(workspace), "task-msg.messages");
-  fs.writeFileSync(path.join(dir, `${ids[1]}.pending.json`), "{bad");
+  assert.throws(() => assertPrivateStoreFolders(dirs, { ...posix, lstat: lstat(dirs[1], { isSymbolicLink: () => true }) }), refused(dirs[1]));
+  // Windows has a temp directory per user: nothing is checked there.
+  assert.doesNotThrow(() => assertPrivateStoreFolders(dirs, { platform: "win32", getuid: () => 1000, lstat: lstat(dirs[0], { uid: 2000 }) }));
+});
 
-  const messages = takeJobMessages(workspace, "task-msg");
-
-  assert.deepEqual(
-    messages.map((message) => message.text),
-    ["first", "third"]
+test("a command's store open waits out a store another process holds locked", async (t) => {
+  const { openStore, openStoreRetrying, StoreError } = await import("../plugins/agent/scripts/lib/store.mjs");
+  const stateDir = makeTempDir(t);
+  openStore(stateDir).close();
+  // A child takes the write lock of the store for 3 s, longer than one 2 s open attempt.
+  const holder = spawn(
+    process.execPath,
+    [
+      "--disable-warning=ExperimentalWarning",
+      "-e",
+      'const { DatabaseSync } = require("node:sqlite"); const db = new DatabaseSync(process.argv[1]); db.exec("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE"); console.log("locked"); setTimeout(() => { db.exec("COMMIT"); db.close(); }, 3000);',
+      path.join(stateDir, "store", "state.db")
+    ],
+    { stdio: ["ignore", "pipe", "inherit"] }
   );
-  assert.deepEqual(takeJobMessages(workspace, "task-msg"), []);
+  t.after(() => stopOwnedProcess(holder));
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("the lock holder did not report its lock within 10 s")), 10000);
+    holder.stdout.once("data", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+
+  assert.throws(
+    () => openStore(stateDir, { busyTimeoutMs: 200 }),
+    (error) => error instanceof StoreError && (error.code === "busy" || error.code === "locked")
+  );
+  const store = openStoreRetrying(stateDir);
+  assert.equal(typeof store.instanceId, "string");
+  store.close();
 });
 
 test("reads skip a shared fallback state root that is not private to the caller", (t) => {

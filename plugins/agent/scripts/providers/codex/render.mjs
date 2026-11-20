@@ -132,3 +132,40 @@ export function renderUsageReport(response, options = {}) {
 
   return `${lines.join("\n")}\n`;
 }
+
+/**
+ * The normalised usage object (schema 1) of an `account/rateLimits/read` response: one group per
+ * limit the text report lists, and one bucket per primary and secondary window, with the fraction
+ * left (`1 - usedPercent / 100`) and the reset time in ISO 8601 UTC.
+ */
+export function normalizeCodexUsage(response, { now = Date.now() } = {}) {
+  const main = response?.rateLimits ?? {};
+  const byId = response?.rateLimitsByLimitId && typeof response.rateLimitsByLimitId === "object" ? response.rateLimitsByLimitId : {};
+  const limits = Object.values(byId).filter(Boolean);
+  const mainHasContent = Boolean(main.limitId || main.primary || main.secondary);
+  const mainDuplicated = limits.some((limit) => limit.limitId && limit.limitId === main.limitId);
+  if (!mainDuplicated && (mainHasContent || limits.length === 0)) {
+    limits.unshift(main);
+  }
+  const bucketOf = (limit, slot) => {
+    const window = limit[slot];
+    return {
+      id: `${limit.limitId ?? "codex"}-${slot}`,
+      name: formatWindowLabel(window.windowDurationMins),
+      window: Number.isFinite(window.windowDurationMins) ? `${window.windowDurationMins}m` : null,
+      remainingFraction: Number.isFinite(window.usedPercent) ? Math.min(1, Math.max(0, 1 - window.usedPercent / 100)) : null,
+      resetTime: Number.isFinite(window.resetsAt) ? new Date(window.resetsAt * 1000).toISOString() : null
+    };
+  };
+  return {
+    schema: 1,
+    provider: "codex",
+    fetchedAt: new Date(now).toISOString(),
+    groups: limits.map((limit) => ({
+      name: limit.limitName ?? limit.limitId ?? "Codex",
+      description: null,
+      defaultDelegation: false,
+      buckets: ["primary", "secondary"].filter((slot) => limit[slot]).map((slot) => bucketOf(limit, slot))
+    }))
+  };
+}

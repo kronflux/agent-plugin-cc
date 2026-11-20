@@ -2685,7 +2685,8 @@ test("every post-end crash point ends released", { timeout: 600000 }, async (t) 
     if (closure) {
       process.env.AGENT_PLUGIN_TEST_CONTRACTS = fx.WORKER_CONTRACTS;
     } else {
-      delete process.env.AGENT_PLUGIN_TEST_CONTRACTS;
+      // An empty list, not an unset variable: unset means the provider's own declared contracts.
+      process.env.AGENT_PLUGIN_TEST_CONTRACTS = "[]";
     }
     const phase = cases.filter((entry) => entry.closure === closure);
     for (let index = 0; index < phase.length; index += 6) {
@@ -2956,6 +2957,15 @@ test("two continuations of one thread never run their providers at once", { time
           const workers = [successorId, second].map((jobId) => fx.startTestWorker(stateDir, jobId, fx.workerEnv(), pids));
           const exits = await Promise.all(workers.map((worker) => worker.exit));
           assert.deepEqual(exits.map((exit) => exit.code), [0, 0], exits.map((exit) => exit.stderr).join(" | "));
+          // A releasing worker launches the next job's worker itself, and that worker may claim the
+          // job before the one started here does; the job is done when its execution is released.
+          await fx.waitFor(() => [successorId, second].every((jobId) => fx.jobRow(stateDir, jobId).exec_released_at !== null), {
+            timeoutMs: 60000,
+            describe: "both continuations released"
+          });
+          for (const jobId of [successorId, second]) {
+            pids.push(...fx.jobProcesses(stateDir, jobId));
+          }
           const spans = [successorId, second].map((jobId) => {
             const trace = fx.readTrace(stateDir, jobId);
             pids.push(...fx.providerIdentities(stateDir, jobId));
@@ -3969,4 +3979,18 @@ test("the dispatch-order check catches a cut-off request whose first bytes prece
   await worker.exit;
   assert.equal(startRequests(stateDir, jobId).length, 0);
   assert.ok(firstByteViolations(stateDir, jobId).length > 0, "a cut-off prefix written before the dispatch commit went unnoticed");
+});
+
+test("a worker that cannot read its own identity claims nothing and leaves the job queued", { timeout: 90000 }, async (t) => {
+  const stateDir = makeStoreDir(t);
+  const db = openTestStore(t, stateDir);
+  const jobId = await fx.createDriverJob(db, {});
+  const pids = fx.trackProcesses(t);
+  const worker = fx.startTestWorker(stateDir, jobId, fx.workerEnv({ AGENT_PLUGIN_TEST_PROCESS: JSON.stringify({ lookup: "unknown" }) }), pids);
+  const exit = await worker.exit;
+  assert.equal(exit.code, 0, exit.stderr);
+  const row = fx.jobRow(stateDir, jobId);
+  assert.equal(row.claimed_at, null, "the job was claimed without a worker start token");
+  assert.equal(row.worker_pid, null);
+  assert.equal(row.end_state, null);
 });

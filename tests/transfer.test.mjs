@@ -309,6 +309,25 @@ test("the snapshot drops a partial final record", async (t) => {
   assert.ok(!Number.isNaN(Date.parse(snapshot.takenAt)));
 });
 
+test("the snapshot keeps a complete final record that has no newline", async (t) => {
+  const { stageTranscriptSnapshot } = await loadTransferModule();
+  const home = makeTempDir(t);
+  const profile = makeTempDir(t);
+  const projectDir = path.join(profile, "projects", "-repo");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const source = path.join(projectDir, "sess-final.jsonl");
+  const whole = `${JSON.stringify({ type: "user", message: { content: "one" } })}\n`;
+  const last = JSON.stringify({ type: "user", message: { content: "last request" } });
+  fs.writeFileSync(source, whole + last, "utf8");
+
+  const snapshot = await withEnv({ HOME: home, USERPROFILE: home }, () => stageTranscriptSnapshot(source));
+  t.after(() => snapshot.cleanup());
+
+  assert.equal(fs.readFileSync(snapshot.path, "utf8"), whole + last);
+  assert.equal(snapshot.bytes, Buffer.byteLength(whole + last));
+  assert.equal(snapshot.sha256, sha256(Buffer.from(whole + last)));
+});
+
 test("the snapshot copies a source already under the home projects folder", async (t) => {
   const { stageTranscriptSnapshot } = await loadTransferModule();
   const home = makeTempDir(t);
@@ -342,6 +361,30 @@ test("cleanup removes the copy and the folders it created", async (t) => {
   assert.equal(fs.existsSync(path.dirname(snapshot.path)), false);
   assert.equal(fs.existsSync(path.join(home, ".claude")), false);
   assert.equal(fs.existsSync(source), true);
+});
+
+test("cleanup returns false and does not throw when the copy cannot be removed", async (t) => {
+  const { stageTranscriptSnapshot } = await loadTransferModule();
+  const home = makeTempDir(t);
+  const profile = makeTempDir(t);
+  const projectDir = path.join(profile, "projects", "-repo");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const source = path.join(projectDir, "sess-held.jsonl");
+  fs.writeFileSync(source, `${JSON.stringify({ type: "user", message: { content: "held" } })}\n`, "utf8");
+
+  const snapshot = await withEnv({ HOME: home, USERPROFILE: home }, () => stageTranscriptSnapshot(source));
+  // Another process holds the copy open without delete sharing.
+  const rmSync = t.mock.method(fs, "rmSync", () => {
+    throw Object.assign(new Error("EBUSY: resource busy or locked"), { code: "EBUSY" });
+  });
+  let removed;
+  assert.doesNotThrow(() => {
+    removed = snapshot.cleanup();
+  });
+  assert.equal(removed, false);
+  assert.equal(fs.existsSync(snapshot.path), true);
+  rmSync.mock.restore();
+  assert.equal(snapshot.cleanup(), true);
 });
 
 test("the import uses the given hash", async (t) => {

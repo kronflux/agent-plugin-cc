@@ -1,21 +1,22 @@
-import {
-  outputCommandResult,
-  outputResult,
-  parseCommandInput,
-  resolveCommandCwd,
-  sleep
-} from "../lib/companion-cli.mjs";
-import { buildSingleJobSnapshot, buildStatusSnapshot, reconcileJobLiveness } from "../lib/job-control.mjs";
-import { renderJobStatusReport, renderStatusReport } from "../lib/render.mjs";
+import fs from "node:fs";
+import process from "node:process";
+
+import { outputCommandResult, parseCommandInput } from "../lib/companion-cli.mjs";
+import { getSessionId } from "../lib/host.mjs";
+import { renderStatusJson, renderStoreJobStatus, renderStoreStatus } from "../lib/render.mjs";
+import { listJobViews, readJobView } from "../lib/state.mjs";
+import { waitForJob } from "../lib/tracked-jobs.mjs";
+import { commandStateDir, jobLogFile, reconcileAndPrune, resolveReadView, withCommandStore } from "./store.mjs";
 
 export const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 export const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+// How many jobs `status` lists: the session's newest, or with --all the repository's newest.
+const SESSION_JOB_LIMIT = 20;
+const ALL_JOB_LIMIT = 200;
+const PROGRESS_LINES = 4;
+const PROGRESS_TAIL_BYTES = 16384;
 
-export const usage = "status [job-id] [--wait] [--timeout-ms <ms>] [--all] [--json]";
-
-function renderStatusPayload(report, asJson) {
-  return asJson ? report : renderStatusReport(report);
-}
+export const usage = "status [job-id|label] [--wait] [--timeout-ms <ms>] [--all] [--json]";
 
 export function isActiveJobStatus(status) {
   return status === "queued" || status === "running";
@@ -33,24 +34,31 @@ export function parseWaitTimeout(value) {
   return timeoutMs;
 }
 
-export async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
-  const timeoutMs = parseWaitTimeout(options.timeoutMs);
-  const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
-  const deadline = Date.now() + timeoutMs;
-  await reconcileJobLiveness(cwd);
-  let snapshot = buildSingleJobSnapshot(cwd, reference);
-
-  while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
-    await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
-    await reconcileJobLiveness(cwd);
-    snapshot = buildSingleJobSnapshot(cwd, reference);
+/** The last non-empty lines of a job's log, as its progress. */
+export function readProgress(logFile, maxLines = PROGRESS_LINES) {
+  let fd;
+  try {
+    fd = fs.openSync(logFile, "r");
+  } catch {
+    return [];
   }
+  try {
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(0, size - PROGRESS_TAIL_BYTES);
+    const buffer = Buffer.alloc(size - start);
+    fs.readSync(fd, buffer, 0, buffer.length, start);
+    const lines = buffer.toString("utf8").split(/\r?\n/);
+    if (start > 0) {
+      lines.shift();
+    }
+    return lines.map((line) => line.trimEnd()).filter(Boolean).slice(-maxLines);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
 
-  return {
-    ...snapshot,
-    waitTimedOut: isActiveJobStatus(snapshot.job.status),
-    timeoutMs
-  };
+function unknownJob(reference) {
+  return new Error(`No job matches "${reference}" in this repository.`);
 }
 
 export async function run(argv) {
@@ -58,27 +66,40 @@ export async function run(argv) {
     valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
     booleanOptions: ["json", "all", "wait"]
   });
-
-  const cwd = resolveCommandCwd(options);
+  const stateDir = commandStateDir(options);
   const reference = positionals[0] ?? "";
-  if (!options.wait) {
-    await reconcileJobLiveness(cwd);
+  const timeoutMs = parseWaitTimeout(options["timeout-ms"]);
+  if (options.wait && !reference) {
+    throw new Error("`status --wait` requires a job id or label.");
   }
-  if (reference) {
-    const snapshot = options.wait
-      ? await waitForSingleJobSnapshot(cwd, reference, {
-          timeoutMs: options["timeout-ms"],
-          pollIntervalMs: options["poll-interval-ms"]
-        })
-      : buildSingleJobSnapshot(cwd, reference);
-    outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
+  await reconcileAndPrune(stateDir);
+
+  if (!reference) {
+    const views = await withCommandStore(stateDir, (store) =>
+      listJobViews(store, { sessionId: getSessionId(process.env), all: Boolean(options.all), limit: options.all ? ALL_JOB_LIMIT : SESSION_JOB_LIMIT })
+    );
+    outputCommandResult(renderStatusJson(views), renderStoreStatus(views, { all: Boolean(options.all) }), options.json);
     return;
   }
 
-  if (options.wait) {
-    throw new Error("`status --wait` requires a job id.");
+  let view = await withCommandStore(stateDir, (store) => resolveReadView(store, reference));
+  if (!view) {
+    throw unknownJob(reference);
   }
-
-  const report = buildStatusSnapshot(cwd, { all: options.all });
-  outputResult(renderStatusPayload(report, options.json), options.json);
+  let waitTimedOut = false;
+  if (options.wait) {
+    // The wait returns when the job leaves queued, running and stopping, and records that its
+    // outcome was returned, so the monitor does not announce it again.
+    const waited = await waitForJob(stateDir, view.id, { until: "not-active", timeoutMs, deliver: true });
+    waitTimedOut = waited.timedOut;
+    view = waited.view ?? (await withCommandStore(stateDir, (store) => readJobView(store, view.id)));
+    if (!view) {
+      throw unknownJob(reference);
+    }
+  }
+  const logFile = jobLogFile(stateDir, view.id);
+  const text =
+    renderStoreJobStatus(view, { progress: readProgress(logFile), logFile: fs.existsSync(logFile) ? logFile : null }) +
+    (waitTimedOut ? `\nJob ${view.id} is still ${view.state} after ${Math.round(timeoutMs / 1000)} s.\n` : "");
+  outputCommandResult({ ...renderStatusJson([view]), ...(options.wait ? { waitTimedOut } : {}) }, text, options.json);
 }

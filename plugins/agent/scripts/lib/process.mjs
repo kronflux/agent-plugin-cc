@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
 import { boundary, testDelay } from "./store.mjs";
 
@@ -166,64 +167,6 @@ function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
 }
 
-/**
- * Returns a Map from PID to command line for the listed processes that are running, or null
- * when the lookup itself failed. A PID missing from the Map is not running.
- */
-export function readProcessCommandLines(pids, options = {}) {
-  const platform = options.platform ?? process.platform;
-  const runCommandImpl = options.runCommandImpl ?? runCommand;
-  const readFileImpl = options.readFileImpl ?? fs.readFileSync;
-  const ids = [...new Set(pids.filter((pid) => Number.isInteger(pid) && pid > 0))];
-  const found = new Map();
-  if (ids.length === 0) {
-    return found;
-  }
-
-  // A process that exits while its /proc entry is read gives ENOENT or ESRCH, and a zombie has
-  // an empty command line; each counts as not running.
-  if (platform === "linux") {
-    for (const pid of ids) {
-      let commandLine;
-      try {
-        commandLine = String(readFileImpl(`/proc/${pid}/cmdline`, "utf8")).split("\0").join(" ").trim();
-      } catch (error) {
-        if (error?.code === "ENOENT" || error?.code === "ESRCH") {
-          continue;
-        }
-        return null;
-      }
-      if (commandLine) {
-        found.set(pid, commandLine);
-      }
-    }
-    return found;
-  }
-
-  const lookup =
-    platform === "win32"
-      ? runCommandImpl("powershell.exe", [
-          "-NoProfile",
-          "-NonInteractive",
-          "-Command",
-          `Get-CimInstance Win32_Process -Filter '${ids.map((pid) => `ProcessId=${pid}`).join(" OR ")}' | ` +
-            'ForEach-Object { "$($_.ProcessId) $($_.CommandLine)" }'
-        ])
-      : runCommandImpl("ps", ["-o", "pid=,command=", "-p", ids.join(",")]);
-  // ps exits 1 when none of the processes exist, which is a valid answer.
-  const psFoundNone = platform !== "win32" && lookup.status === 1 && !lookup.stdout.trim();
-  if (lookup.error || (lookup.status !== 0 && !psFoundNone)) {
-    return null;
-  }
-  for (const line of lookup.stdout.split(/\r?\n/)) {
-    const match = /^\s*(\d+)\s?(.*)$/.exec(line);
-    if (match) {
-      found.set(Number(match[1]), match[2].trim());
-    }
-  }
-  return found;
-}
-
 export function isProcessAlive(pid, killImpl = process.kill.bind(process)) {
   try {
     killImpl(pid, 0);
@@ -339,7 +282,9 @@ export function formatCommandFailure(result) {
 // unknownPidsOnce: [pid], heldProbeDelayMs }. `stopCommandFails` replaces the Windows stop
 // command by a stop of the root alone that reports failure, standing for a failed command while
 // the root exits by itself; `unknownPidsOnce` makes the first query of this process that includes
-// those pids answer unknown for them; `heldProbeDelayMs` slows a held stop's probe (heldProbe).
+// those pids answer unknown for them; `heldProbeDelayMs` slows a held stop's probe (heldProbe);
+// `windowsQuery: "powershell"` makes the Windows identity query skip the script host;
+// `unknownPids: [pid]` makes every query answer unknown for those pids.
 function processSeam() {
   try {
     return JSON.parse(process.env.AGENT_PLUGIN_TEST_PROCESS ?? "null") ?? {};
@@ -399,6 +344,7 @@ function readLinuxIdentity(pid) {
 function runBounded(file, args, timeoutMs, deadline = undefined) {
   return new Promise((resolve) => {
     let stdout = "";
+    let stderr = "";
     let settled = false;
     testDelay("command");
     const limitMs = Math.min(timeoutMs, remainingUntil(deadline));
@@ -406,12 +352,12 @@ function runBounded(file, args, timeoutMs, deadline = undefined) {
       resolve({ ok: false, reason: "late", stdout: "" });
       return;
     }
-    const child = spawn(file, args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    const child = spawn(file, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     const finish = (value) => {
       if (!settled) {
         settled = true;
         clearTimeout(timer);
-        resolve(value);
+        resolve({ ...value, stderr });
       }
     };
     const timer = setTimeout(() => {
@@ -423,17 +369,82 @@ function runBounded(file, args, timeoutMs, deadline = undefined) {
       finish({ ok: false, reason: "timed out", stdout });
     }, Math.max(1, Math.floor(limitMs)));
     child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stderr.on("data", (chunk) => (stderr += chunk));
     child.on("error", (error) => finish({ ok: false, reason: String(error?.message ?? error), stdout }));
     child.on("close", (code) => finish(code === 0 ? { ok: true, stdout } : { ok: false, reason: `exit ${code}`, stdout }));
   });
 }
 
-async function readWindowsIdentities(ids, timeoutMs) {
+/**
+ * Whether a failed `taskkill /PID <rootPid> /T /F` still stopped the root's tree. A root that is
+ * a batch-file wrapper (`cmd.exe` running one program) exits by itself the moment the command
+ * stops its child, and the command then fails on the root, which it reports as not found. That
+ * is a tree stop made by this command when both hold: its standard output reports a process
+ * stopped as a child of the root, which proves the root was in the command's own listing, and
+ * every line of its error output is about the root, so nothing else was left running. Only the
+ * numbers are read, because the text around them is localised: on a success line the stopped
+ * process comes first and its parent second, and an error line names the process it is about
+ * first. A root that had exited before the command ran gives no success line, so it is never
+ * credited.
+ */
+export function failedStopStoppedTree(rootPid, { stdout = "", stderr = "" } = {}) {
+  const numbers = (line) => [...line.matchAll(/\d+/g)].map((match) => Number(match[0]));
+  const lines = (text) =>
+    String(text ?? "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+  const childStopped = lines(stdout).some((line) => {
+    const [stopped, ...rest] = numbers(line);
+    return stopped !== undefined && stopped !== rootPid && rest.includes(rootPid);
+  });
+  const onlyRootFailed = lines(stderr).every((line) => numbers(line)[0] === rootPid);
+  return childStopped && onlyRootFailed;
+}
+
+// The Windows Script Host query of process-identity.jscript, beside this file.
+const SCRIPT_HOST_QUERY = fileURLToPath(new URL("./process-identity.jscript", import.meta.url));
+// True once the script host failed for a reason other than time (disabled by policy, missing):
+// this process then asks PowerShell only.
+let scriptHostFailed = false;
+
+// The creation times of `ids` as lines "<pid> <ticks>", by the Windows Script Host: it answers in
+// tens of milliseconds, where starting PowerShell alone takes about half a second of processor
+// time. `ok` is false when the host did not run the query to its end.
+async function queryScriptHost(ids, timeoutMs) {
+  const result = await runBounded("cscript.exe", ["//nologo", "//E:JScript", SCRIPT_HOST_QUERY, ...ids.map(String)], timeoutMs);
+  const lines = result.stdout.split(/\r?\n/).map((line) => line.trim());
+  if (result.ok && lines.includes("done")) {
+    return { ok: true, stdout: lines.filter((line) => line !== "done").join("\n") };
+  }
+  return { ok: false, reason: result.ok ? "the script host query did not finish" : result.reason, stdout: "" };
+}
+
+function queryPowerShell(ids, timeoutMs) {
   const filter = ids.map((pid) => `ProcessId=${pid}`).join(" OR ");
   const script =
     `Get-CimInstance Win32_Process -Filter '${filter}' | ` +
     'ForEach-Object { if ($_.CreationDate) { "$($_.ProcessId) $($_.CreationDate.ToUniversalTime().Ticks)" } else { "$($_.ProcessId) -" } }';
-  const result = await runBounded("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], timeoutMs);
+  return runBounded("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], timeoutMs);
+}
+
+// Both routes give the same token for one process (the creation time in UTC ticks), so a token
+// recorded by one is confirmed by the other. `windowsQuery: "powershell"` in the test seam skips
+// the script host.
+async function readWindowsIdentities(ids, timeoutMs) {
+  const started = performance.now();
+  let result = null;
+  if (!scriptHostFailed && processSeam().windowsQuery !== "powershell") {
+    result = await queryScriptHost(ids, timeoutMs);
+    if (!result.ok && result.reason !== "timed out" && result.reason !== "late") {
+      scriptHostFailed = true;
+      result = null;
+    }
+  }
+  if (result === null) {
+    const left = timeoutMs - (performance.now() - started);
+    result = left > 0 ? await queryPowerShell(ids, left) : { ok: false, reason: "timed out", stdout: "" };
+  }
   const identities = new Map();
   if (!result.ok) {
     for (const pid of ids) {
@@ -529,6 +540,8 @@ export async function readProcessIdentities(pids, { deadline = undefined } = {})
   }
   for (const pid of unknownOnce) {
     answered.set(pid, { state: "unknown", reason: "unknown once (AGENT_PLUGIN_TEST_PROCESS)" });
+  }  for (const pid of (seam.unknownPids ?? []).filter((pid) => ids.includes(pid))) {
+    answered.set(pid, { state: "unknown", reason: "unknown (AGENT_PLUGIN_TEST_PROCESS)" });
   }
   return answered;
 }
@@ -635,9 +648,13 @@ export async function stopTree(identity, { deadline = undefined, expectedGroupId
     return "unknown";
   }
   // The stop command failed. A root that is gone now exited by itself or was stopped by someone
-  // else; that proves its exit only, never a tree stop.
+  // else; that proves its exit only, never a tree stop, unless the command's own output shows it
+  // stopped the root's child and failed on nothing but the root (failedStopStoppedTree).
   const after = await readProcessIdentity(identity.pid, { deadline: performance.now() + Math.max(500, remainingUntil(deadline)) });
-  return confirmIdentity(identity, after) === "absent" ? "absent" : "unknown";
+  if (confirmIdentity(identity, after) !== "absent") {
+    return "unknown";
+  }
+  return failedStopStoppedTree(identity.pid, result) ? "stopped" : "absent";
 }
 
 function stopRootAloneForTest(pid) {
@@ -647,6 +664,146 @@ function stopRootAloneForTest(pid) {
     // Already gone.
   }
   return { ok: false, reason: "exit 1", stdout: "" };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Verified tree stops of several processes from one batched identity query.
+
+function stoppableTarget(identity) {
+  return Boolean(identity) && Number.isInteger(identity.pid) && identity.pid > 0 && identity.pid !== process.pid;
+}
+
+// The POSIX stop of one verified target, as stopTree stops it after its identity read.
+function stopVerifiedPosix(identity, observed, { deadline, expectedGroupId, rootAlone }) {
+  if ((expectedGroupId === null || expectedGroupId === undefined) && rootAlone) {
+    testDelay("tree-signal");
+    if (remainingUntil(deadline) <= 0) {
+      return "unknown";
+    }
+    try {
+      process.kill(identity.pid, "SIGKILL");
+      return "root-stopped";
+    } catch (error) {
+      return error?.code === "ESRCH" ? "absent" : "unknown";
+    }
+  }
+  if (expectedGroupId === null || expectedGroupId === undefined || observed.groupId !== expectedGroupId || observed.groupId === ownGroupId()) {
+    return "mismatch";
+  }
+  testDelay("tree-signal");
+  if (remainingUntil(deadline) <= 0) {
+    return "unknown";
+  }
+  try {
+    process.kill(-observed.groupId, "SIGKILL");
+    return "stopped";
+  } catch (error) {
+    return error?.code === "ESRCH" ? "absent" : "unknown";
+  }
+}
+
+// The process ids a taskkill run reports as stopped: the first number on each line of its
+// standard output, which carries only its successes (errors go to standard error). The text
+// around the numbers is localised, so only the numbers are read. When any line of its error output
+// does not name one of `rootPids` first, another process (a descendant) failed and may still run,
+// so no pid is reported.
+export function pidsReportedStopped({ stdout = "", stderr = "" } = {}, rootPids = []) {
+  const pids = new Set();
+  const errorLines = String(stderr ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!errorLines.every((line) => rootPids.includes(Number(/\d+/.exec(line)?.[0])))) {
+    return pids;
+  }
+  for (const line of String(stdout ?? "").split(/\r?\n/)) {
+    const match = /\d+/.exec(line);
+    if (match) {
+      pids.add(Number(match[0]));
+    }
+  }
+  return pids;
+}
+
+/**
+ * Stops several processes' trees, each only when its exact identity was verified in one batched
+ * identity query, with stopTree's results (`stopped`, `root-stopped`, `absent`, `mismatch`,
+ * `unknown`) in the order of `identities`. `expectedGroupIds[i]` is the POSIX group of
+ * `identities[i]` (null for none); `rootAlone` applies to every target. On Windows one
+ * `taskkill /PID <pid> ... /T /F` stops every verified target: exit 0 means all of them stopped;
+ * otherwise a target stopped only when its pid is reported on the command's standard output and
+ * its error output names no process but requested roots, and the rest are checked again in one batched query (absent or unknown, never a tree stop). The
+ * deadline is checked as the last step before each signal or command start; past it nothing is
+ * sent and the target is `unknown`.
+ */
+export async function stopTrees(identities, { deadline = undefined, expectedGroupIds = [], rootAlone = false } = {}) {
+  const results = identities.map(() => "unknown");
+  const candidates = identities.map((identity, index) => ({ identity, index })).filter(({ identity }) => stoppableTarget(identity));
+  if (candidates.length === 0) {
+    return results;
+  }
+  const observed = await readProcessIdentities(
+    candidates.map(({ identity }) => identity.pid),
+    { deadline }
+  );
+  const verified = [];
+  for (const { identity, index } of candidates) {
+    const seen = observed.get(identity.pid);
+    const verdict = confirmIdentity(identity, seen);
+    if (verdict === "absent") {
+      results[index] = seen?.state === "present" ? "mismatch" : "absent";
+    } else if (verdict === "present" && !processSeam().stopFails) {
+      verified.push({ identity, index, observed: seen });
+    }
+  }
+  if (verified.length === 0) {
+    return results;
+  }
+  if (process.platform !== "win32") {
+    for (const { identity, index, observed: seen } of verified) {
+      results[index] = remainingUntil(deadline) <= 0 ? "unknown" : stopVerifiedPosix(identity, seen, { deadline, expectedGroupId: expectedGroupIds[index] ?? null, rootAlone });
+    }
+    return results;
+  }
+  const remaining = remainingUntil(deadline);
+  if (remaining <= 0) {
+    return results;
+  }
+  const command = await runBounded(
+    "taskkill",
+    [...verified.flatMap(({ identity }) => ["/PID", String(identity.pid)]), "/T", "/F"],
+    Math.min(remaining, 30000),
+    deadline
+  );
+  if (command.ok) {
+    for (const { index } of verified) {
+      results[index] = "stopped";
+    }
+    return results;
+  }
+  if (command.reason === "late") {
+    return results;
+  }
+  const reported = pidsReportedStopped(command, verified.map(({ identity }) => identity.pid));
+  const unreported = verified.filter(({ identity, index }) => {
+    if (reported.has(identity.pid)) {
+      results[index] = "stopped";
+      return false;
+    }
+    return true;
+  });
+  if (unreported.length > 0) {
+    // A target the command did not report as stopped may have exited by itself; that proves its
+    // exit only, never a tree stop.
+    const after = await readProcessIdentities(
+      unreported.map(({ identity }) => identity.pid),
+      { deadline: performance.now() + Math.max(500, remainingUntil(deadline)) }
+    );
+    for (const { identity, index } of unreported) {
+      results[index] = confirmIdentity(identity, after.get(identity.pid)) === "absent" ? "absent" : "unknown";
+    }
+  }
+  return results;
 }
 
 // Signal 0 to the whole group: ESRCH means it has no member at all. The kernel answers for the
@@ -797,8 +954,12 @@ export async function stopHeldTree(child, { groupId = null, deadline = undefined
   if (result.ok) {
     return "stopped";
   }
-  // A failed command on a root that is gone now proves its exit only, never a tree stop.
-  return isProcessAlive(child.pid) ? "unknown" : "absent";
+  // A failed command on a root that is gone now proves its exit only, never a tree stop, unless
+  // the command's own output shows it stopped the root's child and failed on nothing but the root.
+  if (isProcessAlive(child.pid)) {
+    return "unknown";
+  }
+  return failedStopStoppedTree(child.pid, result) ? "stopped" : "absent";
 }
 
 /** The Linux process group of this process, or null elsewhere. */

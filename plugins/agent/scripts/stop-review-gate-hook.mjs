@@ -2,20 +2,25 @@
 
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import process from "node:process";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { getCodexAvailability } from "./providers/codex/runtime.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { getConfig, listJobs, resolveStateDir } from "./lib/state.mjs";
-import { sortJobsNewestFirst } from "./lib/job-control.mjs";
-import { formatBlockDecision, getProjectDir, getSessionId, readHookInput, SESSION_ID_ENV } from "./lib/host.mjs";
+import { resolveModelSelection } from "./lib/model-selection.mjs";
+import { getProvider } from "./lib/providers.mjs";
+import { createJob, getConfig, listJobViews, resolveStateDir } from "./lib/state.mjs";
+import { checkRuntime, openStore, runtimeGateMessage } from "./lib/store.mjs";
+import { launchWorker } from "./lib/task-launch.mjs";
+import { waitForJob } from "./lib/tracked-jobs.mjs";
+import { formatBlockDecision, getProjectDir, getSessionId, readHookInput, readRequesterIdentity } from "./lib/host.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
-const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
+// The review waits for its job at most this long, inside the Stop hook's 900 s limit in hooks.json,
+// so the hook can still say that the job keeps running. AGENT_PLUGIN_STOP_REVIEW_WAIT_MS replaces it
+// in tests.
+const STOP_REVIEW_WAIT_MS = 870 * 1000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const VERDICT_SCHEMA = path.join(ROOT_DIR, "schemas", "stop-gate-verdict.schema.json");
@@ -34,12 +39,9 @@ function logNote(message) {
   process.stderr.write(`${message}\n`);
 }
 
-function filterJobsForCurrentSession(jobs, input = {}) {
-  const sessionId = input.session_id || getSessionId() || null;
-  if (!sessionId) {
-    return jobs;
-  }
-  return jobs.filter((job) => job.sessionId === sessionId);
+function readWaitMs() {
+  const raw = (process.env.AGENT_PLUGIN_STOP_REVIEW_WAIT_MS ?? "").trim();
+  return /^\d+$/.test(raw) && Number(raw) > 0 ? Number(raw) : STOP_REVIEW_WAIT_MS;
 }
 
 // The previous Claude response is quoted between markers carrying a random id, so text in
@@ -81,31 +83,13 @@ function infrastructureFailure(problem) {
   return { ok: false, reason: `${problem} ${DISABLE_HINT}` };
 }
 
-// The last stderr line that is not a Node runtime warning, which is where the companion
-// prints the error that stopped it.
-function lastErrorLine(stderr) {
-  return (
-    String(stderr ?? "")
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith("(node:") && !line.startsWith("(Use `node --trace"))
-      .at(-1) ?? ""
-  );
+function messageOf(error) {
+  return error instanceof Error ? error.message : String(error);
 }
 
 // The verdict comes from the structured `verdict` field. Output that is not the expected JSON
 // object counts as a failed review, so "BLOCK" in a reason or in quoted text cannot decide it.
-function parseStopReviewOutput(rawOutput) {
-  const text = String(rawOutput ?? "").trim();
-  if (!text) {
-    return infrastructureFailure("The stop-time Codex review returned no output.");
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return infrastructureFailure("The stop-time Codex review did not return a JSON verdict.");
-  }
+function parseVerdict(parsed) {
   const reason = typeof parsed?.reason === "string" ? parsed.reason.trim() : "";
   if (parsed?.verdict === "allow") {
     return { ok: true, reason: null };
@@ -119,62 +103,96 @@ function parseStopReviewOutput(rawOutput) {
   return infrastructureFailure("The stop-time Codex review returned an unknown verdict.");
 }
 
-function runStopReview(cwd, input = {}) {
-  const scriptPath = path.join(SCRIPT_DIR, "codex-companion.mjs");
-  const prompt = buildStopReviewPrompt(input);
-  const childEnv = {
-    ...process.env,
-    ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
-  };
-  // The prompt goes through a file because a long message does not fit in a command line.
-  const promptFile = path.join(os.tmpdir(), `agent-stop-review-${randomBytes(8).toString("hex")}.md`);
-  // "wx" refuses a file or symlink that already holds the name in the shared temp folder, and
-  // such a file is left alone. A file this call created is removed even when the write fails.
-  const fd = fs.openSync(promptFile, "wx", 0o600);
-  let result;
-  try {
-    try {
-      fs.writeFileSync(fd, prompt, "utf8");
-    } finally {
-      fs.closeSync(fd);
-    }
-    result = spawnSync(
-      process.execPath,
-      [scriptPath, "task", "--json", "--output-schema", VERDICT_SCHEMA, "--prompt-file", promptFile],
-      {
-        cwd,
-        env: childEnv,
-        encoding: "utf8",
-        timeout: STOP_REVIEW_TIMEOUT_MS,
-        windowsHide: true
-      }
-    );
-  } finally {
-    fs.rmSync(promptFile, { force: true });
-  }
-
-  if (result.error?.code === "ETIMEDOUT") {
-    return infrastructureFailure("The stop-time Codex review timed out after 15 minutes.");
-  }
-
-  let payload = null;
-  try {
-    payload = JSON.parse(result.stdout);
-  } catch {
-    payload = null;
-  }
-
-  if (result.status !== 0) {
-    const detail = String(payload?.failureMessage ?? "").trim() || lastErrorLine(result.stderr);
+// The job's structured result, or its text when that is the JSON object.
+function verdictOfJob(view) {
+  const row = view.row;
+  if (row.end_state !== "completed") {
+    const detail = String(row.error ?? "").trim();
     return infrastructureFailure(
-      detail ? `The stop-time Codex review failed: ${detail}` : "The stop-time Codex review failed."
+      detail ? `The stop-time Codex review failed: ${detail}` : `The stop-time Codex review ended ${view.state}.`
     );
   }
-
-  if (!payload) {
-    return infrastructureFailure("The stop-time Codex review printed output that is not JSON.");
+  if (row.result_json) {
+    try {
+      return parseVerdict(JSON.parse(row.result_json));
+    } catch {
+      // Falls through to the text.
+    }
   }
-  return parseStopReviewOutput(payload.rawOutput);
+  const text = String(row.result_text ?? "").trim();
+  if (!text) {
+    return infrastructureFailure("The stop-time Codex review returned no output.");
+  }
+  try {
+    return parseVerdict(JSON.parse(text));
+  } catch {
+    return infrastructureFailure("The stop-time Codex review did not return a JSON verdict.");
+  }
+}
+
+// The review request of the shared provider command contract, for a read-only review of the
+// working tree's changes with the verdict schema.
+async function buildReviewFields(provider, cwd, input) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const selection = await resolveModelSelection(provider, { setting: getConfig(workspaceRoot).models?.[provider.id] ?? null, cwd });
+  const outputSchema = JSON.parse(fs.readFileSync(VERDICT_SCHEMA, "utf8"));
+  const request = {
+    cwd,
+    worktree: null,
+    write: false,
+    sandbox: "read-only",
+    model: selection.model,
+    effort: selection.effort,
+    modelSource: selection.modelSource,
+    effortSource: selection.effortSource,
+    review: { target: "changes", paths: [], stance: "critical", native: false },
+    outputSchema,
+    allowQuestions: false,
+    flags: { background: false, fresh: true }
+  };
+  // Test seam: AGENT_PLUGIN_TEST_DRIVER (JSON) is the behaviour of the test driver's provider that
+  // runs the job in tests; production never sets it.
+  if (process.env.AGENT_PLUGIN_TEST_DRIVER) {
+    request.testDriver = JSON.parse(process.env.AGENT_PLUGIN_TEST_DRIVER);
+  }
+  const identity = await readRequesterIdentity();
+  return {
+    provider: provider.id,
+    kind: "review",
+    title: `${provider.label} stop-time review`,
+    prompt: buildStopReviewPrompt(input),
+    request,
+    cwd,
+    model: selection.model,
+    allowQuestions: false,
+    foreground: true,
+    requester: { ...identity, sessionId: input.session_id || identity.sessionId }
+  };
+}
+
+// Runs the review as an ordinary foreground job: the job is created and its worker launched
+// through the store, and the hook waits for its end within its own limit. When the limit comes
+// first, the job keeps running and the result says so.
+async function runStopReview(stateDir, cwd, input) {
+  const provider = getProvider();
+  const fields = await buildReviewFields(provider, cwd, input);
+  const store = openStore(stateDir);
+  let jobId;
+  try {
+    ({ jobId } = createJob(store, fields));
+    await launchWorker(store, stateDir, jobId);
+  } finally {
+    store.close();
+  }
+  const waitMs = readWaitMs();
+  const outcome = await waitForJob(stateDir, jobId, { until: "end", deliver: true, timeoutMs: waitMs });
+  if (outcome.timedOut || !outcome.view) {
+    return infrastructureFailure(
+      `The stop-time Codex review job ${jobId} did not finish within ${Math.round(waitMs / 1000)} s and keeps running; ` +
+        `check it with /agent:status ${jobId} or stop it with /agent:cancel ${jobId}.`
+    );
+  }
+  return verdictOfJob(outcome.view);
 }
 
 function readMaxRounds() {
@@ -184,9 +202,9 @@ function readMaxRounds() {
 
 // Consecutive blocks are counted per Claude session, so a review that keeps blocking cannot
 // keep the session from ending. Zero rounds removes the limit.
-function roundsFile(workspaceRoot, sessionId) {
+function roundsFile(stateDir, sessionId) {
   const safeId = String(sessionId || "no-session").replace(/[^A-Za-z0-9._-]/g, "_");
-  return path.join(resolveStateDir(workspaceRoot), "stop-gate", `${safeId}.json`);
+  return path.join(stateDir, "stop-gate", `${safeId}.json`);
 }
 
 function readRounds(file) {
@@ -206,17 +224,42 @@ function writeRounds(file, blocks) {
   fs.writeFileSync(file, `${JSON.stringify({ blocks })}\n`, "utf8");
 }
 
+// A note about the newest queued or running job of this session, read from the store.
+function runningJobNote(stateDir, sessionId) {
+  if (!fs.existsSync(path.join(stateDir, "store", "state.db"))) {
+    return null;
+  }
+  let views = [];
+  const store = openStore(stateDir);
+  try {
+    views = listJobViews(store, { sessionId, all: !sessionId });
+  } finally {
+    store.close();
+  }
+  const running = views.find((view) => view.state === "queued" || view.state === "running");
+  return running
+    ? `${getProvider(running.provider).label} job ${running.id} is still running. Check /agent:status and use /agent:cancel ${running.id} if you want to stop it before ending the session.`
+    : null;
+}
+
 async function main() {
   const input = await readHookInput();
   const cwd = input.cwd || getProjectDir() || process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), input));
-  const runningJob = jobs.find((job) => job.status === "queued" || job.status === "running");
-  const runningTaskNote = runningJob
-    ? `Codex task ${runningJob.id} is still running. Check /agent:status and use /agent:cancel ${runningJob.id} if you want to stop it before ending the session.`
-    : null;
+  const gate = checkRuntime();
+  if (!gate.ok) {
+    logNote(runtimeGateMessage(gate));
+    return;
+  }
+  const stateDir = resolveStateDir(cwd);
+  const sessionId = input.session_id || getSessionId();
+  let runningTaskNote = null;
+  try {
+    runningTaskNote = runningJobNote(stateDir, sessionId);
+  } catch (error) {
+    logNote(`The job store could not be read: ${messageOf(error)}`);
+  }
 
   if (!config.stopReviewGate) {
     logNote(runningTaskNote);
@@ -230,8 +273,8 @@ async function main() {
     return;
   }
 
-  const rounds = roundsFile(workspaceRoot, input.session_id || getSessionId());
-  const review = runStopReview(cwd, input);
+  const rounds = roundsFile(stateDir, sessionId);
+  const review = await runStopReview(stateDir, cwd, input);
   if (review.ok) {
     writeRounds(rounds, 0);
     logNote(runningTaskNote);
@@ -251,7 +294,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message} ${DISABLE_HINT}\n`);
+  process.stderr.write(`${messageOf(error)} ${DISABLE_HINT}\n`);
   process.exitCode = 1;
 });

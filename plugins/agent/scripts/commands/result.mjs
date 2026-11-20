@@ -1,71 +1,91 @@
+import fs from "node:fs";
 import process from "node:process";
 
-import { outputCommandResult, parseCommandInput, resolveCommandCwd } from "../lib/companion-cli.mjs";
-import { readStoredJob, reconcileJobLiveness, resolveResultJob } from "../lib/job-control.mjs";
-import { providerForJob } from "../lib/providers.mjs";
-import { renderStoredJobResult } from "../lib/render.mjs";
-import { markJobResultDelivered } from "../lib/state.mjs";
-import { isActiveJobStatus, parseWaitTimeout, waitForSingleJobSnapshot } from "./status.mjs";
+import { outputCommandResult, parseCommandInput } from "../lib/companion-cli.mjs";
+import { getSessionId } from "../lib/host.mjs";
+import { listEvents, markEventRead } from "../lib/mailbox.mjs";
+import { renderStatusJson, renderStoreResult } from "../lib/render.mjs";
+import { listJobViews, readJobView } from "../lib/state.mjs";
+import { waitForJob } from "../lib/tracked-jobs.mjs";
+import { parseWaitTimeout } from "./status.mjs";
+import { commandStateDir, jobLogFile, reconcileAndPrune, resolveReadView, retrying, withCommandStore } from "./store.mjs";
 
 // result --wait exits with this code when the job is still running at the end of the wait.
 export const STILL_RUNNING_EXIT_CODE = 75;
 
-export const usage = "result [job-id] [--wait] [--timeout-ms <ms>] [--json]";
+export const usage = "result [job-id|label] [--wait] [--timeout-ms <ms>] [--json]";
+
+// The job `result` shows without a reference: the newest job of this session with an end decision.
+function newestEnded(store) {
+  const views = listJobViews(store, { sessionId: getSessionId(process.env), limit: 50 });
+  return views.find((view) => view.row.end_state !== null || view.state === "cancelled") ?? null;
+}
+
+// Marks the job's unread event read once its result was shown.
+async function markResultRead(store, jobId) {
+  const events = listEvents(store, { unread: true }).filter((event) => event.jobId === jobId);
+  for (const event of events) {
+    await retrying((opts) => markEventRead(store, event.id, opts));
+  }
+}
+
+function resultPayload(view, successor, extra = {}) {
+  const row = view.row;
+  return {
+    job: renderStatusJson([view]).jobs[0],
+    title: row.title,
+    resultText: row.result_text ?? null,
+    resultJson: row.result_json ? JSON.parse(row.result_json) : null,
+    error: row.error ?? null,
+    successorId: successor?.id ?? view.successorId ?? null,
+    ...extra
+  };
+}
 
 export async function run(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
     booleanOptions: ["json", "wait"]
   });
-
-  const cwd = resolveCommandCwd(options);
+  const stateDir = commandStateDir(options);
   const reference = positionals[0] ?? "";
-  parseWaitTimeout(options["timeout-ms"]);
+  const timeoutMs = parseWaitTimeout(options["timeout-ms"]);
+  if (options.wait && !reference) {
+    throw new Error("`result --wait` requires a job id or label.");
+  }
+  await reconcileAndPrune(stateDir);
+
+  let view = await withCommandStore(stateDir, (store) => (reference ? resolveReadView(store, reference) : newestEnded(store)));
+  if (!view) {
+    throw new Error(reference ? `No job matches "${reference}" in this repository.` : "No finished job was found for this session.");
+  }
   if (options.wait) {
-    if (!reference) {
-      throw new Error("`result --wait` requires a job id.");
-    }
-    const snapshot = await waitForSingleJobSnapshot(cwd, reference, {
-      timeoutMs: options["timeout-ms"],
-      pollIntervalMs: options["poll-interval-ms"]
-    });
-    if (snapshot.waitTimedOut) {
-      const seconds = Math.round(snapshot.timeoutMs / 1000);
+    // The wait records that the outcome was returned, so the monitor does not announce it again.
+    const waited = await waitForJob(stateDir, view.id, { until: "end", timeoutMs, deliver: true });
+    view = waited.view ?? view;
+    if (waited.timedOut) {
+      const seconds = Math.round(timeoutMs / 1000);
       outputCommandResult(
-        { job: snapshot.job, waitTimedOut: true },
-        `Job ${snapshot.job.id} is still running after ${seconds} s. Run the same command again to keep waiting.\n`,
+        { ...resultPayload(view, null), waitTimedOut: true },
+        `Job ${view.id} is still ${view.state} after ${seconds} s. Run the same command again to keep waiting.\n`,
         options.json
       );
       process.exitCode = STILL_RUNNING_EXIT_CODE;
       return;
     }
   }
-  await reconcileJobLiveness(cwd);
-  const { workspaceRoot, job } = resolveResultJob(cwd, reference);
-  let storedJob = readStoredJob(workspaceRoot, job.id);
-  let recoveredNote = "";
-  const hasOutput = Boolean(storedJob?.result?.rawOutput || storedJob?.rendered || providerForJob(job).storedOutputText(storedJob));
-  // A job that stopped without storing its output may still have it in the provider's transcript.
-  if (!hasOutput) {
-    const provider = providerForJob(job);
-    const recovered = provider.recoverTurnResult?.({
-      threadId: storedJob?.threadId ?? job.threadId,
-      turnId: storedJob?.turnId ?? job.turnId
-    });
-    if (recovered) {
-      storedJob = { ...storedJob, result: { ...(storedJob?.result ?? {}), rawOutput: recovered.text }, recovered };
-      recoveredNote = recovered.complete
-        ? `Recovered from the ${provider.label} transcript.\n\n`
-        : `Recovered from the ${provider.label} transcript. The turn did not finish; this is its last message.\n\n`;
+  const { current, successor } = await withCommandStore(stateDir, async (store) => {
+    const latest = readJobView(store, view.id) ?? view;
+    const next = latest.successorId ? readJobView(store, latest.successorId) : null;
+    if (latest.row.end_state !== null || latest.state === "cancelled") {
+      await markResultRead(store, latest.id);
     }
-  }
-  const payload = {
-    job,
-    storedJob
-  };
-
-  outputCommandResult(payload, `${recoveredNote}${renderStoredJobResult(job, storedJob)}`, options.json);
-  if (!isActiveJobStatus(job.status)) {
-    markJobResultDelivered(workspaceRoot, job.id);
-  }
+    return { current: latest, successor: next };
+  });
+  const logFile = jobLogFile(stateDir, current.id);
+  outputCommandResult(
+    resultPayload(current, successor),
+    renderStoreResult(current, { successor, logFile: fs.existsSync(logFile) ? logFile : null }),
+    options.json
+  );
 }

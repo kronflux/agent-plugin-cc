@@ -1,143 +1,280 @@
-import {
-  outputCommandResult,
-  parseCommandInput,
-  resolveCommandCwd,
-  resolveCommandWorkspace,
-  sleep
-} from "../lib/companion-cli.mjs";
+import process from "node:process";
+
+import { HelpRequested, outputCommandResult } from "../lib/companion-cli.mjs";
 import { readStdinIfPiped } from "../lib/fs.mjs";
-import { readStoredJob, reconcileJobLiveness } from "../lib/job-control.mjs";
-import { providerForJob } from "../lib/providers.mjs";
-import { listJobs, queueJobMessage, readJobMessageOutcome, withdrawJobMessage } from "../lib/state.mjs";
-import { DEFAULT_SEND_TIMEOUT_MS } from "../lib/task-launch.mjs";
-import { isActiveJobStatus, parseWaitTimeout } from "./status.mjs";
+import { readRequesterIdentity } from "../lib/host.mjs";
+import { sendToChain } from "../lib/mailbox.mjs";
+import { providerLabelOf } from "../lib/render.mjs";
+import { UnknownJobError, readJobView, resolveActionableTip } from "../lib/state.mjs";
+import { DEFAULT_SEND_TIMEOUT_MS, launchWorker } from "../lib/task-launch.mjs";
+import { waitForJob } from "../lib/tracked-jobs.mjs";
+import { parseWaitTimeout } from "./status.mjs";
+import { commandStateDir, retrying, withCommandStore } from "./store.mjs";
 
 export { DEFAULT_SEND_TIMEOUT_MS };
-export const SEND_VALUE_OPTIONS = new Set(["--timeout-ms", "--cwd", "-C"]);
+// How long a message read from stdin may take to start and to finish arriving.
+const STDIN_LIMITS = { firstByteTimeoutMs: 10000, totalTimeoutMs: 60000 };
 
-export const usage = "send [--timeout-ms <ms>] [--json] <job-id> <message>";
+/**
+ * The options of a command that takes a job id or label and then a message: value options and
+ * flags by token, each mapped to its option name. `--stdin` and `-` read the message from stdin.
+ */
+export const SEND_SPEC = Object.freeze({
+  name: "send",
+  values: Object.freeze({ "--timeout-ms": "timeoutMs", "--cwd": "cwd", "-C": "cwd" }),
+  flags: Object.freeze({ "--force": "force", "--json": "json" })
+});
+export const SEND_VALUE_OPTIONS = new Set(Object.keys(SEND_SPEC.values));
 
-// The slash command passes its arguments as one string. Options and the job id are split off
-// the front, and the rest is the message exactly as typed, so quotes and apostrophes survive.
-export function splitSendArguments(argv) {
+export const usage = "send <job-id|label> [--timeout-ms <ms>] [--force] [--json] [--stdin | -] [--] <message>";
+
+function isMessageOption(token, spec) {
+  if (Object.hasOwn(spec.flags, token) || Object.hasOwn(spec.values, token)) {
+    return true;
+  }
+  if (["--stdin", "-", "--help", "-h"].includes(token)) {
+    return true;
+  }
+  const equalsAt = token.indexOf("=");
+  return token.startsWith("--") && equalsAt > 0 && Object.hasOwn(spec.values, token.slice(0, equalsAt));
+}
+
+/**
+ * Splits the one argument string a slash command passes. Options, the job id or label and the
+ * options right after it are split off the front, and the rest is the message exactly as typed,
+ * so quotes and apostrophes survive. Already split arguments are returned unchanged.
+ */
+export function splitMessageArguments(argv, spec = SEND_SPEC) {
   if (argv.length !== 1 || !/\s/.test(argv[0].trim())) {
     return argv;
   }
   const tokens = [];
   let rest = argv[0].trim();
+  let referenceSeen = false;
   while (rest) {
     const match = rest.match(/^(\S+)\s*([\s\S]*)$/);
-    tokens.push(match[1]);
+    const token = match[1];
+    if (token === "--") {
+      tokens.push(token);
+      rest = match[2];
+      break;
+    }
+    if (referenceSeen && !isMessageOption(token, spec)) {
+      break;
+    }
+    tokens.push(token);
     rest = match[2];
-    if (SEND_VALUE_OPTIONS.has(match[1]) && rest) {
+    if (Object.hasOwn(spec.values, token) && rest) {
       const value = rest.match(/^(\S+)\s*([\s\S]*)$/);
       tokens.push(value[1]);
       rest = value[2];
-    } else if (!match[1].startsWith("-")) {
-      break;
+    } else if (!token.startsWith("-")) {
+      referenceSeen = true;
     }
   }
   const quoted = rest.match(/^(["'])([\s\S]*)\1$/);
-  return rest ? [...tokens, "--", quoted ? quoted[2] : rest] : tokens;
+  const message = quoted ? quoted[2] : rest;
+  if (!message) {
+    return tokens;
+  }
+  return tokens.at(-1) === "--" ? [...tokens, message] : [...tokens, "--", message];
 }
 
-export function renderSendResult(result, label) {
+export function splitSendArguments(argv) {
+  return splitMessageArguments(argv, SEND_SPEC);
+}
+
+/**
+ * Reads the options, the job id or label and the message words from tokens. Options may come
+ * before and right after the reference; `--` or the first other word starts the message.
+ */
+export function parseMessageTokens(tokens, spec = SEND_SPEC) {
+  const options = { stdin: false };
+  for (const key of Object.values(spec.flags)) {
+    options[key] = false;
+  }
+  let reference = null;
+  const words = [];
+  let inMessage = false;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (inMessage) {
+      words.push(token);
+      continue;
+    }
+    if (token === "--") {
+      if (reference === null && index + 1 < tokens.length) {
+        reference = tokens[index + 1];
+        index += 1;
+      }
+      inMessage = true;
+      continue;
+    }
+    if ((token === "--help" || token === "-h") && reference === null) {
+      throw new HelpRequested();
+    }
+    if (Object.hasOwn(spec.flags, token)) {
+      options[spec.flags[token]] = true;
+      continue;
+    }
+    if (token === "--stdin" || token === "-") {
+      options.stdin = true;
+      continue;
+    }
+    const equalsAt = token.indexOf("=");
+    if (token.startsWith("--") && equalsAt > 0 && Object.hasOwn(spec.values, token.slice(0, equalsAt))) {
+      options[spec.values[token.slice(0, equalsAt)]] = token.slice(equalsAt + 1);
+      continue;
+    }
+    if (Object.hasOwn(spec.values, token)) {
+      if (index + 1 >= tokens.length) {
+        throw new Error(`Missing value for ${token}`);
+      }
+      options[spec.values[token]] = tokens[index + 1];
+      index += 1;
+      continue;
+    }
+    if (reference === null && !token.startsWith("-")) {
+      reference = token;
+      continue;
+    }
+    if (reference === null) {
+      throw new Error(`Unknown option for ${spec.name}: ${token}`);
+    }
+    words.push(token);
+    inMessage = true;
+  }
+  return { options, reference, words };
+}
+
+export function parseSendTokens(tokens) {
+  return parseMessageTokens(tokens, SEND_SPEC);
+}
+
+/**
+ * The message of a send or resume: from stdin with `--stdin` or `-`, keeping every character
+ * except the line end a heredoc adds; otherwise the words, or piped input when there are none.
+ */
+export async function readMessage({ options, words }, name) {
+  if (options.stdin) {
+    if (words.length > 0) {
+      throw new Error(`${name} --stdin takes the message only from standard input.`);
+    }
+    if (process.stdin.isTTY) {
+      throw new Error(`${name} --stdin reads the message from standard input, but standard input is a terminal.`);
+    }
+    return (await readStdinIfPiped(STDIN_LIMITS)).replace(/\r?\n$/, "");
+  }
+  return words.join(" ").trim() || (await readStdinIfPiped()).trim();
+}
+
+export function forcedThreadWarning(threadId, barrierJobId) {
+  return `Thread ${threadId} was last used by job ${barrierJobId}, whose provider exit was not observed; it may still run and overlap this job.`;
+}
+
+/** The reply of send, from what happened to the message. */
+export function renderSendReply(result) {
+  const lines = [];
+  if (result.warning) {
+    lines.push(result.warning);
+  }
   switch (result.status) {
-    case "applied":
-      return `${label} received the message in the running turn of ${result.jobId}.\n`;
-    case "sent":
-      return `${label} accepted the message for the running turn of ${result.jobId} and had not confirmed it after ${Math.round(result.timeoutMs / 1000)} s. Check /agent:status ${result.jobId}.\n`;
-    case "started":
-      if (result.reason === "unapplied") {
-        return `The turn of ${result.jobId} ended before ${label} applied the message, so it started a new turn on the same thread as ${result.newJobId}. Check /agent:status ${result.newJobId} for progress.\n`;
-      }
-      return `${result.jobId} had finished, so the message started a new turn on its ${label} thread as ${result.newJobId}. Check /agent:status ${result.newJobId} for progress.\n`;
+    case "received":
+      lines.push(`${result.provider} received the message in the running turn of ${result.jobId}.`);
+      break;
+    case "continued":
+      lines.push(
+        result.started
+          ? `${result.sentTo} had ended, so the message started ${result.consumedJobId}, which continues it on the same thread. Check /agent:status ${result.consumedJobId} for progress.`
+          : `The message was received by ${result.consumedJobId}, which continues ${result.sentTo} on the same thread. Check /agent:status ${result.consumedJobId} for progress.`
+      );
+      break;
+    case "dropped":
+      lines.push(
+        result.dispatched
+          ? `The message was dropped because job ${result.jobId} was ${result.reason}; it had been sent to the provider, so it may have been delivered.`
+          : `The message was dropped because job ${result.jobId} was ${result.reason}; it was not delivered.`
+      );
+      break;
     default:
-      return `${result.detail}\n`;
+      lines.push(
+        result.reason === "stopping"
+          ? `Job ${result.jobId} is stopping; the message will be delivered when it is continued.`
+          : `Job ${result.jobId} has not received the message yet (not yet received after ${Math.round(result.timeoutMs / 1000)} s). It stays with the job's chain; check /agent:status ${result.jobId}.`
+      );
   }
-}
-
-// The job's provider starts the new turn on the job's thread.
-export async function startTurnOnFinishedJob(cwd, workspaceRoot, job, text) {
-  const provider = providerForJob(job);
-  if (!job.threadId) {
-    throw new Error(`${job.id} has no ${provider.label} thread to continue.`);
+  if (result.labelDropped) {
+    lines.push(`The label "${result.labelDropped}" is held by another job, so ${result.consumedJobId} has no label.`);
   }
-  return provider.startFollowUpTurn(cwd, workspaceRoot, job, text);
-}
-
-export async function waitForMessageOutcome(cwd, workspaceRoot, job, messageId, text, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  let sent = null;
-  for (;;) {
-    const outcome = readJobMessageOutcome(workspaceRoot, job.id, messageId);
-    if (outcome?.status === "applied") {
-      return { status: outcome.status, jobId: job.id, turnId: outcome.turnId ?? null };
-    }
-    // The turn ended without applying the message: the agent applies a sent message only at its
-    // next model request, so a message that arrives during the final answer is not applied.
-    if (outcome?.status === "unconfirmed") {
-      return {
-        ...(await startTurnOnFinishedJob(cwd, workspaceRoot, readStoredJob(workspaceRoot, job.id) ?? job, text)),
-        reason: "unapplied"
-      };
-    }
-    if (outcome?.status === "failed") {
-      throw new Error(`${providerForJob(job).label} rejected the message for ${job.id}: ${outcome.error}`);
-    }
-    if (outcome?.status === "turn-ended") {
-      return startTurnOnFinishedJob(cwd, workspaceRoot, readStoredJob(workspaceRoot, job.id) ?? job, text);
-    }
-    sent = outcome?.status === "sent" ? outcome : sent;
-    if (!outcome) {
-      const current = readStoredJob(workspaceRoot, job.id) ?? job;
-      if (!isActiveJobStatus(current.status) && withdrawJobMessage(workspaceRoot, job.id, messageId)) {
-        return startTurnOnFinishedJob(cwd, workspaceRoot, current, text);
-      }
-    }
-    if (Date.now() >= deadline) {
-      if (sent) {
-        return { status: "sent", jobId: job.id, turnId: sent.turnId ?? null, timeoutMs };
-      }
-      if (withdrawJobMessage(workspaceRoot, job.id, messageId)) {
-        throw new Error(`The worker of ${job.id} did not take the message within ${Math.round(timeoutMs / 1000)} s, so it was withdrawn.`);
-      }
-      return { status: "sent", jobId: job.id, turnId: null, timeoutMs };
-    }
-    await sleep(200);
-  }
+  return `${lines.join("\n")}\n`;
 }
 
 export async function run(argv) {
-  const { options, positionals } = parseCommandInput(splitSendArguments(argv), {
-    valueOptions: ["cwd", "timeout-ms"],
-    booleanOptions: ["json"],
-    stopAtFirstPositional: true
+  const parsed = parseSendTokens(splitSendArguments(argv));
+  const { options, reference } = parsed;
+  const timeoutMs = options.timeoutMs === undefined ? DEFAULT_SEND_TIMEOUT_MS : parseWaitTimeout(options.timeoutMs);
+  if (!reference) {
+    throw new Error("Provide a job id or label and a message: send <job-id|label> <message>.");
+  }
+  const text = await readMessage(parsed, "send");
+  if (!text.trim()) {
+    throw new Error("Provide a job id or label and a message: send <job-id|label> <message>.");
+  }
+  const stateDir = commandStateDir({ cwd: options.cwd });
+  const requester = await readRequesterIdentity();
+
+  const sent = await withCommandStore(stateDir, async (store) => {
+    const tip = await retrying((opts) => resolveActionableTip(store, reference, opts));
+    if (!tip) {
+      throw new UnknownJobError({ ref: reference });
+    }
+    const outcome = await retrying((opts) => sendToChain(store, { ref: reference, observedTipId: tip.id }, { text, requester, force: options.force }, opts));
+    let successor = null;
+    if (outcome.outcome === "continued") {
+      successor = await retrying((opts) => readJobView(store, outcome.jobId, opts));
+      await launchWorker(store, stateDir, outcome.jobId).catch(() => null);
+    }
+    return { tip, outcome, successor };
   });
-  const cwd = resolveCommandCwd(options);
-  const workspaceRoot = resolveCommandWorkspace(options);
-  const [reference, ...words] = positionals.filter((value, index) => !(index === 1 && value === "--"));
-  const text = words.join(" ").trim() || (await readStdinIfPiped()).trim();
-  if (!reference || !text) {
-    throw new Error("Provide a job id and a message: send <job-id> <message>.");
-  }
-  const timeoutMs = options["timeout-ms"] === undefined ? DEFAULT_SEND_TIMEOUT_MS : parseWaitTimeout(options["timeout-ms"]);
 
-  await reconcileJobLiveness(cwd);
-  const job = listJobs(workspaceRoot).find((candidate) => candidate.id === reference);
-  if (!job) {
-    throw new Error(`No job ${reference} was found for this repository.`);
+  const { tip, outcome, successor } = sent;
+  const result = {
+    status: "pending",
+    jobId: outcome.jobId,
+    sentTo: outcome.outcome === "continued" ? tip.id : outcome.jobId,
+    messageId: outcome.messageId,
+    provider: providerLabelOf(tip),
+    consumedJobId: null,
+    started: false,
+    reason: null,
+    timeoutMs,
+    labelDropped: null,
+    warning: outcome.barrierJobId ? forcedThreadWarning(tip.row.thread_id, outcome.barrierJobId) : null
+  };
+  if (outcome.outcome === "continued") {
+    Object.assign(result, { status: "continued", consumedJobId: outcome.jobId, started: true });
+    if (tip.label && successor && !successor.label) {
+      result.labelDropped = tip.label;
+    }
+  } else if (outcome.outcome === "pending-stopping") {
+    result.reason = "stopping";
+  } else {
+    const waited = await waitForJob(stateDir, outcome.jobId, { until: "consumed", messageId: outcome.messageId, timeoutMs });
+    const message = waited.outcome;
+    if (message?.state === "consumed") {
+      result.consumedJobId = message.consumedJobId;
+      result.status = message.consumedJobId === outcome.jobId ? "received" : "continued";
+    } else if (message?.state === "dropped" || message?.state === "withdrawn") {
+      result.status = "dropped";
+      result.reason = message.closeCause === "failed" ? "failed" : message.closeCause === "withdrawn" ? "withdrawn" : "cancelled";
+      // A message dispatched before it was dropped may have reached the provider.
+      result.dispatched = Boolean(message.dispatchedJobId);
+    } else {
+      result.reason = "timeout";
+    }
   }
-  if (job.jobClass !== "task") {
-    throw new Error(`${job.id} is a ${job.jobClass ?? "non-task"} job. Messages can be sent only to task jobs.`);
+  outputCommandResult(result, renderSendReply(result), options.json);
+  if (result.status === "dropped") {
+    process.exitCode = 1;
   }
-  const provider = providerForJob(job);
-  if (isActiveJobStatus(job.status) && !provider.capabilities.steer) {
-    throw new Error(`${provider.label} cannot take a message during a running turn. Send it after ${job.id} finishes.`);
-  }
-
-  const result = isActiveJobStatus(job.status)
-    ? await waitForMessageOutcome(cwd, workspaceRoot, job, queueJobMessage(workspaceRoot, job.id, text), text, timeoutMs)
-    : await startTurnOnFinishedJob(cwd, workspaceRoot, readStoredJob(workspaceRoot, job.id) ?? job, text);
-  outputCommandResult(result, renderSendResult(result, provider.label), options.json);
 }

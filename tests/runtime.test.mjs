@@ -1,17 +1,22 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeCommittedRepo, makeTempDir, run, stopOwnedProcess, stopOwnedProcesses, waitUntil } from "./helpers.mjs";
-import { markJobCancelled, resolveJobFile, resolveStateDir, writeJobFile } from "../plugins/agent/scripts/lib/state.mjs";
-import { readStoredJob } from "../plugins/agent/scripts/lib/job-control.mjs";
-import { cancelJob } from "../plugins/agent/scripts/codex-companion.mjs";
-import { runAppServerTurn } from "../plugins/agent/scripts/providers/codex/runtime.mjs";
+import { initGitRepo, makeCommittedRepo, makeTempDir, run as runCommand, stopOwnedProcess, stopOwnedProcesses, waitUntil } from "./helpers.mjs";
+import { resolveStateDir } from "../plugins/agent/scripts/lib/state.mjs";
+import { createCodexDriver } from "../plugins/agent/scripts/providers/codex/runtime.mjs";
+import { launchManifestTasks } from "../plugins/agent/scripts/codex-companion.mjs";
 import { isProcessAlive } from "../plugins/agent/scripts/lib/process.mjs";
+import * as storeLib from "../plugins/agent/scripts/lib/store.mjs";
+import * as storeState from "../plugins/agent/scripts/lib/state.mjs";
+import { launchWorker } from "../plugins/agent/scripts/lib/task-launch.mjs";
+import * as storeFixtures from "./store-fixtures.mjs";
+import * as mailbox from "../plugins/agent/scripts/lib/mailbox.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "agent");
@@ -20,15 +25,21 @@ const NEUTRAL = path.join(PLUGIN_ROOT, "scripts", "agent-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
 
-// Reads every job record in a state directory, newest update first.
-function readJobsState(stateDir) {
-  const jobsDir = path.join(stateDir, "jobs");
-  const jobs = fs
-    .readdirSync(jobsDir)
-    .filter((name) => name.endsWith(".json") && !name.endsWith(".request.json"))
-    .map((name) => JSON.parse(fs.readFileSync(path.join(jobsDir, name), "utf8")))
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
-  return { jobs };
+// Every command a test here runs ends within 30 s unless the test names a longer limit.
+function run(command, args, options = {}) {
+  return runCommand(command, args, { timeout: 30000, ...options });
+}
+
+// Reads the log of the newest job of the job store for workspace `repo`.
+function readStoreJobLog(repo) {
+  const artifacts = path.join(resolveStateDir(repo), "store", "artifacts");
+  const [newest] = fs
+    .readdirSync(artifacts)
+    .filter((name) => name.endsWith(".log"))
+    .map((name) => ({ name, mtime: fs.statSync(path.join(artifacts, name)).mtimeMs }))
+    .sort((left, right) => right.mtime - left.mtime);
+  assert.ok(newest, "the job store holds no job log");
+  return fs.readFileSync(path.join(artifacts, newest.name), "utf8");
 }
 
 // Reads the process ids of every fake app server started with this bin folder, in start order.
@@ -68,16 +79,23 @@ async function waitForExit(pids, exited, describe) {
   }
 }
 
-async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const value = await predicate();
-    if (value) {
-      return value;
-    }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+// Adds a queued Codex job that no worker runs to the job store of workspace `repo`; resolves to
+// its id. A queued job stays active, so a wait on it blocks until its time limit.
+function seedQueuedCodexJob(repo, { sessionId = null, title = "Codex Task" } = {}) {
+  const db = storeLib.openStore(resolveStateDir(repo));
+  try {
+    return storeState.createJob(db, {
+      provider: "codex",
+      kind: "task",
+      title,
+      prompt: "queued work",
+      request: { cwd: repo },
+      cwd: repo,
+      requester: { sessionId, leaderPid: null, leaderStartToken: null }
+    }).jobId;
+  } finally {
+    db.close();
   }
-  throw new Error("Timed out waiting for condition.");
 }
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
@@ -379,8 +397,9 @@ test("review includes reasoning output when the app server returns it", () => {
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Reasoning:/);
-  assert.match(result.stdout, /Reviewed the changed files and checked the likely regression paths first|Reviewed the changed files and checked the likely regression paths/i);
+  // The job's log, its reasoning summary included, is printed on stderr while the review runs.
+  assert.match(result.stderr, /Reasoning summary/);
+  assert.match(result.stderr, /Reviewed the changed files and checked the likely regression paths/i);
 });
 
 test("review logs reasoning summaries and review output to the job log", () => {
@@ -399,9 +418,7 @@ test("review logs reasoning summaries and review output to the job log", () => {
   });
 
   assert.equal(result.status, 0, result.stderr);
-  const stateDir = resolveStateDir(repo);
-  const state = readJobsState(stateDir);
-  const log = fs.readFileSync(state.jobs[0].logFile, "utf8");
+  const log = readStoreJobLog(repo);
   assert.match(log, /Reasoning summary/);
   assert.match(log, /Reviewed the changed files and checked the likely regression paths/);
   assert.match(log, /Review output/);
@@ -435,18 +452,10 @@ test("task --resume-last resumes the latest persisted task thread", () => {
 for (const value of ["0", "abc"]) {
   test(`status --timeout-ms ${value} is rejected`, (t) => {
     const repo = makeCommittedRepo(t);
-    // A running record without a pid stays active, so a wait that accepted the value would block.
-    writeJobFile(repo, "task-waiting", {
-      id: "task-waiting",
-      provider: "codex",
-      status: "running",
-      phase: "running",
-      jobClass: "task",
-      title: "Codex Task",
-      pid: null
-    });
+    // A queued job stays active, so a wait that accepted the value would block.
+    const jobId = seedQueuedCodexJob(repo);
 
-    const result = spawnSync(process.execPath, [NEUTRAL, "status", "task-waiting", "--wait", "--timeout-ms", value], {
+    const result = spawnSync(process.execPath, [NEUTRAL, "status", jobId, "--wait", "--timeout-ms", value], {
       cwd: repo,
       encoding: "utf8",
       timeout: 10000,
@@ -459,201 +468,96 @@ for (const value of ["0", "abc"]) {
   });
 }
 
-test("a Codex job cancelled after its worker recorded its pid starts no turn", { timeout: 60000 }, async (t) => {
-  const repo = makeCommittedRepo(t);
-  const binDir = makeTempDir(t);
-  installFakeCodex(binDir);
-  const id = "task-cancelled-starting";
-  const sessionId = "session-cancelled-starting";
-  writeJobFile(repo, id, {
-    id,
-    provider: "codex",
-    status: "queued",
-    phase: "queued",
-    jobClass: "task",
-    title: "Codex Task",
-    sessionId,
-    pid: null,
-    request: { cwd: repo, prompt: "do not run", write: false, resumeLast: false, jobId: id }
-  });
-  const jobFile = resolveJobFile(repo, id);
-  // A module loaded before the worker stops it right after it replaced the record with one that
-  // holds its pid, until the test has written the cancel marker.
-  const pauseDir = makeTempDir(t);
-  const pausedFile = path.join(pauseDir, "paused");
-  const resumeFile = path.join(pauseDir, "resume");
-  const preload = path.join(pauseDir, "pause-after-pid.mjs");
-  fs.writeFileSync(
-    preload,
-    [
-      `import fs from "node:fs";`,
-      `const jobFile = ${JSON.stringify(jobFile)};`,
-      "const rename = fs.renameSync;",
-      "let paused = false;",
-      "fs.renameSync = (from, to) => {",
-      "  rename(from, to);",
-      "  if (paused || String(to) !== jobFile) return;",
-      "  if (JSON.parse(fs.readFileSync(jobFile, 'utf8')).pid !== process.pid) return;",
-      "  paused = true;",
-      `  fs.writeFileSync(${JSON.stringify(pausedFile)}, "");`,
-      "  const deadline = Date.now() + 30000;",
-      `  while (!fs.existsSync(${JSON.stringify(resumeFile)}) && Date.now() < deadline) {`,
-      "    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);",
-      "  }",
-      "};"
-    ].join("\n")
-  );
-
-  const workerArgs = ["--import", pathToFileURL(preload).href, SCRIPT, "task-worker", "--cwd", repo, "--job-id", id];
-  const worker = spawn(process.execPath, workerArgs, {
-    cwd: repo,
-    env: { ...buildEnv(binDir), AGENT_PLUGIN_SESSION_ID: sessionId },
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true
-  });
-  let stderr = "";
-  worker.stderr.setEncoding("utf8");
-  worker.stderr.on("data", (chunk) => {
-    stderr += chunk;
-  });
-  const exitCode = new Promise((resolve) => worker.on("close", resolve));
-  t.after(() => {
-    if (worker.exitCode === null && worker.signalCode === null) {
-      worker.kill("SIGKILL");
-    }
-  });
-
-  await waitUntil(() => fs.existsSync(pausedFile), { timeoutMs: 20000, describe: "the worker to record its pid" });
-  markJobCancelled(repo, id);
-  fs.writeFileSync(resumeFile, "");
-
-  assert.equal(await exitCode, 0, stderr);
-  const statePath = path.join(binDir, "fake-codex-state.json");
-  const fakeState = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : {};
-  assert.equal(fakeState.lastTurnStart, undefined);
-  assert.equal(readStoredJob(repo, id).status, "cancelled");
-});
-
 // Records a finished agy task job with a conversation id, written after every earlier record.
-async function writeNewerAgyTaskJob(repo, id) {
+// Adds a finished agy job of session `sessionId` to the job store of workspace `repo`, newer than
+// every job there; resolves to its id.
+async function seedFinishedAgyJob(repo, sessionId) {
   await new Promise((resolve) => setTimeout(resolve, 20));
-  writeJobFile(repo, id, {
-    id,
-    provider: "agy",
-    status: "completed",
-    phase: "done",
-    title: "Agy Task",
-    jobClass: "task",
-    threadId: "agy-conversation-1",
-    summary: "agy work",
-    completedAt: new Date().toISOString()
-  });
+  const stateDir = resolveStateDir(repo);
+  const db = storeLib.openStore(stateDir);
+  try {
+    const { jobId } = storeState.createJob(db, {
+      provider: "agy",
+      kind: "task",
+      title: "Agy Task",
+      prompt: "agy work",
+      request: { cwd: repo },
+      cwd: repo,
+      threadId: "agy-conversation-1",
+      requester: { sessionId, leaderPid: null, leaderStartToken: null }
+    });
+    storeFixtures.rawExec(stateDir, "UPDATE jobs SET end_state = 'completed', end_at = ?, end_by = 'worker' WHERE id = ?", [Date.now(), jobId]);
+    return jobId;
+  } finally {
+    db.close();
+  }
 }
 
 test("task --resume-last ignores a finished agy job", async (t) => {
   const repo = makeCommittedRepo(t);
   const binDir = makeTempDir(t);
   installFakeCodex(binDir);
-  const env = buildEnv(binDir);
+  const env = { ...buildEnv(binDir), AGENT_PLUGIN_SESSION_ID: "sess-agy" };
   const firstRun = run("node", [SCRIPT, "task", "initial task"], { cwd: repo, env });
   assert.equal(firstRun.status, 0, firstRun.stderr);
-  await writeNewerAgyTaskJob(repo, "task-agy-finished");
+  await seedFinishedAgyJob(repo, "sess-agy");
 
   const resume = run("node", [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env });
 
   assert.equal(resume.status, 0, resume.stderr);
   const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
-  assert.equal(fakeState.lastTurnStart.prompt, "follow up");
+  // The follow-up reaches Codex as the first message of the continuing job.
+  assert.match(fakeState.lastTurnStart.prompt, /^\[message \d+\]\nfollow up$/);
 });
 
 test("task-resume-candidate offers only Codex jobs", async (t) => {
   const repo = makeCommittedRepo(t);
-  writeJobFile(repo, "task-codex-finished", {
-    id: "task-codex-finished",
-    provider: "codex",
-    status: "completed",
-    phase: "done",
-    title: "Codex Task",
-    jobClass: "task",
-    threadId: "thr_codex",
-    summary: "codex work"
-  });
-  await writeNewerAgyTaskJob(repo, "task-agy-finished");
+  const binDir = makeTempDir(t);
+  installFakeCodex(binDir);
+  const env = { ...buildEnv(binDir), AGENT_PLUGIN_SESSION_ID: "sess-agy" };
+  const firstRun = run("node", [SCRIPT, "task", "codex work"], { cwd: repo, env });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+  const [codexJob] = storeFixtures.rawAll(resolveStateDir(repo), "SELECT id, thread_id FROM jobs");
+  await seedFinishedAgyJob(repo, "sess-agy");
 
-  const result = run("node", [SCRIPT, "task-resume-candidate", "--json"], { cwd: repo });
+  const result = run("node", [SCRIPT, "task-resume-candidate", "--json"], { cwd: repo, env });
 
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
-  assert.equal(payload.candidate?.id, "task-codex-finished");
-  assert.equal(payload.candidate?.threadId, "thr_codex");
+  assert.equal(payload.available, true);
+  assert.equal(payload.jobId, codexJob.id);
+  assert.equal(payload.threadId, codexJob.thread_id);
+  assert.equal(payload.provider, "codex");
 });
 
-test("task-resume-candidate returns the latest rescue thread from the current session", () => {
-  const workspace = makeTempDir();
-  const stateDir = resolveStateDir(workspace);
-  const jobsDir = path.join(stateDir, "jobs");
-  fs.mkdirSync(jobsDir, { recursive: true });
-
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-current",
-            status: "completed",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-current",
-            threadId: "thr_current",
-            summary: "Investigate the flaky test",
-            updatedAt: "2026-03-24T20:00:00.000Z"
-          },
-          {
-            id: "task-other-session",
-            status: "completed",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-other",
-            threadId: "thr_other",
-            summary: "Old rescue run",
-            updatedAt: "2026-03-24T20:05:00.000Z"
-          },
-          {
-            id: "review-current",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            sessionId: "sess-current",
-            threadId: "thr_review",
-            summary: "Review main...HEAD",
-            updatedAt: "2026-03-24T20:10:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+test("task-resume-candidate returns the latest rescue thread from the current session", (t) => {
+  const repo = makeCommittedRepo(t);
+  const binDir = makeTempDir(t);
+  installFakeCodex(binDir);
+  const current = run("node", [SCRIPT, "task", "investigate the flaky test"], {
+    cwd: repo,
+    env: { ...buildEnv(binDir), AGENT_PLUGIN_SESSION_ID: "sess-current" }
+  });
+  assert.equal(current.status, 0, current.stderr);
+  const [currentJob] = storeFixtures.rawAll(resolveStateDir(repo), "SELECT id, thread_id FROM jobs");
+  // A newer job of another session is not this session's candidate.
+  const other = run("node", [SCRIPT, "task", "old rescue run"], {
+    cwd: repo,
+    env: { ...buildEnv(binDir), AGENT_PLUGIN_SESSION_ID: "sess-other" }
+  });
+  assert.equal(other.status, 0, other.stderr);
 
   const result = run("node", [SCRIPT, "task-resume-candidate", "--json"], {
-    cwd: workspace,
-    env: {
-      ...process.env,
-      AGENT_PLUGIN_SESSION_ID: "sess-current"
-    }
+    cwd: repo,
+    env: { ...buildEnv(binDir), AGENT_PLUGIN_SESSION_ID: "sess-current" }
   });
 
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.available, true);
-  assert.equal(payload.sessionId, "sess-current");
-  assert.equal(payload.candidate.id, "task-current");
-  assert.equal(payload.candidate.threadId, "thr_current");
+  assert.equal(payload.jobId, currentJob.id);
+  assert.equal(payload.threadId, currentJob.thread_id);
 });
 
 test("task --resume-last does not resume a task from another Claude session", () => {
@@ -693,66 +597,39 @@ test("task --resume-last does not resume a task from another Claude session", ()
     env: currentEnv
   });
   assert.equal(resume.status, 1);
-  assert.match(resume.stderr, /No previous Codex task thread was found for this repository\./);
+  assert.match(resume.stderr, /no job of this session can be continued/);
 
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
   assert.equal(fakeState.lastTurnStart.prompt, "initial task");
 });
 
-test("task --resume-last ignores running tasks from other Claude sessions", () => {
-  const repo = makeTempDir();
-  const binDir = makeTempDir();
+test("task --resume-last ignores running tasks from other Claude sessions", (t) => {
+  const repo = makeCommittedRepo(t);
+  const binDir = makeTempDir(t);
   installFakeCodex(binDir);
-  initGitRepo(repo);
-  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
-  run("git", ["add", "README.md"], { cwd: repo });
-  run("git", ["commit", "-m", "init"], { cwd: repo });
-
   const stateDir = resolveStateDir(repo);
-  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-other-running",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-other",
-            threadId: "thr_other",
-            summary: "Other session active task",
-            updatedAt: "2026-03-24T20:05:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
-
-  const env = {
-    ...buildEnv(binDir),
-    AGENT_PLUGIN_SESSION_ID: "sess-current"
-  };
-  const status = run("node", [NEUTRAL, "status", "--json"], {
+  // A queued Codex job of another session, never launched.
+  const db = storeLib.openStore(stateDir);
+  t.after(() => db.close());
+  storeState.createJob(db, {
+    provider: "codex",
+    kind: "task",
+    title: "Codex Task",
+    prompt: "Other session active task",
+    request: { cwd: repo },
     cwd: repo,
-    env
+    threadId: "thr_other",
+    requester: { sessionId: "sess-other", leaderPid: null, leaderStartToken: null }
   });
-  assert.equal(status.status, 0, status.stderr);
-  assert.deepEqual(JSON.parse(status.stdout).running, []);
 
   const resume = run("node", [SCRIPT, "task", "--resume-last", "follow up"], {
     cwd: repo,
-    env
+    env: { ...buildEnv(binDir), AGENT_PLUGIN_SESSION_ID: "sess-current" }
   });
   assert.equal(resume.status, 1);
-  assert.match(resume.stderr, /No previous Codex task thread was found for this repository\./);
+  assert.match(resume.stderr, /no job of this session can be continued/);
+  assert.equal(storeFixtures.rawAll(stateDir, "SELECT id FROM jobs").length, 1);
 });
 
 test("session start hook exports the Claude session id, transcript path, and plugin data dir", () => {
@@ -826,7 +703,8 @@ test("task --resume acts like --resume-last without leaking the flag into the pr
   assert.equal(result.status, 0, result.stderr);
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
-  assert.equal(fakeState.lastTurnStart.prompt, "follow up");
+  // The follow-up reaches Codex as the first message of the continuing job, without the flag.
+  assert.match(fakeState.lastTurnStart.prompt, /^\[message \d+\]\nfollow up$/);
 });
 
 test("task --fresh is treated as routing control and does not leak into the prompt", () => {
@@ -885,9 +763,7 @@ test("task logs reasoning summaries and assistant messages to the job log", () =
   });
 
   assert.equal(result.status, 0, result.stderr);
-  const stateDir = resolveStateDir(repo);
-  const state = readJobsState(stateDir);
-  const log = fs.readFileSync(state.jobs[0].logFile, "utf8");
+  const log = readStoreJobLog(repo);
   assert.match(log, /Reasoning summary/);
   assert.match(log, /Inspected the prompt, gathered evidence, and checked the highest-risk paths first/);
   assert.match(log, /Assistant message/);
@@ -909,9 +785,7 @@ test("task logs subagent reasoning and messages with a subagent prefix", () => {
   });
 
   assert.equal(result.status, 0, result.stderr);
-  const stateDir = resolveStateDir(repo);
-  const state = readJobsState(stateDir);
-  const log = fs.readFileSync(state.jobs[0].logFile, "utf8");
+  const log = readStoreJobLog(repo);
   assert.match(log, /Starting subagent design-challenger via collaboration tool: wait\./);
   assert.match(log, /Subagent design-challenger reasoning:/);
   assert.match(log, /Questioned the retry strategy and the cache invalidation boundaries\./);
@@ -1015,37 +889,16 @@ test("task --background enqueues a detached worker and exposes per-job status", 
 
   assert.equal(launched.status, 0, launched.stderr);
   const launchPayload = JSON.parse(launched.stdout);
-  assert.equal(launchPayload.status, "queued");
+  assert.ok(["queued", "running"].includes(launchPayload.status), launchPayload.status);
   assert.match(launchPayload.jobId, /^task-/);
 
-  const waitedStatus = run(
-    "node",
-    [NEUTRAL, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
-    {
-      cwd: repo,
-      env: buildEnv(binDir)
-    }
-  );
-
-  assert.equal(waitedStatus.status, 0, waitedStatus.stderr);
-  const waitedPayload = JSON.parse(waitedStatus.stdout);
-  assert.equal(waitedPayload.job.id, launchPayload.jobId);
-  assert.equal(waitedPayload.job.status, "completed");
-
-  const resultPayload = await waitFor(() => {
-    const result = run("node", [NEUTRAL, "result", launchPayload.jobId, "--json"], {
-      cwd: repo,
-      env: buildEnv(binDir)
-    });
-    if (result.status !== 0) {
-      return null;
-    }
-    return JSON.parse(result.stdout);
+  assert.equal(launchPayload.provider, "codex");
+  const stateDir = resolveStateDir(repo);
+  await storeFixtures.waitFor(() => storeFixtures.jobRow(stateDir, launchPayload.jobId)?.end_state === "completed", {
+    timeoutMs: 30000,
+    describe: "the background job's end"
   });
-
-  assert.equal(resultPayload.job.id, launchPayload.jobId);
-  assert.equal(resultPayload.job.status, "completed");
-  assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+  assert.match(storeFixtures.jobRow(stateDir, launchPayload.jobId).result_text, /Handled the requested task/);
 });
 
 test("review with focus text runs a schema-bound peer review", () => {
@@ -1129,474 +982,16 @@ test("review --background runs as a tracked background review job", async () => 
 
   assert.equal(launched.status, 0, launched.stderr);
   const launchPayload = JSON.parse(launched.stdout);
-  assert.equal(launchPayload.status, "queued");
-  assert.equal(launchPayload.title, "Codex Review");
-  assert.ok(
-    await waitUntil(() => readStoredJob(repo, launchPayload.jobId)?.status === "completed", { timeoutMs: 30000 }),
-    JSON.stringify(readStoredJob(repo, launchPayload.jobId))
-  );
-  assert.match(readStoredJob(repo, launchPayload.jobId).result.codex.stdout, /No material issues found/);
-
-  const status = run("node", [NEUTRAL, "status"], {
-    cwd: repo,
-    env: buildEnv(binDir)
+  assert.ok(["queued", "running"].includes(launchPayload.status), launchPayload.status);
+  assert.equal(launchPayload.provider, "codex");
+  const stateDir = resolveStateDir(repo);
+  await storeFixtures.waitFor(() => storeFixtures.jobRow(stateDir, launchPayload.jobId)?.end_state === "completed", {
+    timeoutMs: 30000,
+    describe: "the background review's end"
   });
-
-  assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /# Agent Status/);
-  assert.match(status.stdout, /Codex Review/);
-  assert.match(status.stdout, /completed/);
-});
-
-test("status shows phases, hints, and the latest finished job", () => {
-  const workspace = makeTempDir();
-  const stateDir = resolveStateDir(workspace);
-  const jobsDir = path.join(stateDir, "jobs");
-  fs.mkdirSync(jobsDir, { recursive: true });
-
-  const logFile = path.join(jobsDir, "review-live.log");
-  fs.writeFileSync(
-    logFile,
-    [
-      "[2026-03-18T15:30:00.000Z] Starting Codex Review.",
-      "[2026-03-18T15:30:01.000Z] Thread ready (thr_1).",
-      "[2026-03-18T15:30:02.000Z] Turn started (turn_1).",
-      "[2026-03-18T15:30:03.000Z] Reviewer started: current changes"
-    ].join("\n"),
-    "utf8"
-  );
-
-  const finishedJobFile = path.join(jobsDir, "review-done.json");
-  fs.writeFileSync(
-    finishedJobFile,
-    JSON.stringify(
-      {
-        id: "review-done",
-        status: "completed",
-        title: "Codex Review",
-        rendered: "# Codex Review\n\nReviewed uncommitted changes.\nNo material issues found.\n"
-      },
-      null,
-      2
-    ),
-    "utf8"
-  );
-
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-live",
-            kind: "review",
-            kindLabel: "review",
-            status: "running",
-            title: "Codex Review",
-            jobClass: "review",
-            phase: "reviewing",
-            threadId: "thr_1",
-            summary: "Review working tree diff",
-            logFile,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            updatedAt: "2026-03-18T15:30:03.000Z"
-          },
-          {
-            id: "review-done",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            threadId: "thr_done",
-            summary: "Review main...HEAD",
-            createdAt: "2026-03-18T15:10:00.000Z",
-            startedAt: "2026-03-18T15:10:05.000Z",
-            completedAt: "2026-03-18T15:11:10.000Z",
-            updatedAt: "2026-03-18T15:11:10.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
-
-  const result = run("node", [NEUTRAL, "status"], {
-    cwd: workspace
-  });
-
-  assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Active jobs:/);
-  assert.match(result.stdout, /\| Job \| Kind \| Status \| Phase \| Elapsed \| Session ID \| Summary \| Actions \|/);
-  assert.match(result.stdout, /\| review-live \| review \| running \| reviewing \| .* \| thr_1 \| Review working tree diff \|/);
-  assert.match(result.stdout, /`\/agent:status review-live`<br>`\/agent:cancel review-live`/);
-  assert.match(result.stdout, /Live details:/);
-  assert.match(result.stdout, /Latest finished:/);
-  assert.match(result.stdout, /Progress:/);
-  assert.match(result.stdout, /Session runtime: direct startup/);
-  assert.match(result.stdout, /Phase: reviewing/);
-  assert.match(result.stdout, /Codex session ID: thr_1/);
-  assert.match(result.stdout, /Resume in Codex: codex resume thr_1/);
-  assert.match(result.stdout, /Thread ready \(thr_1\)\./);
-  assert.match(result.stdout, /Reviewer started: current changes/);
-  assert.match(result.stdout, /Duration: 1m 5s/);
-  assert.match(result.stdout, /Codex session ID: thr_done/);
-  assert.match(result.stdout, /Resume in Codex: codex resume thr_done/);
-});
-
-test("status without a job id only shows jobs from the current Claude session", () => {
-  const workspace = makeTempDir();
-  const stateDir = resolveStateDir(workspace);
-  const jobsDir = path.join(stateDir, "jobs");
-  fs.mkdirSync(jobsDir, { recursive: true });
-
-  const currentLog = path.join(jobsDir, "review-current.log");
-  const otherLog = path.join(jobsDir, "review-other.log");
-  fs.writeFileSync(currentLog, "[2026-03-18T15:30:00.000Z] Reviewer started: current changes\n", "utf8");
-  fs.writeFileSync(otherLog, "[2026-03-18T15:31:00.000Z] Reviewer started: old changes\n", "utf8");
-
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-current",
-            kind: "review",
-            kindLabel: "review",
-            status: "running",
-            title: "Codex Review",
-            jobClass: "review",
-            phase: "reviewing",
-            sessionId: "sess-current",
-            threadId: "thr_current",
-            summary: "Current session review",
-            logFile: currentLog,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            updatedAt: "2026-03-18T15:30:00.000Z"
-          },
-          {
-            id: "review-other",
-            kind: "review",
-            kindLabel: "review",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            sessionId: "sess-other",
-            threadId: "thr_other",
-            summary: "Previous session review",
-            createdAt: "2026-03-18T15:20:00.000Z",
-            startedAt: "2026-03-18T15:20:05.000Z",
-            completedAt: "2026-03-18T15:21:00.000Z",
-            updatedAt: "2026-03-18T15:21:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
-
-  const result = run("node", [NEUTRAL, "status"], {
-    cwd: workspace,
-    env: {
-      ...process.env,
-      AGENT_PLUGIN_SESSION_ID: "sess-current"
-    }
-  });
-
-  assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(
-    [...new Set(result.stdout.match(/review-(?:current|other)/g) ?? [])],
-    ["review-current"]
-  );
-});
-
-test("status preserves adversarial review kind labels", () => {
-  const workspace = makeTempDir();
-  const stateDir = resolveStateDir(workspace);
-  const jobsDir = path.join(stateDir, "jobs");
-  fs.mkdirSync(jobsDir, { recursive: true });
-
-  const logFile = path.join(jobsDir, "review-adv.log");
-  fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Reviewer started: adversarial review\n", "utf8");
-
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-adv-live",
-            kind: "adversarial-review",
-            status: "running",
-            title: "Codex Adversarial Review",
-            jobClass: "review",
-            phase: "reviewing",
-            threadId: "thr_adv_live",
-            summary: "Adversarial review current changes",
-            logFile,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            updatedAt: "2026-03-18T15:30:00.000Z"
-          },
-          {
-            id: "review-adv",
-            kind: "adversarial-review",
-            status: "completed",
-            title: "Codex Adversarial Review",
-            jobClass: "review",
-            threadId: "thr_adv_done",
-            summary: "Adversarial review working tree diff",
-            createdAt: "2026-03-18T15:10:00.000Z",
-            startedAt: "2026-03-18T15:10:05.000Z",
-            completedAt: "2026-03-18T15:11:10.000Z",
-            updatedAt: "2026-03-18T15:11:10.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
-
-  const result = run("node", [NEUTRAL, "status"], {
-    cwd: workspace
-  });
-
-  assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /\| review-adv-live \| adversarial-review \| running \| reviewing \|/);
-  assert.match(result.stdout, /- review-adv \| completed \| adversarial-review \| Codex Adversarial Review/);
-  assert.match(result.stdout, /Codex session ID: thr_adv_live/);
-  assert.match(result.stdout, /Codex session ID: thr_adv_done/);
-});
-
-test("status --wait times out cleanly when a job is still active", () => {
-  const workspace = makeTempDir();
-  const stateDir = resolveStateDir(workspace);
-  const jobsDir = path.join(stateDir, "jobs");
-  fs.mkdirSync(jobsDir, { recursive: true });
-
-  const logFile = path.join(jobsDir, "task-live.log");
-  fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Starting Codex Task.\n", "utf8");
-  fs.writeFileSync(
-    path.join(jobsDir, "task-live.json"),
-    JSON.stringify(
-      {
-        id: "task-live",
-        status: "running",
-        title: "Codex Task",
-        logFile
-      },
-      null,
-      2
-    ),
-    "utf8"
-  );
-
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-live",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            summary: "Investigate flaky test",
-            logFile,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            startedAt: "2026-03-18T15:30:01.000Z",
-            updatedAt: "2026-03-18T15:30:02.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
-
-  const result = run("node", [NEUTRAL, "status", "task-live", "--wait", "--timeout-ms", "25", "--json"], {
-    cwd: workspace
-  });
-
-  assert.equal(result.status, 0, result.stderr);
-  const payload = JSON.parse(result.stdout);
-  assert.equal(payload.job.id, "task-live");
-  assert.equal(payload.job.status, "running");
-  assert.equal(payload.waitTimedOut, true);
-});
-
-test("result returns the stored output for the latest finished job by default", () => {
-  const workspace = makeTempDir();
-  const stateDir = resolveStateDir(workspace);
-  const jobsDir = path.join(stateDir, "jobs");
-  fs.mkdirSync(jobsDir, { recursive: true });
-
-  fs.writeFileSync(
-    path.join(jobsDir, "review-finished.json"),
-    JSON.stringify(
-      {
-        id: "review-finished",
-        status: "completed",
-        title: "Codex Review",
-        rendered: "# Codex Review\n\nReviewed uncommitted changes.\nNo material issues found.\n",
-        result: {
-          codex: {
-            stdout: "Reviewed uncommitted changes.\nNo material issues found."
-          }
-        },
-        threadId: "thr_review_finished"
-      },
-      null,
-      2
-    ),
-    "utf8"
-  );
-
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-finished",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            threadId: "thr_review_finished",
-            summary: "Review working tree diff",
-            createdAt: "2026-03-18T15:00:00.000Z",
-            updatedAt: "2026-03-18T15:01:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
-
-  const result = run("node", [NEUTRAL, "result"], {
-    cwd: workspace
-  });
-
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(
-    result.stdout,
-    "Reviewed uncommitted changes.\nNo material issues found.\n\nCodex session ID: thr_review_finished\nResume in Codex: codex resume thr_review_finished\n"
-  );
-});
-
-test("result without a job id prefers the latest finished job from the current Claude session", () => {
-  const workspace = makeTempDir();
-  const stateDir = resolveStateDir(workspace);
-  const jobsDir = path.join(stateDir, "jobs");
-  fs.mkdirSync(jobsDir, { recursive: true });
-
-  fs.writeFileSync(
-    path.join(jobsDir, "review-current.json"),
-    JSON.stringify(
-      {
-        id: "review-current",
-        status: "completed",
-        title: "Codex Review",
-        threadId: "thr_current",
-        result: {
-          codex: {
-            stdout: "Current session output."
-          }
-        }
-      },
-      null,
-      2
-    ),
-    "utf8"
-  );
-
-  fs.writeFileSync(
-    path.join(jobsDir, "review-other.json"),
-    JSON.stringify(
-      {
-        id: "review-other",
-        status: "completed",
-        title: "Codex Review",
-        threadId: "thr_other",
-        result: {
-          codex: {
-            stdout: "Old session output."
-          }
-        }
-      },
-      null,
-      2
-    ),
-    "utf8"
-  );
-
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-current",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            sessionId: "sess-current",
-            threadId: "thr_current",
-            summary: "Current session review",
-            createdAt: "2026-03-18T15:10:00.000Z",
-            updatedAt: "2026-03-18T15:11:00.000Z"
-          },
-          {
-            id: "review-other",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            sessionId: "sess-other",
-            threadId: "thr_other",
-            summary: "Old session review",
-            createdAt: "2026-03-18T15:20:00.000Z",
-            updatedAt: "2026-03-18T15:21:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
-
-  const result = run("node", [NEUTRAL, "result"], {
-    cwd: workspace,
-    env: {
-      ...process.env,
-      AGENT_PLUGIN_SESSION_ID: "sess-current"
-    }
-  });
-
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(
-    result.stdout,
-    "Current session output.\n\nCodex session ID: thr_current\nResume in Codex: codex resume thr_current\n"
-  );
+  const row = storeFixtures.jobRow(stateDir, launchPayload.jobId);
+  assert.equal(row.title, "Codex Review");
+  assert.match(row.result_text, /No material issues found/);
 });
 
 test("result for a finished write-capable task returns the raw Codex final response", () => {
@@ -1621,462 +1016,8 @@ test("result for a finished write-capable task returns the raw Codex final respo
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /^Handled the requested task\.\nTask prompt accepted\.\n/);
+  // The store result names the thread; it prints no resume command.
   assert.match(result.stdout, /Codex session ID: thr_[a-z0-9]+/i);
-  assert.match(result.stdout, /Resume in Codex: codex resume thr_[a-z0-9]+/i);
-});
-
-test("cancel stops an active background job and marks it cancelled", async (t) => {
-  const workspace = makeTempDir();
-  const stateDir = resolveStateDir(workspace);
-  const jobsDir = path.join(stateDir, "jobs");
-  fs.mkdirSync(jobsDir, { recursive: true });
-
-  // The trailing argument gives the stand-in worker the command line of a companion process,
-  // which is what cancel and session cleanup check before stopping a job's PID.
-  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "codex-companion.mjs"], {
-    cwd: workspace,
-    detached: true,
-    stdio: "ignore"
-  });
-  sleeper.unref();
-
-  t.after(() => stopOwnedProcess(sleeper, { tree: true }));
-
-  const logFile = path.join(jobsDir, "task-live.log");
-  const jobFile = path.join(jobsDir, "task-live.json");
-  fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Starting Codex Task.\n", "utf8");
-  fs.writeFileSync(
-    jobFile,
-    JSON.stringify(
-      {
-        id: "task-live",
-        status: "running",
-        title: "Codex Task",
-        logFile
-      },
-      null,
-      2
-    ),
-    "utf8"
-  );
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-live",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            summary: "Investigate flaky test",
-            pid: sleeper.pid,
-            logFile,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            startedAt: "2026-03-18T15:30:01.000Z",
-            updatedAt: "2026-03-18T15:30:02.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
-
-  const cancelResult = run("node", [NEUTRAL, "cancel", "task-live", "--json"], {
-    cwd: workspace
-  });
-
-  assert.equal(cancelResult.status, 0, cancelResult.stderr);
-  assert.equal(JSON.parse(cancelResult.stdout).status, "cancelled");
-
-  await waitFor(() => {
-    try {
-      process.kill(sleeper.pid, 0);
-      return false;
-    } catch (error) {
-      return error?.code === "ESRCH";
-    }
-  });
-
-  const state = readJobsState(stateDir);
-  const cancelled = state.jobs.find((job) => job.id === "task-live");
-  assert.equal(cancelled.status, "cancelled");
-  assert.equal(cancelled.pid, null);
-
-  const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
-  assert.equal(stored.status, "cancelled");
-  assert.match(fs.readFileSync(logFile, "utf8"), /Cancelled by user/);
-});
-
-test("cancel keeps the output the worker recorded as it was stopped", async (t) => {
-  const repo = makeCommittedRepo(t);
-  const id = "task-partial";
-  const logFile = path.join(resolveStateDir(repo), "jobs", `${id}.log`);
-  writeJobFile(repo, id, {
-    id,
-    provider: "codex",
-    status: "running",
-    phase: "running",
-    title: "Codex Task",
-    jobClass: "task",
-    summary: "Investigate",
-    logFile,
-    startedAt: "2026-03-18T15:30:01.000Z"
-  });
-  fs.writeFileSync(logFile, "Starting Codex Task.\n", "utf8");
-  const existing = readStoredJob(repo, id);
-
-  // The worker writes its result between cancel's first read and the stop of its process.
-  await cancelJob(repo, existing, existing, {
-    terminate: () => {
-      writeJobFile(repo, id, { ...existing, result: { rawOutput: "partial answer" }, rendered: "partial answer\n" });
-      return [{ jobId: id, outcome: "terminated" }];
-    }
-  });
-
-  const result = run("node", [NEUTRAL, "result", id], { cwd: repo });
-  assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /partial answer/);
-  assert.equal(readStoredJob(repo, id).status, "cancelled");
-});
-
-test("cancel keeps a result the worker records after cancel's last read", async (t) => {
-  const repo = makeCommittedRepo(t);
-  const id = "task-late-result";
-  const logFile = path.join(resolveStateDir(repo), "jobs", `${id}.log`);
-  writeJobFile(repo, id, {
-    id,
-    provider: "codex",
-    status: "running",
-    phase: "running",
-    title: "Codex Task",
-    jobClass: "task",
-    logFile
-  });
-  fs.writeFileSync(logFile, "Starting Codex Task.\n", "utf8");
-  const existing = readStoredJob(repo, id);
-
-  // The worker commits its result right after cancel reads the record.
-  let committed = false;
-  await cancelJob(repo, existing, existing, {
-    terminate: () => [{ jobId: id, outcome: "terminated" }],
-    readStoredJob: (root, jobId) => {
-      const record = readStoredJob(root, jobId);
-      if (!committed) {
-        committed = true;
-        writeJobFile(repo, id, { ...existing, result: { rawOutput: "late answer" }, rendered: "late answer\n" });
-      }
-      return record;
-    }
-  });
-
-  assert.equal(committed, true);
-  const stored = readStoredJob(repo, id);
-  assert.equal(stored.status, "cancelled");
-  assert.equal(stored.rendered, "late answer\n");
-});
-
-test("cancel stops a worker that recorded its pid after the caller read the job", async (t) => {
-  const repo = makeCommittedRepo(t);
-  const id = "task-late-pid";
-  const logFile = path.join(resolveStateDir(repo), "jobs", `${id}.log`);
-  writeJobFile(repo, id, {
-    id,
-    provider: "codex",
-    status: "queued",
-    phase: "queued",
-    title: "Codex Task",
-    jobClass: "task",
-    pid: null,
-    logFile
-  });
-  fs.writeFileSync(logFile, "", "utf8");
-  const existing = readStoredJob(repo, id);
-  // The worker publishes its pid after the caller's read and before cancel writes its marker.
-  writeJobFile(repo, id, { ...existing, status: "running", phase: "starting", pid: 424242, processMarker: id });
-
-  const stopped = [];
-  await cancelJob(repo, existing, existing, {
-    terminate: (jobs) => {
-      stopped.push(...jobs);
-      return [{ jobId: id, outcome: "terminated" }];
-    }
-  });
-
-  assert.equal(stopped.length, 1);
-  assert.equal(stopped[0].pid, 424242);
-  assert.equal(stopped[0].processMarker, id);
-});
-
-test("cancel without a job id ignores active jobs from other Claude sessions", () => {
-  const workspace = makeTempDir();
-  const stateDir = resolveStateDir(workspace);
-  const jobsDir = path.join(stateDir, "jobs");
-  fs.mkdirSync(jobsDir, { recursive: true });
-
-  const logFile = path.join(jobsDir, "task-other.log");
-  fs.writeFileSync(logFile, "", "utf8");
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-other",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-other",
-            summary: "Other session run",
-            updatedAt: "2026-03-24T20:05:00.000Z",
-            logFile
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
-
-  const env = {
-    ...process.env,
-    AGENT_PLUGIN_SESSION_ID: "sess-current"
-  };
-  const status = run("node", [NEUTRAL, "status", "--json"], {
-    cwd: workspace,
-    env
-  });
-  assert.equal(status.status, 0, status.stderr);
-  assert.deepEqual(JSON.parse(status.stdout).running, []);
-
-  const cancel = run("node", [NEUTRAL, "cancel", "--json"], {
-    cwd: workspace,
-    env
-  });
-  assert.equal(cancel.status, 1);
-  assert.match(cancel.stderr, /No active jobs to cancel for this session\./);
-
-  const state = readJobsState(stateDir);
-  assert.equal(state.jobs[0].status, "running");
-});
-
-test("cancel with a job id can still target an active job from another Claude session", () => {
-  const workspace = makeTempDir();
-  const stateDir = resolveStateDir(workspace);
-  const jobsDir = path.join(stateDir, "jobs");
-  fs.mkdirSync(jobsDir, { recursive: true });
-
-  const logFile = path.join(jobsDir, "task-other.log");
-  fs.writeFileSync(logFile, "", "utf8");
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-other",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-other",
-            summary: "Other session run",
-            updatedAt: "2026-03-24T20:05:00.000Z",
-            logFile
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
-
-  const env = {
-    ...process.env,
-    AGENT_PLUGIN_SESSION_ID: "sess-current"
-  };
-  const cancel = run("node", [NEUTRAL, "cancel", "task-other", "--json"], {
-    cwd: workspace,
-    env
-  });
-  assert.equal(cancel.status, 0, cancel.stderr);
-  assert.equal(JSON.parse(cancel.stdout).jobId, "task-other");
-
-  const state = readJobsState(stateDir);
-  assert.equal(state.jobs[0].status, "cancelled");
-});
-
-test("cancel stops a running job's worker and its app-server", async (t) => {
-  const repo = makeTempDir();
-  const binDir = makeTempDir();
-  installFakeCodex(binDir, "interruptible-slow-task", { recordIdentities: true });
-  const exited = new Set();
-  let workerPid = null;
-  // The legacy job record holds the worker's pid without a start token, so only the app server
-  // can be stopped by the cleanup; the worker ends with its turn.
-  stopLeftoverProcesses(t, () => binDir, exited);
-  initGitRepo(repo);
-  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
-  run("git", ["add", "README.md"], { cwd: repo });
-  run("git", ["commit", "-m", "init"], { cwd: repo });
-
-  const env = buildEnv(binDir);
-  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the flaky worker timeout"], {
-    cwd: repo,
-    env
-  });
-  assert.equal(launched.status, 0, launched.stderr);
-  const { jobId } = JSON.parse(launched.stdout);
-  assert.ok(jobId);
-
-  const stateDir = resolveStateDir(repo);
-  const runningJob = await waitUntil(
-    () => {
-      const job = readJobsState(stateDir).jobs.find((candidate) => candidate.id === jobId);
-      const running = job?.status === "running" && Number.isInteger(job.pid);
-      // The launch reads the model catalog through an app server of its own, which has ended
-      // before the worker starts the second one.
-      return running && readAppServerPids(binDir).length === 2 ? job : null;
-    },
-    { timeoutMs: 15000, describe: "the job to run with its own app server" }
-  );
-  workerPid = runningJob.pid;
-  const appServerPid = readAppServerPids(binDir).at(-1);
-  assert.equal(isProcessAlive(workerPid), true, "the worker exited before cancel");
-  assert.equal(isProcessAlive(appServerPid), true, "the app server exited before cancel");
-
-  const cancelResult = run("node", [NEUTRAL, "cancel", jobId, "--json"], { cwd: repo, env });
-
-  assert.equal(cancelResult.status, 0, cancelResult.stderr);
-  const cancelPayload = JSON.parse(cancelResult.stdout);
-  assert.equal(cancelPayload.status, "cancelled");
-  assert.equal(cancelPayload.turnInterruptAttempted, false);
-  await waitForExit([workerPid, appServerPid], exited, "the worker and its app server to exit");
-  assert.equal(fs.existsSync(path.join(stateDir, "broker.json")), false, "a shared runtime record exists");
-});
-
-test("session end fully cleans up jobs for the ending session", async (t) => {
-  const repo = makeTempDir();
-  initGitRepo(repo);
-  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
-  run("git", ["add", "README.md"], { cwd: repo });
-  run("git", ["commit", "-m", "init"], { cwd: repo });
-
-  const stateDir = resolveStateDir(repo);
-  const jobsDir = path.join(stateDir, "jobs");
-  fs.mkdirSync(jobsDir, { recursive: true });
-
-  const completedLog = path.join(jobsDir, "completed.log");
-  const runningLog = path.join(jobsDir, "running.log");
-  const otherSessionLog = path.join(jobsDir, "other.log");
-  const completedJobFile = path.join(jobsDir, "review-completed.json");
-  const runningJobFile = path.join(jobsDir, "review-running.json");
-  const otherJobFile = path.join(jobsDir, "review-other.json");
-  fs.writeFileSync(completedLog, "completed\n", "utf8");
-  fs.writeFileSync(runningLog, "running\n", "utf8");
-  fs.writeFileSync(otherSessionLog, "other\n", "utf8");
-  fs.writeFileSync(completedJobFile, JSON.stringify({ id: "review-completed" }, null, 2), "utf8");
-  fs.writeFileSync(otherJobFile, JSON.stringify({ id: "review-other" }, null, 2), "utf8");
-
-  // The trailing argument gives the stand-in worker the command line of a companion process,
-  // which is what cancel and session cleanup check before stopping a job's PID.
-  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "codex-companion.mjs"], {
-    cwd: repo,
-    detached: true,
-    stdio: "ignore"
-  });
-  sleeper.unref();
-  fs.writeFileSync(runningJobFile, JSON.stringify({ id: "review-running" }, null, 2), "utf8");
-
-  t.after(() => stopOwnedProcess(sleeper, { tree: true }));
-
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-completed",
-            status: "completed",
-            title: "Codex Review",
-            sessionId: "sess-current",
-            logFile: completedLog,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            updatedAt: "2026-03-18T15:31:00.000Z"
-          },
-          {
-            id: "review-running",
-            status: "running",
-            title: "Codex Review",
-            sessionId: "sess-current",
-            pid: sleeper.pid,
-            logFile: runningLog,
-            createdAt: "2026-03-18T15:32:00.000Z",
-            updatedAt: "2026-03-18T15:33:00.000Z"
-          },
-          {
-            id: "review-other",
-            status: "completed",
-            title: "Codex Review",
-            sessionId: "sess-other",
-            logFile: otherSessionLog,
-            createdAt: "2026-03-18T15:34:00.000Z",
-            updatedAt: "2026-03-18T15:35:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
-
-  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
-    cwd: repo,
-    env: {
-      ...process.env,
-      AGENT_PLUGIN_SESSION_ID: "sess-current"
-    },
-    input: JSON.stringify({
-      hook_event_name: "SessionEnd",
-      session_id: "sess-current",
-      cwd: repo
-    })
-  });
-
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(fs.existsSync(otherSessionLog), true);
-  assert.equal(fs.existsSync(otherJobFile), true);
-  // The running job leaves a removal marker, so its worker cannot write the record again.
-  assert.deepEqual(
-    fs.readdirSync(path.dirname(otherJobFile)).sort(),
-    [path.basename(otherJobFile), path.basename(otherSessionLog), "review-running.removed"].sort()
-  );
-
-  await waitFor(() => {
-    try {
-      process.kill(sleeper.pid, 0);
-      return false;
-    } catch (error) {
-      return error?.code === "ESRCH";
-    }
-  });
-
-  const state = readJobsState(stateDir);
-  assert.deepEqual(state.jobs.map((job) => job.id), ["review-other"]);
-  const otherJob = state.jobs[0];
-  assert.equal(otherJob.logFile, otherSessionLog);
 });
 
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {
@@ -2124,57 +1065,13 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   assert.match(fakeState.lastTurnStart.prompt, /Only review the work from the previous Claude turn/i);
   assert.match(fakeState.lastTurnStart.prompt, /I completed the refactor and updated the retry logic\./);
 
-  const status = run("node", [NEUTRAL, "status"], {
-    cwd: repo,
-    env: {
-      ...buildEnv(binDir),
-      AGENT_PLUGIN_SESSION_ID: "sess-stop-review"
-    }
-  });
-  assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /Codex Stop Gate Review/);
+  const titles = storeFixtures.rawAll(resolveStateDir(repo), "SELECT title FROM jobs").map((row) => row.title);
+  assert.ok(titles.includes("Codex stop-time review"), titles.join(", "));
 });
 
-test("stop hook logs running tasks to stderr without blocking when the review gate is disabled", () => {
-  const repo = makeTempDir();
-  initGitRepo(repo);
-  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
-  run("git", ["add", "README.md"], { cwd: repo });
-  run("git", ["commit", "-m", "init"], { cwd: repo });
-
-  const stateDir = resolveStateDir(repo);
-  const jobsDir = path.join(stateDir, "jobs");
-  fs.mkdirSync(jobsDir, { recursive: true });
-
-  const runningLog = path.join(jobsDir, "task-running.log");
-  fs.writeFileSync(runningLog, "running\n", "utf8");
-
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: {
-          stopReviewGate: false
-        },
-        jobs: [
-          {
-            id: "task-live",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-current",
-            logFile: runningLog,
-            createdAt: "2026-03-18T15:32:00.000Z",
-            updatedAt: "2026-03-18T15:33:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+test("stop hook logs running tasks to stderr without blocking when the review gate is disabled", (t) => {
+  const repo = makeCommittedRepo(t);
+  const jobId = seedQueuedCodexJob(repo, { sessionId: "sess-current" });
 
   const blocked = run("node", [STOP_HOOK], {
     cwd: repo,
@@ -2187,9 +1084,9 @@ test("stop hook logs running tasks to stderr without blocking when the review ga
 
   assert.equal(blocked.status, 0, blocked.stderr);
   assert.equal(blocked.stdout.trim(), "");
-  assert.match(blocked.stderr, /Codex task task-live is still running/i);
+  assert.ok(blocked.stderr.includes(`Codex job ${jobId} is still running`), blocked.stderr);
   assert.match(blocked.stderr, /\/agent:status/i);
-  assert.match(blocked.stderr, /\/agent:cancel task-live/i);
+  assert.ok(blocked.stderr.includes(`/agent:cancel ${jobId}`), blocked.stderr);
 });
 
 test("stop hook allows the stop when the review gate is enabled and the stop-time review task is clean", () => {
@@ -2310,23 +1207,14 @@ test("setup and status read the workspace named by --cwd", async (t) => {
   binDir = makeTempDir(t);
   installFakeCodex(binDir, undefined, { recordIdentities: true });
   const env = buildEnv(binDir);
-  writeJobFile(targetWorkspace, "task-in-target", {
-    id: "task-in-target",
-    provider: "codex",
-    status: "completed",
-    phase: "done",
-    jobClass: "task",
-    title: "Codex Task",
-    summary: "target workspace job",
-    completedAt: new Date().toISOString()
-  });
+  const targetJobId = seedQueuedCodexJob(targetWorkspace);
 
   const status = run("node", [NEUTRAL, "status", "--all", "--cwd", targetWorkspace, "--json"], { cwd: invocationWorkspace, env });
   assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /task-in-target/);
+  assert.ok(status.stdout.includes(targetJobId), status.stdout);
   const localStatus = run("node", [NEUTRAL, "status", "--all", "--json"], { cwd: invocationWorkspace, env });
   assert.equal(localStatus.status, 0, localStatus.stderr);
-  assert.doesNotMatch(localStatus.stdout, /task-in-target/);
+  assert.equal(localStatus.stdout.includes(targetJobId), false, localStatus.stdout);
 
   const enable = run("node", [SCRIPT, "setup", "--cwd", targetWorkspace, "--enable-review-gate", "--json"], {
     cwd: invocationWorkspace,
@@ -2386,20 +1274,6 @@ test("a model list that is not an array skips the effort check", (t) => {
   assert.equal(fakeState.lastTurnStart.effort, "xhigh");
 });
 
-test("an empty prompt contacts no app server", async (t) => {
-  const binDir = makeTempDir(t);
-  installFakeCodex(binDir);
-  const workspace = makeTempDir(t);
-  const savedPath = process.env.PATH;
-  process.env.PATH = buildEnv(binDir).PATH;
-  t.after(() => {
-    process.env.PATH = savedPath;
-  });
-
-  await assert.rejects(runAppServerTurn(workspace, { prompt: "  ", resumeThreadId: "thr-1" }), /A prompt is required/);
-  assert.deepEqual(readAppServerPids(binDir), []);
-});
-
 test("a foreign thread start is not counted as a subagent", (t) => {
   const repo = makeCommittedRepo(t);
   const binDir = makeTempDir(t);
@@ -2410,11 +1284,11 @@ test("a foreign thread start is not counted as a subagent", (t) => {
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.doesNotMatch(payload.rawOutput, /Answer from another session/);
-  const log = fs.readFileSync(readStoredJob(repo, payload.jobId).logFile, "utf8");
+  const log = readStoreJobLog(repo);
   assert.doesNotMatch(log, /other-session|Answer from another session|turn_foreign/);
 });
 
-test("status prints no resume command for an ephemeral review thread", (t) => {
+test("a native review's job records its single-use thread as ephemeral", (t) => {
   const repo = makeCommittedRepo(t);
   const binDir = makeTempDir(t);
   installFakeCodex(binDir);
@@ -2423,21 +1297,16 @@ test("status prints no resume command for an ephemeral review thread", (t) => {
 
   const review = run("node", [SCRIPT, "review", "--json"], { cwd: repo, env });
   assert.equal(review.status, 0, review.stderr);
-  const [job] = readJobsState(resolveStateDir(repo)).jobs.filter((candidate) => candidate.jobClass === "review");
-  assert.ok(job?.threadId, "the review recorded no thread");
-  assert.equal(job.ephemeralThread, true);
-
-  const status = run("node", [NEUTRAL, "status", job.id], { cwd: repo, env });
-  assert.equal(status.status, 0, status.stderr);
-  assert.doesNotMatch(status.stdout, /codex resume/);
-  const result = run("node", [NEUTRAL, "result", job.id], { cwd: repo, env });
-  assert.equal(result.status, 0, result.stderr);
-  assert.doesNotMatch(result.stdout, /codex resume/);
+  const [job] = storeFixtures.rawAll(resolveStateDir(repo), "SELECT thread_id, ephemeral FROM jobs WHERE kind = 'review'");
+  assert.ok(job?.thread_id, "the review recorded no thread");
+  assert.equal(job.ephemeral, 1);
 });
 
-for (const [behavior, name] of [
-  ["exit-mid-turn", "a task whose app server dies mid-turn fails within 30 seconds"],
-  ["close-stdin-on-turn", "a task whose app server closes its input fails the job"]
+// The app server that exits after accepting the turn ends it; the one that stops reading before it
+// answers the turn start leaves the request refused.
+for (const [behavior, name, failure] of [
+  ["exit-mid-turn", "a task whose app server dies mid-turn fails within 30 seconds", /the provider exited before the turn ended/],
+  ["close-stdin-on-turn", "a task whose app server closes its input fails the job", /the provider rejected the request/]
 ]) {
   test(name, (t) => {
     const exited = new Set();
@@ -2457,75 +1326,982 @@ for (const [behavior, name] of [
 
     assert.equal(result.error?.code ?? null, null, "the task did not end within 30 s");
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /app-server exited unexpectedly/);
+    assert.match(`${result.stdout}${result.stderr}`, failure);
     assert.doesNotMatch(result.stderr, /Unhandled 'error' event/);
-    const [job] = readJobsState(resolveStateDir(repo)).jobs;
-    assert.equal(job.status, "failed");
+    const [job] = storeFixtures.rawAll(resolveStateDir(repo), "SELECT end_state FROM jobs");
+    assert.equal(job.end_state, "failed");
   });
 }
 
-test("a progress writer that throws on turn completion does not leave the turn waiting", { timeout: 30000 }, async (t) => {
-  const binDir = makeTempDir(t);
-  // The turn completes after the turn/start response, through the notification handler, and
-  // sends no final answer from which its end could be inferred.
-  installFakeCodex(binDir, "slow-task-no-final-phase");
-  const workspace = makeCommittedRepo(t);
-  const savedPath = process.env.PATH;
-  const savedIdle = process.env.CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS;
-  process.env.PATH = buildEnv(binDir).PATH;
-  // A turn left waiting ends through the idle limit, which this test must not reach.
-  process.env.CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS = "8000";
+// ---------------------------------------------------------------------------------------------
+// Codex jobs on the job store: the worker, its driver and its own app server
+
+const STORE_REQUESTER = { sessionId: "session-codex", leaderPid: null, leaderStartToken: null };
+// Cleanup contracts for the fake Codex on this platform, so a worker that saw its app server end
+// or stopped it releases confirmed. They include own-exit because on Windows the fake runs behind
+// a codex.cmd wrapper: a tree stop kills the fake first, and the wrapper can then exit before the
+// stop command reaches it, which the worker can only count as the root's own exit. The contract
+// tests of the stop path set their own contracts.
+const FAKE_CODEX_CONTRACTS = JSON.stringify(
+  ["tree-stop", "owner-death", "own-exit"].map((trigger) => ({ provider: "codex", platform: process.platform, trigger, version: "0.0.0", windowMs: 0 }))
+);
+
+// Sets a process environment variable for the rest of the test.
+function setEnvFor(t, name, value) {
+  const saved = process.env[name];
+  process.env[name] = value;
   t.after(() => {
-    process.env.PATH = savedPath;
-    if (savedIdle === undefined) {
-      delete process.env.CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS;
+    if (saved === undefined) {
+      delete process.env[name];
     } else {
-      process.env.CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS = savedIdle;
+      process.env[name] = saved;
     }
   });
+}
 
-  const started = Date.now();
-  const result = await runAppServerTurn(workspace, {
-    prompt: "check the cache",
-    onProgress: (event) => {
-      if (/^Turn (completed|failed|interrupted)/.test(String(event?.message ?? event))) {
-        throw new Error("Could not lock the job record.");
+// A fresh store and a fake Codex on PATH for every worker this test starts or launches. Every app
+// server the fake starts and every worker the store records are stopped when the test ends.
+// With `contracts: "descriptor"` the Codex descriptor's own cleanup contracts apply.
+async function codexStore(t, behavior = "review-ok", { contracts = FAKE_CODEX_CONTRACTS } = {}) {
+  const exited = new Set();
+  let binDir = null;
+  stopLeftoverProcesses(t, () => binDir, exited);
+  // The children a fake app server started and recorded are stopped by their identities too.
+  t.after(() => {
+    const file = binDir ? path.join(binDir, "fake-codex-state.json") : null;
+    const identities = file && fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, "utf8")).processIdentities ?? []) : [];
+    return stopOwnedProcesses(identities.filter((entry) => entry.key !== "appServerPids").map(({ pid, startToken }) => ({ pid, startToken })));
+  });
+  binDir = makeTempDir(t);
+  installFakeCodex(binDir, behavior, { recordIdentities: true, version: "0.169.0" });
+  setEnvFor(t, "PATH", buildEnv(binDir).PATH);
+  if (contracts === "descriptor") {
+    const saved = process.env.AGENT_PLUGIN_TEST_CONTRACTS;
+    delete process.env.AGENT_PLUGIN_TEST_CONTRACTS;
+    t.after(() => {
+      if (saved !== undefined) {
+        process.env.AGENT_PLUGIN_TEST_CONTRACTS = saved;
       }
+    });
+  } else {
+    setEnvFor(t, "AGENT_PLUGIN_TEST_CONTRACTS", contracts);
+  }
+  const stateDir = storeFixtures.makeStoreDir(t);
+  const db = storeLib.openStore(stateDir);
+  t.after(() => db.close());
+  const workers = storeFixtures.trackProcesses(t);
+  const cwd = makeTempDir(t);
+  const createCodexJob = (prompt, extra = {}) =>
+    storeState.createJob(db, {
+      provider: "codex",
+      kind: "task",
+      title: prompt.slice(0, 40),
+      prompt,
+      request: { cwd, ...(extra.request ?? {}) },
+      cwd,
+      threadId: extra.threadId ?? null,
+      ephemeral: extra.ephemeral ?? false,
+      allowQuestions: extra.allowQuestions ?? false,
+      requester: STORE_REQUESTER
+    }).jobId;
+  // Starts `codex-companion.mjs worker` for a job directly, held by this test.
+  const startWorker = (jobId, env = {}) => {
+    const child = spawn(process.execPath, [SCRIPT, "worker", "--state-dir", stateDir, "--job", jobId], {
+      env: { ...process.env, ...env },
+      stdio: ["ignore", "ignore", "pipe"],
+      windowsHide: true
+    });
+    workers.push(child);
+    let stderr = "";
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    const exit = new Promise((resolve) => child.on("close", (code) => resolve({ code, stderr })));
+    return { child, exit };
+  };
+  // Records the worker a launch started, so it is stopped by its identity if it outlives the test.
+  const trackLaunched = (jobId) => {
+    const identity = storeFixtures.workerIdentity(stateDir, jobId);
+    if (identity) {
+      workers.push(identity);
     }
-  });
+  };
+  const readFake = () => {
+    const file = path.join(binDir, "fake-codex-state.json");
+    return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+  };
+  return { stateDir, db, cwd, binDir, createCodexJob, startWorker, trackLaunched, readFake };
+}
 
-  assert.ok(Date.now() - started < 6000, `the turn took ${Date.now() - started} ms to end`);
-  assert.doesNotMatch(String(result.error?.message ?? ""), /sent no events/);
+// Waits for a worker's exit; after `timeoutMs` fails with the job's row and log instead of
+// waiting on.
+async function waitWorkerExit(store, jobId, worker, timeoutMs = 60000) {
+  let timer;
+  const late = new Promise((resolve) => {
+    timer = setTimeout(() => resolve("late"), timeoutMs);
+  });
+  const outcome = await Promise.race([worker.exit.then(() => "exited"), late]);
+  clearTimeout(timer);
+  if (outcome === "late") {
+    const logFile = path.join(store.stateDir, "store", "artifacts", `${jobId}.log`);
+    const log = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "(no log)";
+    throw new Error(`the worker of ${jobId} did not exit within ${timeoutMs} ms; row ${JSON.stringify(storeFixtures.jobRow(store.stateDir, jobId))}; log ${log.slice(-3000)}`);
+  }
+}
+
+// Waits until a job's execution is released, recording its worker while it runs. A release the
+// worker left to reconciliation (on Windows its tree stop can find the wrapper's root already gone)
+// is completed by a scan once the job ended and its worker exited, as the next command's scan
+// would; the scan launches nothing.
+async function waitReleased(store, jobId, timeoutMs = 60000) {
+  let lastScan = performance.now();
+  let scanning = false;
+  try {
+    await storeFixtures.waitFor(
+      () => {
+        store.trackLaunched(jobId);
+        const row = storeFixtures.jobRow(store.stateDir, jobId);
+        if (row?.exec_released_at !== null) {
+          return true;
+        }
+        const workerGone = row?.end_state !== null && row?.worker_pid !== null && !isProcessAlive(row.worker_pid);
+        if (workerGone && !scanning && performance.now() - lastScan > 2000) {
+          scanning = true;
+          storeState
+            .scanWorkspace(store.db, { deadline: performance.now() + 10000, launch: async () => null, leaderCheck: async (views) => new Map(views.map((view) => [view.id, "none"])) })
+            .catch(() => {})
+            .finally(() => {
+              scanning = false;
+              lastScan = performance.now();
+            });
+        }
+        return false;
+      },
+      { timeoutMs, describe: `the release of ${jobId}` }
+    );
+  } catch (error) {
+    const row = storeFixtures.jobRow(store.stateDir, jobId);
+    const logFile = path.join(store.stateDir, "store", "artifacts", `${jobId}.log`);
+    const log = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "(no log)";
+    const fields = row ? { end_state: row.end_state, end_reason: row.end_reason, stopping_cause: row.stopping_cause, claimed_at: row.claimed_at, provider_pid: row.provider_pid, last_refusal: row.last_refusal, error: row.error } : null;
+    throw new Error(`${error.message}; row ${JSON.stringify(fields)}; log ${log.slice(-1500)}`);
+  }
+  return storeFixtures.jobRow(store.stateDir, jobId);
+}
+
+test("a job launched twice on the fake Codex sends one turn/start", { timeout: 300000 }, async (t) => {
+  const store = await codexStore(t);
+  for (let batch = 0; batch < 4; batch += 1) {
+    const jobIds = Array.from({ length: 5 }, (_, index) => store.createCodexJob(`launch twice ${batch}-${index}`));
+    await Promise.all(
+      jobIds.map(async (jobId) => {
+        // One launch through the store's launcher and one worker started directly race to claim.
+        const direct = store.startWorker(jobId);
+        await launchWorker(store.db, store.stateDir, jobId);
+        await direct.exit;
+        await waitReleased(store, jobId);
+      })
+    );
+    for (const [index, jobId] of jobIds.entries()) {
+      const starts = store.readFake().turnStarts.filter((entry) => entry.prompt.includes(`launch twice ${batch}-${index}`));
+      assert.equal(starts.length, 1, `${jobId} sent ${starts.length} turn/start requests`);
+      assert.equal(storeFixtures.jobRow(store.stateDir, jobId).end_state, "completed");
+    }
+  }
 });
 
-test("a progress writer that throws during the turn fails the turn at once", { timeout: 30000 }, async (t) => {
-  const binDir = makeTempDir(t);
-  installFakeCodex(binDir, "slow-task-no-final-phase");
-  const workspace = makeCommittedRepo(t);
-  const savedPath = process.env.PATH;
-  const savedIdle = process.env.CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS;
-  process.env.PATH = buildEnv(binDir).PATH;
-  process.env.CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS = "8000";
+test("a crash between claim and start replays the stored prompt to Codex", { timeout: 120000 }, async (t) => {
+  const store = await codexStore(t);
+  const jobId = store.createCodexJob("replay this stored prompt");
+  const pointsDir = makeTempDir(t);
+  const worker = store.startWorker(jobId, { AGENT_PLUGIN_TEST_POINTS: "after-claim", AGENT_PLUGIN_TEST_POINTS_DIR: pointsDir });
+  await storeFixtures.waitFor(() => fs.readdirSync(pointsDir).some((name) => name.startsWith("after-claim-")), { describe: "the claim" });
+  await stopOwnedProcess(worker.child);
+  await worker.exit;
+  assert.equal(store.readFake().turnStarts?.length ?? 0, 0);
+  await storeState.scanWorkspace(store.db, { deadline: performance.now() + 30000, launch: async () => null, leaderCheck: async () => new Map() });
+  const ended = storeFixtures.jobRow(store.stateDir, jobId);
+  assert.equal(ended.end_state, "interrupted");
+  assert.equal(ended.resume_method, "stored-prompt");
+  const { successorId } = storeState.decideNext(store.db, { ref: jobId, observedTipId: jobId }, { action: "continue", requester: STORE_REQUESTER });
+  await launchWorker(store.db, store.stateDir, successorId);
+  await waitReleased(store, successorId);
+  const starts = store.readFake().turnStarts;
+  assert.equal(starts.length, 1);
+  assert.match(starts[0].prompt, /replay this stored prompt/);
+});
+
+test("a turn end racing a stop never loses the Codex output", { timeout: 300000 }, async (t) => {
+  const store = await codexStore(t, "slow-task");
+  for (let repetition = 0; repetition < 20; repetition += 1) {
+    const jobId = store.createCodexJob(`race the stop ${repetition}`);
+    const worker = store.startWorker(jobId);
+    await storeFixtures.waitFor(() => storeFixtures.jobRow(store.stateDir, jobId).started_at !== null, { describe: "the turn start" });
+    // The fake ends the turn 400 ms after turn/start; the stop lands around that moment.
+    await new Promise((resolve) => setTimeout(resolve, 300 + (repetition % 5) * 50));
+    storeState.requestStop(store.db, { jobIds: [jobId] }, { reason: "session-end" });
+    await worker.exit;
+    const row = await waitReleased(store, jobId);
+    assert.notEqual(row.result_text, null, `repetition ${repetition}: the Codex output was lost (${row.end_state})`);
+  }
+});
+
+test("no transaction is open at any Codex request", { timeout: 120000 }, async (t) => {
+  const store = await codexStore(t);
+  const jobId = store.createCodexJob("watch the transactions");
+  const logFile = path.join(makeTempDir(t), "txn.log");
+  const worker = store.startWorker(jobId, { AGENT_PLUGIN_TEST_TXN_LOG: logFile });
+  const exit = await worker.exit;
+  assert.equal(exit.code, 0, exit.stderr);
+  const requests = fs.readFileSync(logFile, "utf8").split(/\r?\n/).filter((line) => line.startsWith("provider-request"));
+  assert.ok(requests.length >= 3, `only ${requests.length} Codex requests were logged`);
+  assert.deepEqual(requests.filter((line) => line !== "provider-request 0"), [], "a Codex request was sent inside a transaction");
+});
+
+// The job that continues `jobId`, or null.
+function successorOf(store, jobId) {
+  return storeFixtures.rawAll(store.stateDir, "SELECT id FROM jobs WHERE continues = ?", [jobId])[0]?.id ?? null;
+}
+
+// Runs one scan that launches what it continues or finds eligible, with every leader absent.
+function scanAndLaunch(store) {
+  return storeState.scanWorkspace(store.db, {
+    deadline: performance.now() + 30000,
+    launch: (id) => launchWorker(store.db, store.stateDir, id),
+    leaderCheck: async (views) => new Map(views.map((view) => [view.id, "none"]))
+  });
+}
+
+test("a steered message is confirmed by its clientId and carries its message line", { timeout: 120000 }, async (t) => {
+  const store = await codexStore(t, "interruptible-slow-task");
+  const jobId = store.createCodexJob("work while a message arrives");
+  const worker = store.startWorker(jobId);
+  await storeFixtures.waitFor(() => storeFixtures.jobRow(store.stateDir, jobId).started_at !== null, { describe: "the turn start" });
+  const sent = mailbox.sendToChain(store.db, { ref: jobId, observedTipId: jobId }, { text: "steer this in", requester: STORE_REQUESTER });
+  assert.equal(sent.outcome, "running");
+  await storeFixtures.waitFor(() => mailbox.readMessageOutcome(store.db, sent.messageId).state === "consumed", { describe: "the steered message's receipt" });
+  const outcome = mailbox.readMessageOutcome(store.db, sent.messageId);
+  assert.equal(outcome.consumedJobId, jobId);
+  const steers = store.readFake().steers;
+  assert.equal(steers.length, 1);
+  assert.equal(steers[0].clientUserMessageId, mailbox.messageClientId(store.db.instanceId, sent.messageId));
+  assert.match(steers[0].text, new RegExp(`^\\[message ${sent.messageId}\\]`));
+  assert.match(steers[0].text, /steer this in/);
+  await worker.exit;
+  await waitReleased(store, jobId);
+});
+
+test("a steer racing the end notification is not sent and the successor delivers it", { timeout: 600000 }, async (t) => {
+  const store = await codexStore(t, "steer-turn-ended");
+  for (let batch = 0; batch < 4; batch += 1) {
+    const jobIds = Array.from({ length: 5 }, (_, index) => store.createCodexJob(`end before the steer ${batch}-${index}`));
+    await Promise.all(
+      jobIds.map(async (jobId) => {
+        const worker = store.startWorker(jobId);
+        await storeFixtures.waitFor(() => storeFixtures.jobRow(store.stateDir, jobId).started_at !== null, { describe: "the turn start" });
+        const sent = mailbox.sendToChain(store.db, { ref: jobId, observedTipId: jobId }, { text: `deliver after ${jobId}`, requester: STORE_REQUESTER });
+        // The fake answers every steer as if the turn had just ended.
+        await storeFixtures.waitFor(() => (store.readFake().steerAttempts ?? 0) > 0 && mailbox.readMessageOutcome(store.db, sent.messageId).state !== "pending", {
+          describe: "the steer attempt"
+        });
+        await waitWorkerExit(store, jobId, worker);
+        await waitReleased(store, jobId);
+        if (!successorOf(store, jobId)) {
+          await scanAndLaunch(store);
+        }
+        const successorId = successorOf(store, jobId);
+        assert.ok(successorId, `no successor continued ${jobId}`);
+        await storeFixtures.waitFor(() => storeFixtures.jobRow(store.stateDir, successorId).claimed_at !== null || (scanAndLaunch(store), false), {
+          timeoutMs: 30000,
+          describe: `the successor of ${jobId} starting`
+        });
+        await waitReleased(store, successorId);
+        const outcome = mailbox.readMessageOutcome(store.db, sent.messageId);
+        assert.equal(outcome.state, "consumed", `${jobId}: the message ended ${outcome.state}`);
+        assert.equal(outcome.consumedJobId, successorId);
+      })
+    );
+  }
+  // No steer was accepted, and each message reached Codex once, as a successor's request.
+  const fake = store.readFake();
+  assert.equal((fake.steers ?? []).length, 0);
+  const delivered = fake.turnStarts.filter((entry) => /^\[message \d+\]/.test(entry.prompt));
+  assert.equal(delivered.length, 20);
+});
+
+test("a message survives a worker stopped before the steer returns", { timeout: 180000 }, async (t) => {
+  const store = await codexStore(t, "interruptible-slow-task");
+  const jobId = store.createCodexJob("work until the worker is stopped");
+  const pointsDir = makeTempDir(t);
+  // The first after-dispatch is the job's own request; the second is the steer's.
+  const worker = store.startWorker(jobId, { AGENT_PLUGIN_TEST_POINTS: "after-dispatch#2", AGENT_PLUGIN_TEST_POINTS_DIR: pointsDir });
+  await storeFixtures.waitFor(() => storeFixtures.jobRow(store.stateDir, jobId).started_at !== null, { describe: "the turn start" });
+  const sent = mailbox.sendToChain(store.db, { ref: jobId, observedTipId: jobId }, { text: "survive the stop", requester: STORE_REQUESTER });
+  await storeFixtures.waitFor(() => fs.readdirSync(pointsDir).some((name) => name.startsWith("after-dispatch-")), { describe: "the steer's dispatch" });
+  const providers = storeFixtures.providerIdentities(store.stateDir, jobId);
+  await stopOwnedProcess(worker.child);
+  await worker.exit;
+  assert.equal(mailbox.readMessageOutcome(store.db, sent.messageId).state, "dispatched");
+  assert.equal((store.readFake().steers ?? []).length, 0, "the steer reached Codex");
+  // The scanner cleans up the dead worker; the message is kept for the next request.
+  for (let scan = 0; scan < 20 && storeFixtures.jobRow(store.stateDir, jobId).exec_released_at === null; scan += 1) {
+    await storeState.scanWorkspace(store.db, { deadline: performance.now() + 30000, launch: async () => null, leaderCheck: async () => new Map() });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  await stopOwnedProcesses(providers, { tree: true });
+  assert.notEqual(storeFixtures.jobRow(store.stateDir, jobId).exec_released_at, null);
+  assert.equal(mailbox.readMessageOutcome(store.db, sent.messageId).state, "dispatched");
+  const { successorId } = storeState.decideNext(store.db, { ref: jobId, observedTipId: jobId }, { action: "continue", requester: STORE_REQUESTER });
+  await launchWorker(store.db, store.stateDir, successorId);
+  await waitReleased(store, successorId);
+  const outcome = mailbox.readMessageOutcome(store.db, sent.messageId);
+  assert.equal(outcome.state, "consumed");
+  assert.equal(outcome.consumedJobId, successorId);
+  const resent = store.readFake().turnStarts.find((entry) => entry.prompt.includes("survive the stop"));
+  assert.ok(resent, "the successor did not send the message");
+  assert.match(resent.prompt, new RegExp(`^\\[message ${sent.messageId}\\]`));
+});
+
+// Runs a first job to its release, so its Codex thread exists, then continues it with a message;
+// returns the first job, the message and the continuation (created, not launched).
+async function firstTurnThenMessage(store, prompt, text) {
+  const firstId = store.createCodexJob(prompt);
+  await launchWorker(store.db, store.stateDir, firstId);
+  await waitReleased(store, firstId);
+  const sent = mailbox.sendToChain(store.db, { ref: firstId, observedTipId: firstId }, { text, requester: STORE_REQUESTER });
+  let successorId = sent.outcome === "continued" ? sent.jobId : successorOf(store, firstId);
+  if (!successorId) {
+    successorId = storeState.decideNext(store.db, { ref: firstId, observedTipId: firstId }, { action: "continue", requester: STORE_REQUESTER }).successorId;
+  }
+  return { firstId, messageId: sent.messageId, successorId };
+}
+
+// Starts a worker for `jobId` that stops at `point`, then stops it there by its held handle.
+async function crashAtPoint(t, store, jobId, point) {
+  const pointsDir = makeTempDir(t);
+  const worker = store.startWorker(jobId, { AGENT_PLUGIN_TEST_POINTS: point, AGENT_PLUGIN_TEST_POINTS_DIR: pointsDir });
+  await storeFixtures.waitFor(() => fs.readdirSync(pointsDir).some((name) => name.startsWith(`${point.split("#")[0]}-`)), { describe: `the point ${point}` });
+  const providers = storeFixtures.providerIdentities(store.stateDir, jobId);
+  await stopOwnedProcess(worker.child);
+  await worker.exit;
+  for (let scan = 0; scan < 20 && storeFixtures.jobRow(store.stateDir, jobId).exec_released_at === null; scan += 1) {
+    await storeState.scanWorkspace(store.db, { deadline: performance.now() + 30000, launch: async () => null, leaderCheck: async () => new Map() });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  await stopOwnedProcesses(providers, { tree: true });
+  assert.notEqual(storeFixtures.jobRow(store.stateDir, jobId).exec_released_at, null, `${jobId} was not released after its worker stopped`);
+}
+
+// Continues a released job and runs the continuation to its release; returns its id.
+async function continueAndRun(store, jobId) {
+  const { successorId } = storeState.decideNext(store.db, { ref: jobId, observedTipId: jobId }, { action: "continue", requester: STORE_REQUESTER });
+  await launchWorker(store.db, store.stateDir, successorId);
+  await waitReleased(store, successorId);
+  return successorId;
+}
+
+test("a dispatched message on the history's second page is not resent", { timeout: 180000 }, async (t) => {
+  const store = await codexStore(t, "history-pages");
+  const { messageId, successorId } = await firstTurnThenMessage(store, "first turn of the paged thread", "delivered on page two");
+  // The continuation sends the message, then stops before it handles the receipt.
+  await crashAtPoint(t, store, successorId, "after-write");
+  assert.equal(mailbox.readMessageOutcome(store.db, messageId).state, "dispatched");
+  const thirdId = await continueAndRun(store, successorId);
+  const outcome = mailbox.readMessageOutcome(store.db, messageId);
+  assert.equal(outcome.state, "consumed");
+  const fake = store.readFake();
+  assert.equal(fake.turnStarts.filter((entry) => entry.prompt.includes("delivered on page two")).length, 1, "the delivered message was sent again");
+  assert.ok(fake.historyPagesServed >= 2, `the history was read through ${fake.historyPagesServed} pages`);
+  assert.equal(storeFixtures.jobRow(store.stateDir, thirdId).end_state, "completed");
+});
+
+test("after a crash around dispatch the history decides between consumed and resent", { timeout: 240000 }, async (t) => {
+  const store = await codexStore(t);
+  // Stopped after the dispatch commit and before the request: the message never reached Codex.
+  const beforeWrite = await firstTurnThenMessage(store, "first turn, crash before the write", "never written");
+  await crashAtPoint(t, store, beforeWrite.successorId, "after-dispatch");
+  // Stopped after the request was written: Codex has the message in its history.
+  const afterWrite = await firstTurnThenMessage(store, "first turn, crash after the write", "already written");
+  await crashAtPoint(t, store, afterWrite.successorId, "after-write");
+  await continueAndRun(store, beforeWrite.successorId);
+  await continueAndRun(store, afterWrite.successorId);
+  const starts = store.readFake().turnStarts;
+  const neverWritten = starts.filter((entry) => entry.prompt.includes("never written"));
+  assert.equal(neverWritten.length, 1, "the message that never reached Codex was not sent exactly once");
+  assert.match(neverWritten[0].prompt, new RegExp(`^\\[message ${beforeWrite.messageId}\\]`));
+  assert.equal(starts.filter((entry) => entry.prompt.includes("already written")).length, 1, "the message Codex already had was sent again");
+  assert.equal(mailbox.readMessageOutcome(store.db, beforeWrite.messageId).state, "consumed");
+  assert.equal(mailbox.readMessageOutcome(store.db, afterWrite.messageId).state, "consumed");
+});
+
+test("a continuation interrupts a turn still in progress and fails if it does not end in 10 s", { timeout: 240000 }, async (t) => {
+  // The previous turn ends on its interrupt: the continuation runs its own turn.
+  {
+    const store = await codexStore(t, "turn-in-progress");
+    const firstId = store.createCodexJob("leave a turn running");
+    await launchWorker(store.db, store.stateDir, firstId);
+    await waitReleased(store, firstId);
+    const continuedId = await continueAndRun(store, firstId);
+    assert.equal(storeFixtures.jobRow(store.stateDir, continuedId).end_state, "completed");
+    assert.deepEqual(store.readFake().lastInterrupt, { threadId: storeFixtures.jobRow(store.stateDir, continuedId).thread_id, turnId: "turn-prev" });
+  }
+  // The previous turn never ends: the continuation fails after 10 seconds and sends no turn.
+  {
+    const store = await codexStore(t, "turn-in-progress-stuck");
+    const firstId = store.createCodexJob("leave a turn stuck");
+    await launchWorker(store.db, store.stateDir, firstId);
+    await waitReleased(store, firstId);
+    const startsBefore = store.readFake().turnStarts.length;
+    const started = Date.now();
+    const continuedId = await continueAndRun(store, firstId);
+    const row = storeFixtures.jobRow(store.stateDir, continuedId);
+    assert.equal(row.end_state, "failed");
+    assert.match(row.error ?? "", /previous turn on this thread did not end/);
+    assert.ok(Date.now() - started >= 10000, `the continuation failed after ${Date.now() - started} ms`);
+    assert.equal(store.readFake().turnStarts.length, startsBefore, "the continuation sent a turn");
+  }
+});
+
+// Whether every process the fake recorded under `key` is gone.
+async function recordedAbsent(store, key) {
+  const { readProcessIdentities } = await import("../plugins/agent/scripts/lib/process.mjs");
+  const recorded = (store.readFake().processIdentities ?? []).filter((entry) => entry.key === key);
+  const identities = await readProcessIdentities(recorded.map((entry) => entry.pid), { deadline: performance.now() + 15000 });
+  return recorded.every((entry) => identities.get(entry.pid)?.state !== "present" || identities.get(entry.pid)?.startToken !== entry.startToken);
+}
+
+test("a provider that ignores interrupt and end-of-file is stopped by identity before cancelled", { timeout: 120000 }, async (t) => {
+  const store = await codexStore(t, "interrupt-ignored-eof");
+  const jobId = store.createCodexJob("ignore every polite stop");
+  const worker = store.startWorker(jobId);
+  await storeFixtures.waitFor(() => storeFixtures.jobRow(store.stateDir, jobId).started_at !== null, { describe: "the turn start" });
+  await storeFixtures.waitFor(() => (store.readFake().processIdentities ?? []).some((entry) => entry.key === "childPids"), { describe: "the app server's child" });
+  storeState.requestStop(store.db, { jobIds: [jobId] }, { reason: "cancel", cancel: true });
+  const exit = await worker.exit;
+  assert.equal(exit.code, 0, exit.stderr);
+  const row = await waitReleased(store, jobId);
+  assert.equal(row.end_state, "cancelled");
+  assert.equal(store.readFake().lastInterrupt?.turnId, row.turn_id, "the turn was not interrupted first");
+  assert.equal(await recordedAbsent(store, "appServerPids"), true, "the app server outlived the cancel");
+  assert.equal(await recordedAbsent(store, "childPids"), true, "the app server's child outlived the cancel");
+});
+
+test("a Codex job stopped in its first turn is resumable", { timeout: 120000 }, async (t) => {
+  const store = await codexStore(t, "interruptible-slow-task");
+  const jobId = store.createCodexJob("stop me in my first turn");
+  const worker = store.startWorker(jobId);
+  await storeFixtures.waitFor(() => storeFixtures.jobRow(store.stateDir, jobId).started_at !== null, { describe: "the turn start" });
+  storeState.requestStop(store.db, { jobIds: [jobId] }, { reason: "session-end" });
+  await worker.exit;
+  const row = await waitReleased(store, jobId);
+  assert.equal(row.end_state, "interrupted");
+  assert.notEqual(row.thread_id, null);
+  assert.equal(storeState.readJobView(store.db, jobId).resumable, true);
+  const continuedId = await continueAndRun(store, jobId);
+  const continued = storeFixtures.jobRow(store.stateDir, continuedId);
+  assert.equal(continued.thread_id, row.thread_id);
+  assert.equal(store.readFake().lastThreadResume?.threadId, row.thread_id);
+});
+
+test("owner death after turn/start acceptance releases before resume", { timeout: 120000 }, async (t) => {
+  const store = await codexStore(t, "interruptible-slow-task");
+  const jobId = store.createCodexJob("lose my worker after acceptance");
+  await crashAtPoint(t, store, jobId, "after-submit-accepted");
+  const row = storeFixtures.jobRow(store.stateDir, jobId);
+  assert.equal(row.end_state, "interrupted");
+  assert.equal(row.end_reason, "worker-dead");
+  assert.equal(row.active_thread_key, null);
+  const continuedId = await continueAndRun(store, jobId);
+  assert.equal(storeFixtures.jobRow(store.stateDir, continuedId).thread_id, row.thread_id);
+});
+
+test("an absent Codex root is not confirmation without closure", async (t) => {
+  const saved = process.env.AGENT_PLUGIN_TEST_CONTRACTS;
+  delete process.env.AGENT_PLUGIN_TEST_CONTRACTS;
   t.after(() => {
-    process.env.PATH = savedPath;
-    if (savedIdle === undefined) {
-      delete process.env.CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS;
-    } else {
-      process.env.CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS = savedIdle;
+    if (saved !== undefined) {
+      process.env.AGENT_PLUGIN_TEST_CONTRACTS = saved;
     }
   });
+  const contracts = storeState.cleanupContracts("codex");
+  assert.deepEqual(contracts.map((entry) => `${entry.platform} ${entry.trigger} ${entry.version} ${entry.windowMs}`), ["win32 owner-death 0.169.0 1000", "win32 tree-stop 0.169.0 1000"]);
+  const T = 5_000_000;
+  const evidence = (fields) => ({
+    platform: "win32",
+    provider: "codex",
+    providerVersion: "0.169.0",
+    rootRecorded: true,
+    root: "absent",
+    rootExitSeenAt: null,
+    group: null,
+    trigger: null,
+    graceStartedAt: T,
+    graceMs: 60000,
+    contracts,
+    ...fields
+  });
+  // A: the root ended by itself, and Codex has no own-exit contract.
+  assert.equal(storeState.decideRelease(evidence({ rootExitSeenAt: T, trigger: { kind: "own-exit", at: T } }), { now: T + 5000 }).kind, "wait");
+  // B: owner death on a Codex older than the validated version.
+  assert.equal(storeState.decideRelease(evidence({ providerVersion: "0.168.9", trigger: { kind: "owner-death", at: T } }), { now: T + 5000 }).kind, "wait");
+  // D: Linux, the root is gone but its process group still has a member.
+  assert.equal(storeState.decideRelease(evidence({ platform: "linux", group: false, trigger: { kind: "owner-death", at: T } }), { now: T + 5000 }).kind, "wait");
+  // Each of them is released unobserved once the grace window has passed.
+  assert.equal(storeState.decideRelease(evidence({ rootExitSeenAt: T, trigger: { kind: "own-exit", at: T } }), { now: T + 60000 }).kind, "unobserved");
+  // The validated owner-death contract confirms once its window has passed.
+  assert.equal(storeState.decideRelease(evidence({ trigger: { kind: "owner-death", at: T } }), { now: T + 1000 }).kind, "confirmed");
+});
 
-  const started = Date.now();
-  await assert.rejects(
-    runAppServerTurn(workspace, {
-      prompt: "check the cache",
-      onProgress: (event) => {
-        if (/^Turn started/.test(String(event?.message ?? event))) {
-          throw new Error("progress log is not writable");
-        }
-      }
-    }),
-    /progress log is not writable/
+test("owner death before the child is recorded on the fake Codex", { timeout: 120000 }, async (t) => {
+  const store = await codexStore(t, "interruptible-slow-task");
+  setEnvFor(t, "AGENT_PLUGIN_GRACE_MS", "1500");
+  const jobId = store.createCodexJob("lose my worker before the app server is recorded", { threadId: "th-unrecorded-codex" });
+  const pointsDir = makeTempDir(t);
+  const worker = store.startWorker(jobId, { AGENT_PLUGIN_TEST_POINTS: "after-spawn", AGENT_PLUGIN_TEST_POINTS_DIR: pointsDir });
+  await storeFixtures.waitFor(() => fs.readdirSync(pointsDir).some((name) => name.startsWith("after-spawn-")), { describe: "the spawn point" });
+  await stopOwnedProcess(worker.child);
+  await worker.exit;
+  assert.equal(storeFixtures.jobRow(store.stateDir, jobId).provider_pid, null);
+  const scan = () => storeState.scanWorkspace(store.db, { deadline: performance.now() + 30000, launch: async () => null, leaderCheck: async () => new Map() });
+  await scan();
+  const marked = storeFixtures.jobRow(store.stateDir, jobId);
+  assert.equal(marked.stopping_cause, "unrecorded-child");
+  assert.equal(marked.exec_released_at, null);
+  await new Promise((resolve) => setTimeout(resolve, 1700));
+  await scan();
+  const released = storeFixtures.jobRow(store.stateDir, jobId);
+  assert.equal(released.release_kind, "unobserved");
+  assert.deepEqual(storeFixtures.rawAll(store.stateDir, "SELECT thread_id FROM thread_barriers").map((barrier) => barrier.thread_id), ["th-unrecorded-codex"]);
+});
+
+test("the contract summary shows the validated and installed versions", async () => {
+  const { codexProvider } = await import("../plugins/agent/scripts/providers/codex/index.mjs");
+  assert.equal(codexProvider.validatedVersion, "0.169.0");
+  const lines = codexProvider.contractSummary("0.170.2");
+  assert.match(lines[0], /validated on Codex 0\.169\.0, installed 0\.170\.2/);
+  assert.ok(lines.some((line) => /win32 owner-death: every Codex process ends within 1000 ms/.test(line)));
+  assert.ok(lines.some((line) => /win32 tree-stop: every Codex process ends within 1000 ms/.test(line)));
+  assert.ok(!lines.some((line) => /stdin/.test(line)), "the end of input is listed as a contract");
+  assert.match(codexProvider.contractSummary(null)[0], /installed unknown/);
+});
+
+// Runs one seeded Codex job with a worker started directly and returns its row once released.
+async function runSeededJob(store, prompt, extra = {}) {
+  const jobId = store.createCodexJob(prompt, extra);
+  if (extra.beforeStart) {
+    extra.beforeStart(jobId);
+  }
+  const exit = await store.startWorker(jobId).exit;
+  assert.equal(exit.code, 0, exit.stderr);
+  return waitReleased(store, jobId);
+}
+
+function eventKinds(store, jobId) {
+  return storeFixtures.rawAll(store.stateDir, "SELECT kind FROM events WHERE job_id = ?", [jobId]).map((event) => event.kind);
+}
+
+const QUESTION_SCHEMA = { type: "object", properties: { result: { type: "string" }, question: { type: "string" } }, required: ["result"] };
+
+test("a delegate question makes the Codex job waiting with one waiting event", { timeout: 120000 }, async (t) => {
+  const store = await codexStore(t, "question-line");
+  const row = await runSeededJob(store, "ask me if you must", { allowQuestions: true });
+  assert.equal(row.end_state, "waiting");
+  assert.equal(row.question, "Which file should change?");
+  assert.deepEqual(eventKinds(store, row.id), ["waiting"]);
+});
+
+test("a non-empty structured question makes the job waiting and an empty one is stripped", { timeout: 120000 }, async (t) => {
+  {
+    const store = await codexStore(t, "structured-question");
+    const row = await runSeededJob(store, "answer in the schema", { allowQuestions: true, request: { outputSchema: QUESTION_SCHEMA } });
+    assert.equal(row.end_state, "waiting");
+    assert.equal(row.question, "Keep the old API?");
+  }
+  {
+    const store = await codexStore(t, "structured-empty-question");
+    const row = await runSeededJob(store, "answer in the schema", { allowQuestions: true, request: { outputSchema: QUESTION_SCHEMA } });
+    assert.equal(row.end_state, "completed");
+    assert.equal(row.question, null);
+    assert.deepEqual(JSON.parse(row.result_json), { result: "all done" });
+  }
+});
+
+test("a seeded job without allow_questions completes despite a question line", { timeout: 120000 }, async (t) => {
+  const store = await codexStore(t, "question-line");
+  const row = await runSeededJob(store, "do not ask", { allowQuestions: false });
+  assert.equal(row.end_state, "completed");
+  assert.equal(row.question, null);
+  assert.match(row.result_text, /AGENT-QUESTION: Which file should change\?/);
+  const sent = store.readFake().turnStarts.at(-1).prompt;
+  assert.equal(sent, "do not ask", "the prompt of a job without allow_questions was changed");
+});
+
+test("Codex results and the question request at their caps", { timeout: 240000 }, async (t) => {
+  {
+    const store = await codexStore(t, "huge-answer");
+    const row = await runSeededJob(store, "write too much");
+    assert.equal(row.end_state, "completed");
+    assert.equal(row.result_truncated, 1);
+    assert.ok(Buffer.byteLength(row.result_text, "utf8") <= 1048576, `result_text holds ${Buffer.byteLength(row.result_text, "utf8")} bytes`);
+  }
+  {
+    const store = await codexStore(t, "huge-json");
+    const row = await runSeededJob(store, "answer too much in the schema", { request: { outputSchema: QUESTION_SCHEMA } });
+    assert.equal(row.end_state, "completed");
+    assert.equal(row.result_json, null);
+    assert.equal(row.result_json_too_large, 1);
+  }
+  {
+    // A log that cannot be written leaves the result in the store.
+    const store = await codexStore(t);
+    const row = await runSeededJob(store, "log nowhere", {
+      beforeStart: (jobId) => fs.mkdirSync(path.join(store.stateDir, "store", "artifacts", `${jobId}.log`), { recursive: true })
+    });
+    assert.equal(row.end_state, "completed");
+    assert.equal(row.result_logged, 0);
+    assert.notEqual(row.result_text, null);
+  }
+  {
+    // The question instruction adds at most 4,096 bytes to the prompt.
+    const store = await codexStore(t);
+    const prompt = "p".repeat(10000);
+    await runSeededJob(store, prompt, { allowQuestions: true });
+    const sent = store.readFake().turnStarts.at(-1).prompt;
+    assert.ok(sent.startsWith(prompt), "the prompt is not first in the request");
+    const added = Buffer.byteLength(sent, "utf8") - Buffer.byteLength(prompt, "utf8");
+    assert.ok(added > 0 && added <= 4096, `the question request added ${added} bytes`);
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// The Codex task and review commands on the job store
+
+// A committed repository, a fake Codex and the environment of a CLI run in a Claude session.
+// Every worker the store records and every app server the fake records is stopped at the end.
+function codexCli(t, behavior = "review-ok") {
+  const exited = new Set();
+  let binDir = null;
+  stopLeftoverProcesses(t, () => binDir, exited);
+  const repo = makeCommittedRepo(t);
+  const stateDir = resolveStateDir(repo);
+  t.after(() => {
+    const file = path.join(stateDir, "store", "state.db");
+    if (!fs.existsSync(file)) {
+      return [];
+    }
+    const ids = storeFixtures.rawAll(stateDir, "SELECT id FROM jobs").map((row) => row.id);
+    return stopOwnedProcesses(ids.flatMap((id) => storeFixtures.jobProcesses(stateDir, id)));
+  });
+  binDir = makeTempDir(t);
+  installFakeCodex(binDir, behavior, { recordIdentities: true, version: "0.169.0" });
+  const env = { ...buildEnv(binDir), AGENT_PLUGIN_SESSION_ID: "sess-cli", AGENT_PLUGIN_TEST_CONTRACTS: FAKE_CODEX_CONTRACTS };
+  const cli = (...args) => run("node", [SCRIPT, ...args], { cwd: repo, env });
+  const rows = () => (fs.existsSync(path.join(stateDir, "store", "state.db")) ? storeFixtures.rawAll(stateDir, "SELECT * FROM jobs ORDER BY created_at, id") : []);
+  const readFake = () => {
+    const file = path.join(binDir, "fake-codex-state.json");
+    return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+  };
+  const released = (jobId) =>
+    storeFixtures.waitFor(() => storeFixtures.jobRow(stateDir, jobId)?.exec_released_at !== null, { timeoutMs: 60000, describe: `the release of ${jobId}` });
+  return { repo, stateDir, binDir, env, cli, rows, readFake, released };
+}
+
+test("task and review accept --label and --run-id and store both", { timeout: 120000 }, async (t) => {
+  const codex = codexCli(t);
+  const task = codex.cli("task", "--background", "--json", "--label", "r1", "--run-id", "run-1", "label this task");
+  assert.equal(task.status, 0, task.stderr);
+  const taskReply = JSON.parse(task.stdout);
+  assert.ok(taskReply.jobId);
+  assert.ok(["queued", "running"].includes(taskReply.status), taskReply.status);
+  assert.deepEqual([taskReply.label, taskReply.runId, taskReply.provider], ["r1", "run-1", "codex"]);
+  fs.writeFileSync(path.join(codex.repo, "README.md"), "changed\n");
+  const review = codex.cli("review", "--background", "--json", "--label", "r2", "--run-id", "run-1");
+  assert.equal(review.status, 0, review.stderr);
+  const reviewReply = JSON.parse(review.stdout);
+  assert.ok(reviewReply.jobId);
+  assert.ok(["queued", "running"].includes(reviewReply.status), reviewReply.status);
+  const byId = new Map(codex.rows().map((row) => [row.id, row]));
+  assert.deepEqual([byId.get(taskReply.jobId).label, byId.get(taskReply.jobId).run_id], ["r1", "run-1"]);
+  assert.deepEqual([byId.get(reviewReply.jobId).label, byId.get(reviewReply.jobId).run_id], ["r2", "run-1"]);
+  assert.equal(byId.get(reviewReply.jobId).kind, "review");
+  await codex.released(taskReply.jobId);
+  await codex.released(reviewReply.jobId);
+});
+
+test("task keeps option-like text after -- as the prompt", { timeout: 120000 }, async (t) => {
+  const codex = codexCli(t);
+  const task = codex.cli("task", "--background", "--json", "--write", "--", "fix --model handling");
+  assert.equal(task.status, 0, task.stderr);
+  const { jobId } = JSON.parse(task.stdout);
+  const row = storeFixtures.jobRow(codex.stateDir, jobId);
+  assert.equal(row.prompt, "fix --model handling");
+  assert.notEqual(row.model, "handling");
+  await codex.released(jobId);
+});
+
+test("task-resume-candidate prints the newest resumable Codex tip", { timeout: 120000 }, async (t) => {
+  const codex = codexCli(t);
+  const empty = codex.cli("task-resume-candidate", "--json");
+  assert.equal(empty.status, 0, empty.stderr);
+  assert.deepEqual(JSON.parse(empty.stdout), { available: false, jobId: null, threadId: null, label: null, status: null, provider: "codex" });
+  const task = codex.cli("task", "--label", "c1", "finish one task");
+  assert.equal(task.status, 0, task.stderr);
+  const [row] = codex.rows();
+  await codex.released(row.id);
+  const found = JSON.parse(codex.cli("task-resume-candidate", "--json").stdout);
+  assert.deepEqual(found, { available: true, jobId: row.id, threadId: storeFixtures.jobRow(codex.stateDir, row.id).thread_id, label: "c1", status: "completed", provider: "codex" });
+});
+
+test("a manifest entry keeps its worktree once its job committed, and loses it only when it never committed", { timeout: 120000 }, async (t) => {
+  const codex = codexCli(t);
+  const manifest = path.join(makeTempDir(t), "manifest.json");
+  fs.writeFileSync(
+    manifest,
+    JSON.stringify([
+      { label: "launch-throws", prompt: "entry one", worktree: true },
+      { label: "launch-refused", prompt: "entry two", worktree: true },
+      { label: "create-fails", prompt: "entry three", worktree: true },
+      { label: "launches", prompt: "entry four", worktree: true }
+    ])
   );
-  assert.ok(Date.now() - started < 6000, `the turn took ${Date.now() - started} ms to fail`);
+  const launches = [];
+  const launch = async (store, stateDir, jobId) => {
+    launches.push(jobId);
+    if (launches.length === 1) {
+      throw new Error("the worker could not be started");
+    }
+    return launches.length === 2 ? null : { pid: 1 };
+  };
+  const create = (store, fields, label) => {
+    if (fields.prompt === "entry three") {
+      throw new Error("the job could not be created");
+    }
+    return storeState.createJob(store, fields, { label });
+  };
+  setEnvFor(t, "PATH", codex.env.PATH);
+  const savedWrite = process.stdout.write;
+  const savedExitCode = process.exitCode;
+  let printed = "";
+  // The report is written as a string; the test runner's own binary messages pass through.
+  process.stdout.write = (chunk, ...rest) => {
+    if (typeof chunk !== "string") {
+      return savedWrite.call(process.stdout, chunk, ...rest);
+    }
+    printed += chunk;
+    return true;
+  };
+  try {
+    await launchManifestTasks(codex.repo, codex.repo, { manifest, json: true }, [], { model: null, effort: null }, { create, launch });
+  } finally {
+    process.stdout.write = savedWrite;
+    process.exitCode = savedExitCode;
+  }
+  const report = JSON.parse(printed);
+  t.after(() => {
+    for (const entry of report.jobs) {
+      if (entry.worktreePath) {
+        fs.rmSync(entry.worktreePath, { recursive: true, force: true });
+      }
+    }
+  });
+  assert.deepEqual(report.jobs.map((entry) => entry.label), ["launch-throws", "launch-refused", "launches"]);
+  assert.deepEqual(report.failed.map((entry) => entry.label), ["create-fails"]);
+  const rows = codex.rows();
+  assert.deepEqual(rows.map((row) => row.prompt), ["entry one", "entry two", "entry four"]);
+  for (const entry of report.jobs) {
+    assert.equal(fs.existsSync(entry.worktreePath), true, `the worktree of ${entry.label} was removed`);
+  }
+  const worktrees = fs.readdirSync(path.join(codex.stateDir, "worktrees"));
+  assert.equal(worktrees.length, 3, `worktrees left: ${worktrees.join(", ")}`);
+});
+
+test("a manifest starts one store job per entry through launchWorker", { timeout: 120000 }, async (t) => {
+  const codex = codexCli(t);
+  const manifest = path.join(makeTempDir(t), "manifest.json");
+  fs.writeFileSync(manifest, JSON.stringify([{ label: "one", prompt: "fan out one" }, { label: "two", prompt: "fan out two" }]));
+  const result = codex.cli("task", "--manifest", manifest, "--json");
+  assert.equal(result.status, 0, result.stderr);
+  const rows = codex.rows();
+  assert.equal(rows.length, 2);
+  for (const row of rows) {
+    await codex.released(row.id);
+    assert.notEqual(storeFixtures.jobRow(codex.stateDir, row.id).claimed_at, null);
+  }
+  const legacyJobs = path.join(codex.stateDir, "jobs");
+  assert.equal(fs.existsSync(legacyJobs) ? fs.readdirSync(legacyJobs).length : 0, 0, "a legacy job record was written");
+});
+
+test("a second Codex job with a live label exits 1 naming its holder and leaves no row", { timeout: 120000 }, async (t) => {
+  const codex = codexCli(t, "interruptible-slow-task");
+  const first = codex.cli("task", "--background", "--json", "--label", "dup", "hold the label");
+  assert.equal(first.status, 0, first.stderr);
+  const holder = JSON.parse(first.stdout).jobId;
+  const second = codex.cli("task", "--background", "--label", "dup", "want the label");
+  assert.equal(second.status, 1);
+  assert.match(second.stderr, new RegExp(`held by job ${holder}`));
+  assert.equal(codex.rows().length, 1);
+  await codex.released(holder);
+});
+
+test("Codex resume flags respect the thread barrier and print the overlap warning with --force", { timeout: 120000 }, async (t) => {
+  const codex = codexCli(t);
+  // A real thread first, so the forced continuation can resume it on the fake Codex.
+  const first = codex.cli("task", "make a thread");
+  assert.equal(first.status, 0, first.stderr);
+  const threadId = codex.rows()[0].thread_id;
+  await codex.released(codex.rows()[0].id);
+  // A later job on that thread whose provider exit was not observed leaves a barrier on it.
+  const db = storeLib.openStore(codex.stateDir);
+  t.after(() => db.close());
+  const { jobId: barrierJob } = storeState.createJob(db, {
+    provider: "codex",
+    kind: "task",
+    title: "barrier",
+    prompt: "left running",
+    request: { cwd: codex.repo },
+    cwd: codex.repo,
+    threadId,
+    requester: { sessionId: "sess-cli", leaderPid: null, leaderStartToken: null }
+  });
+  storeFixtures.rawExec(codex.stateDir, `UPDATE jobs SET exec_gen = 1, worker_pid = 1, worker_start_token = 'w', claimed_at = 1, spawn_intent_at = 2, provider_pid = 3, provider_start_token = 'r', active_thread_key = 'codex:${threadId}' WHERE id = '${barrierJob}'`);
+  assert.equal(storeState.releaseExecution(db, barrierJob, 1, { kind: "unobserved", endIfUndecided: { by: "reconcile", reason: "worker-dead" } }), true);
+  const warning = `Thread ${threadId} was last used by job ${barrierJob}, whose provider exit was not observed; it may still run and overlap this job.`;
+  const blocked = codex.cli("task", "--background", "--resume-thread", threadId, "continue the barred thread");
+  assert.equal(blocked.status, 1);
+  assert.match(blocked.stderr, new RegExp(barrierJob));
+  const blockedLast = codex.cli("task", "--background", "--resume-last", "continue the last job");
+  assert.equal(blockedLast.status, 1);
+  assert.match(blockedLast.stderr, new RegExp(barrierJob));
+  const forced = codex.cli("task", "--background", "--json", "--force", "--resume-thread", threadId, "continue anyway");
+  assert.equal(forced.status, 0, forced.stderr);
+  assert.ok(forced.stderr.includes(warning), forced.stderr);
+  await codex.released(JSON.parse(forced.stdout).jobId);
+});
+
+test("a foreground Codex job exits by its end state", { timeout: 120000 }, async (t) => {
+  {
+    const codex = codexCli(t);
+    const done = codex.cli("task", "finish in the foreground");
+    assert.equal(done.status, 0, done.stderr);
+    assert.match(done.stdout, /Handled the requested task/);
+  }
+  {
+    const codex = codexCli(t, "exit-mid-turn");
+    const failed = codex.cli("task", "fail in the foreground");
+    assert.equal(failed.status, 1, failed.stdout);
+    assert.equal(codex.rows()[0].end_state, "failed");
+  }
+});
+
+test("without --allow-questions the prompt is unchanged and the job completes", { timeout: 120000 }, async (t) => {
+  const codex = codexCli(t, "question-line");
+  const result = codex.cli("task", "send exactly this prompt");
+  assert.equal(result.status, 0, result.stderr);
+  const [row] = codex.rows();
+  assert.equal(row.end_state, "completed");
+  assert.equal(codex.readFake().turnStarts.at(-1).prompt, "send exactly this prompt");
+});
+
+test("question-schema conflicts are refused before any Codex job", { timeout: 120000 }, async (t) => {
+  const codex = codexCli(t);
+  const accepted = codex.cli("task", "--background", "--json", "one accepted job first");
+  assert.equal(accepted.status, 0, accepted.stderr);
+  await codex.released(JSON.parse(accepted.stdout).jobId);
+  const startsBefore = codex.readFake().appServerStarts ?? 0;
+  const schemaFile = path.join(makeTempDir(t), "schema.json");
+  fs.writeFileSync(schemaFile, JSON.stringify({ type: "array", items: { type: "string" } }));
+  const hash = crypto.createHash("sha256").update(fs.readFileSync(schemaFile)).digest("hex");
+  const refused = codex.cli("task", "--background", "--allow-questions", "--output-schema", schemaFile, "ask with a list schema");
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, /schema/i);
+  assert.equal(codex.rows().length, 1, "a job row was created for a refused schema");
+  assert.equal(crypto.createHash("sha256").update(fs.readFileSync(schemaFile)).digest("hex"), hash);
+  assert.equal(codex.readFake().appServerStarts ?? 0, startsBefore, "Codex was contacted for a refused schema");
+});
+
+test("--resume-last checks a replacement schema against the question setting the successor inherits", { timeout: 120000 }, async (t) => {
+  const codex = codexCli(t);
+  const first = codex.cli("task", "--allow-questions", "a job that may ask");
+  assert.equal(first.status, 0, first.stderr);
+  const schemaDir = makeTempDir(t);
+  const withQuestion = path.join(schemaDir, "with-question.json");
+  fs.writeFileSync(withQuestion, JSON.stringify({ type: "object", properties: { question: { type: "string" }, answer: { type: "string" } } }));
+  const plain = path.join(schemaDir, "plain.json");
+  fs.writeFileSync(plain, JSON.stringify({ type: "object", properties: { answer: { type: "string" } } }));
+
+  // The resume command does not pass --allow-questions; the successor may ask all the same.
+  const refused = codex.cli("task", "--background", "--resume-last", "--output-schema", withQuestion, "go on");
+  assert.equal(refused.status, 1, refused.stdout);
+  assert.match(refused.stderr, /already defines a question property/);
+  assert.equal(codex.rows().length, 1, "a successor was created for a schema it cannot use");
+
+  const accepted = codex.cli("task", "--background", "--json", "--resume-last", "--output-schema", plain, "go on");
+  assert.equal(accepted.status, 0, accepted.stderr);
+  const { jobId } = JSON.parse(accepted.stdout);
+  await codex.released(jobId);
+  const successor = storeFixtures.jobRow(codex.stateDir, jobId);
+  assert.equal(successor.allow_questions, 1);
+  assert.deepEqual(Object.keys(JSON.parse(successor.request_json).outputSchema.properties), ["answer", "question"]);
+});
+
+test("a Codex prompt of 8,388,608 bytes is accepted and one byte more refused", { timeout: 120000 }, async (t) => {
+  const codex = codexCli(t);
+  const promptDir = makeTempDir(t);
+  const atLimit = path.join(promptDir, "limit.txt");
+  fs.writeFileSync(atLimit, "a".repeat(8388608));
+  const over = path.join(promptDir, "over.txt");
+  fs.writeFileSync(over, "a".repeat(8388609));
+  const accepted = codex.cli("task", "--background", "--json", "--prompt-file", atLimit);
+  assert.equal(accepted.status, 0, accepted.stderr);
+  await codex.released(JSON.parse(accepted.stdout).jobId);
+  const refused = codex.cli("task", "--background", "--prompt-file", over);
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, /8388609 bytes; the limit is 8388608 bytes/);
+  assert.equal(codex.rows().length, 1);
+});
+
+// A Codex driver on a fake Codex of `behavior`, with a job row of a fresh repository and a worker
+// context that records nothing. Every app server the fake starts is stopped when the test ends.
+function fakeCodexDriver(t, behavior) {
+  let binDir = null;
+  stopLeftoverProcesses(t, () => binDir, new Set());
+  const repo = makeCommittedRepo(t);
+  binDir = makeTempDir(t);
+  installFakeCodex(binDir, behavior, { recordIdentities: true });
+  const driver = createCodexDriver(null, { env: buildEnv(binDir) });
+  const job = { id: "task-driver", cwd: repo, model: null, thread_id: null, ephemeral: 0, request_json: JSON.stringify({ cwd: repo }) };
+  const ctx = { job, cwd: repo, log: () => {}, onTurn: () => {}, onStarted: () => {}, onReceipt: () => {} };
+  return { driver, ctx };
+}
+
+// Resolves to `promise`'s value, or to `fallback` after `ms` milliseconds.
+function within(promise, ms, fallback) {
+  let timer;
+  return Promise.race([promise, new Promise((resolve) => (timer = setTimeout(() => resolve(fallback), ms)))]).finally(() => clearTimeout(timer));
+}
+
+test("the Codex driver's spawn returns the child before the handshake, and a stop ends a stalled prepare", { timeout: 60000 }, async (t) => {
+  const { driver, ctx } = fakeCodexDriver(t, "initialize-hangs");
+  const spawned = await within(driver.spawn(ctx), 10000, "pending");
+  assert.notEqual(spawned, "pending", "spawn waited for an initialize reply that never comes");
+  t.after(() => stopOwnedProcess(spawned.child, { tree: true }));
+  assert.ok(spawned.pid > 0 && spawned.child.pid === spawned.pid);
+  const prepared = driver.prepare(ctx).then(
+    () => "resolved",
+    () => "rejected"
+  );
+  assert.equal(await within(prepared, 1000, "pending"), "pending");
+  // The worker stops the provider through the child handle; the stalled handshake then fails.
+  await stopOwnedProcess(spawned.child, { tree: true });
+  assert.equal(await within(prepared, 10000, "pending"), "rejected");
+});
+
+test("the wait for a previous turn's interrupt ends at the limit when Codex never answers it", { timeout: 60000 }, async (t) => {
+  const { driver, ctx } = fakeCodexDriver(t, "interrupt-unanswered");
+  const spawned = await within(driver.spawn(ctx), 10000, "pending");
+  assert.notEqual(spawned, "pending", "spawn did not return");
+  t.after(() => stopOwnedProcess(spawned.child, { tree: true }));
+  await driver.prepare(ctx);
+  const started = Date.now();
+  const outcome = await within(driver.interruptPrevious(ctx, "turn-prev", 500), 10000, "still waiting");
+  assert.equal(outcome, "timeout");
+  assert.ok(Date.now() - started < 5000, `the wait took ${Date.now() - started} ms`);
 });

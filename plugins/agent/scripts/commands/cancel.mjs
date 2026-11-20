@@ -1,127 +1,129 @@
 import process from "node:process";
 
-import { outputCommandResult, parseCommandInput, resolveCommandCwd, sleep } from "../lib/companion-cli.mjs";
-import { readStoredJob, reconcileJobLiveness, resolveCancelableJob, terminateJobProcesses } from "../lib/job-control.mjs";
-import { isProcessAlive } from "../lib/process.mjs";
-import { providerForJob } from "../lib/providers.mjs";
-import { renderCancelReport } from "../lib/render.mjs";
-import { markJobCancelled, upsertJob } from "../lib/state.mjs";
-import { appendLogLine, nowIso } from "../lib/tracked-jobs.mjs";
+import { outputCommandResult, parseCommandInput } from "../lib/companion-cli.mjs";
+import { getSessionId, readRequesterIdentity } from "../lib/host.mjs";
+import { reconcileStore } from "../lib/job-control.mjs";
+import { getProvider } from "../lib/providers.mjs";
+import {
+  UnknownJobError,
+  decideNext,
+  listJobViews,
+  readJobView,
+  requestStop,
+  resolveActionableTip
+} from "../lib/state.mjs";
+import { RETRY_BUDGETS, testPoint } from "../lib/store.mjs";
+import { waitForJob } from "../lib/tracked-jobs.mjs";
+import { commandStateDir, openCommandStore, retrying, withCommandStore } from "./store.mjs";
 
-// How long cancel waits for an interrupted worker to finish its turn and exit by itself.
-export const INTERRUPT_EXIT_WAIT_MS = 10000;
+export const usage = "cancel [job-id|label] [--json]";
 
-export const usage = "cancel [job-id] [--json]";
+// How many times cancel follows a continuation that won against it to the chain's new tip.
+const FOLLOW_LIMIT = 3;
+const ACTIVE_STATES = new Set(["queued", "running", "stopping"]);
+const FINAL_STATES = new Set(["completed", "failed", "cancelled"]);
+
+// The job cancel acts on without a reference: the one queued, running or stopping chain tip of
+// this session.
+function soleActiveTip(store) {
+  const active = listJobViews(store, { sessionId: getSessionId(process.env), limit: 200 }).filter(
+    (view) => view.isTip && ACTIVE_STATES.has(view.state)
+  );
+  if (active.length === 1) {
+    return active[0];
+  }
+  throw new Error(active.length === 0 ? "No active job to cancel. Pass a job id or label." : "Several jobs are active. Pass a job id or label to cancel.");
+}
+
+/** The report of a cancel, from the job's row as last read. */
+export function renderStoreCancel(view, { stopRequested = false } = {}) {
+  const row = view.row;
+  const lines = [];
+  if (view.state === "cancelled") {
+    const provider = getProvider(view.provider);
+    if (stopRequested && provider.capabilities?.interrupt === false && row.end_reason === "tree-stop") {
+      lines.push(`${provider.label} cannot be interrupted; it was stopped by process id.`);
+    }
+    lines.push(`Job ${view.id} was cancelled.`);
+    if (view.providerExitUnobserved) {
+      lines.push("Its provider's exit was not observed; the provider may still run, so continuing its thread needs --force.");
+    }
+  } else if (ACTIVE_STATES.has(view.state)) {
+    lines.push(
+      `Job ${view.id} is ${view.state}: the cancel was recorded, but the job did not confirm it by its deadline. Check /agent:status ${view.id}.`
+    );
+  } else {
+    lines.push(`Job ${view.id} already ended (${view.state}) before the cancel took effect. Read its output with /agent:result ${view.id}.`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+// Records a stop request with a cancel for a queued, running or stopping tip, waits for its end
+// until the stop deadline, and reconciles once when it is still undecided.
+async function stopAndWait(stateDir, store, tip) {
+  testPoint("cancel-before-stop");
+  const stop = await retrying((opts) =>
+    requestStop(store, { jobIds: [tip.id] }, { reason: "cancel", cancel: true, sessionId: getSessionId(process.env) }, opts)
+  );
+  store.close();
+  const timeoutMs = Math.max(0, stop.localDeadline - performance.now());
+  const waited = await waitForJob(stateDir, tip.id, { until: "end", timeoutMs });
+  let view = waited.view;
+  if (waited.timedOut || !view) {
+    await reconcileStore(stateDir, { deadline: performance.now() + RETRY_BUDGETS.command.totalMs, budget: "command" });
+    view = await withCommandStore(stateDir, (fresh) => retrying((opts) => readJobView(fresh, tip.id, opts)));
+  }
+  return view ?? tip;
+}
 
 export async function run(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
     booleanOptions: ["json"]
   });
-
-  const cwd = resolveCommandCwd(options);
+  const stateDir = commandStateDir(options);
   const reference = positionals[0] ?? "";
-  await reconcileJobLiveness(cwd);
-  const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
-  const existing = readStoredJob(workspaceRoot, job.id) ?? {};
-  const { payload, report } = await cancelJob(workspaceRoot, job, existing);
-  outputCommandResult(payload, report, options.json);
-}
+  const requester = await readRequesterIdentity();
 
-/**
- * Cancels a job: marks it cancelled, asks its provider to interrupt the turn, stops its
- * processes, and records it as cancelled. `existing` is the job's stored record read before the
- * call; the record is read again after the cancel marker is written. Returns the command payload,
- * the job as reported, and the rendered report. When the job's process could not be verified, it
- * is not stopped, and the payload's `processWarning` and the report say it may still be running.
- */
-export async function cancelJob(workspaceRoot, job, existing, deps = {}) {
-  const {
-    interruptTurn = (cwd, ids) => providerForJob(job).interruptTurn(cwd, ids),
-    terminate = terminateJobProcesses,
-    readStoredJob: readStored = (root, jobId) => readStoredJob(root, jobId, { ignoreCancelMarker: true }),
-    isAlive = isProcessAlive,
-    sleep: wait = sleep
-  } = deps;
-  markJobCancelled(workspaceRoot, job.id);
-  // A worker publishes its pid and then checks the marker, so the record read after the marker
-  // holds the pid of every worker that can still start a turn.
-  const current = readStored(workspaceRoot, job.id) ?? existing;
-  const threadId = current.threadId ?? job.threadId ?? null;
-  const turnId = current.turnId ?? job.turnId ?? null;
-
-  const provider = providerForJob(job);
-  const interrupt = await interruptTurn(workspaceRoot, { threadId, turnId });
-  if (interrupt.attempted) {
-    appendLogLine(
-      job.logFile,
-      interrupt.interrupted
-        ? `Requested ${provider.label} turn interrupt for ${turnId} on ${threadId}.`
-        : `${provider.label} turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
-    );
-  }
-
-  // An interrupted worker normally records the stopped turn and exits on its own; it is
-  // stopped by force only if it is still running after the wait.
-  const workerPid = current.pid ?? job.pid ?? null;
-  if (interrupt.interrupted && Number.isInteger(workerPid)) {
-    const deadline = Date.now() + INTERRUPT_EXIT_WAIT_MS;
-    while (isAlive(workerPid) && Date.now() < deadline) {
-      await wait(100);
+  let store = await openCommandStore(stateDir);
+  let outcome = null;
+  try {
+    let tip = await retrying((opts) => (reference ? resolveActionableTip(store, reference, opts) : soleActiveTip(store)));
+    if (!tip) {
+      throw new UnknownJobError({ ref: reference });
     }
-    if (isAlive(workerPid)) {
-      appendLogLine(job.logFile, `The worker was still running ${INTERRUPT_EXIT_WAIT_MS / 1000} s after the interrupt.`);
+    for (let attempt = 0; attempt < FOLLOW_LIMIT && !outcome; attempt += 1) {
+      if (ACTIVE_STATES.has(tip.state)) {
+        const view = await stopAndWait(stateDir, store, tip);
+        store = await openCommandStore(stateDir);
+        // A continuation that won before the stop request is the chain's new tip; it is cancelled next.
+        const latest = await retrying((opts) => resolveActionableTip(store, tip.id, opts));
+        if (latest && latest.id !== tip.id && !FINAL_STATES.has(latest.state)) {
+          tip = latest;
+          continue;
+        }
+        outcome = { view, stopRequested: true };
+      } else if (tip.state === "waiting" || tip.state === "interrupted") {
+        const decision = await retrying((opts) => decideNext(store, { ref: tip.id, observedTipId: tip.id }, { action: "cancel", requester }, opts));
+        if (decision.won) {
+          outcome = { view: await retrying((opts) => readJobView(store, tip.id, opts)), stopRequested: false };
+        } else if (decision.successorId) {
+          // A continuation won: the chain's new tip is cancelled instead.
+          tip = await retrying((opts) => resolveActionableTip(store, tip.id, opts));
+        } else {
+          outcome = { view: decision.view ?? tip, stopRequested: false };
+        }
+      } else if (FINAL_STATES.has(tip.state)) {
+        throw new Error(`Job ${tip.id} has already ${tip.state === "cancelled" ? "been cancelled" : tip.state}, so there is nothing to cancel.`);
+      }
     }
+    if (!outcome) {
+      throw new Error(`Job ${tip.id} kept being continued while cancel ran; run cancel again.`);
+    }
+  } finally {
+    store?.close();
   }
-  const [termination] = terminate([{ ...job, ...current }]);
-  const processWarning =
-    termination?.outcome === "unverified"
-      ? `Process ${termination.pid} could not be verified as this job's, so it was not stopped; it may still be running.`
-      : null;
-  if (processWarning) {
-    appendLogLine(job.logFile, processWarning);
-  } else if (termination?.outcome === "pid-reused") {
-    appendLogLine(job.logFile, `Process ${termination.pid} no longer belongs to this job; it was not stopped.`);
-  } else if (termination?.outcome === "failed") {
-    appendLogLine(job.logFile, `Stopping process ${termination.pid} failed: ${termination.detail}`);
-  }
-  appendLogLine(job.logFile, "Cancelled by user.");
-
-  const completedAt = nowIso();
-  const nextJob = {
-    ...job,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    completedAt,
-    errorMessage: "Cancelled by user."
-  };
-
-  // Only the cancellation fields are replaced, in one read-modify-write, so a result the worker
-  // wrote before that read is kept. The step is not locked: a result written between the read
-  // and the replace can be lost. The listed job fills in fields the record does not have.
-  upsertJob(
-    workspaceRoot,
-    {
-      id: job.id,
-      status: "cancelled",
-      phase: "cancelled",
-      pid: null,
-      completedAt,
-      cancelledAt: completedAt,
-      errorMessage: "Cancelled by user."
-    },
-    { defaults: job }
-  );
-
-  const payload = {
-    jobId: job.id,
-    status: "cancelled",
-    title: job.title,
-    turnInterruptAttempted: interrupt.attempted,
-    turnInterrupted: interrupt.interrupted,
-    ...(processWarning ? { processWarning } : {})
-  };
-  const report = renderCancelReport(nextJob) + (processWarning ? `\n**Warning:** ${processWarning}\n` : "");
-  return { payload, nextJob, report };
+  const { view, stopRequested } = outcome;
+  const payload = { jobId: view.id, status: view.state, title: view.row.title, endReason: view.row.end_reason ?? null };
+  outputCommandResult(payload, renderStoreCancel(view, { stopRequested }), options.json);
 }

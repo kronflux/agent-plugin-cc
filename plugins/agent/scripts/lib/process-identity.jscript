@@ -1,0 +1,48 @@
+// Windows Script Host (JScript) query of process creation times, run by lib/process.mjs as
+//   cscript //nologo //E:JScript process-identity.jscript <pid> ...
+// It starts in tens of milliseconds, where a PowerShell start alone takes about half a second.
+// Output: one line "<pid> <ticks>" per process that exists ("<pid> -" when it has no creation
+// time), then the line "done". The ticks are the creation time in UTC as 100 ns ticks since
+// 0001-01-01, the same value PowerShell's CreationDate.ToUniversalTime().Ticks gives, so both
+// query routes yield one token for one process.
+var ids = [];
+for (var i = 0; i < WScript.Arguments.length; i++) {
+  var id = parseInt(WScript.Arguments(i), 10);
+  if (id > 0) {
+    ids.push("ProcessId=" + id);
+  }
+}
+
+function pad(text, width) {
+  text = String(text);
+  while (text.length < width) {
+    text = "0" + text;
+  }
+  return text;
+}
+
+// A WMI time is yyyymmddHHMMSS.mmmmmm±UUU: local time, microseconds, and the offset from UTC in
+// minutes. The seconds are computed apart from the fraction, because the tick count is too large
+// for a JScript number to hold exactly.
+function ticksOf(wmiTime) {
+  var match = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\.(\d{6})([+-]\d{3})$/.exec(String(wmiTime));
+  if (!match) {
+    return null;
+  }
+  var localAsUtcMs = Date.UTC(+match[1], +match[2] - 1, +match[3], +match[4], +match[5], +match[6]);
+  var unixSeconds = localAsUtcMs / 1000 - parseInt(match[8], 10) * 60;
+  // 62135596800 seconds lie between 0001-01-01 and 1970-01-01.
+  return String(unixSeconds + 62135596800) + pad(match[7], 6) + "0";
+}
+
+if (ids.length > 0) {
+  var rows = GetObject("winmgmts:\\\\.\\root\\cimv2").ExecQuery(
+    "SELECT ProcessId, CreationDate FROM Win32_Process WHERE " + ids.join(" OR ")
+  );
+  for (var rowsEnum = new Enumerator(rows); !rowsEnum.atEnd(); rowsEnum.moveNext()) {
+    var row = rowsEnum.item();
+    var ticks = row.CreationDate ? ticksOf(row.CreationDate) : null;
+    WScript.Echo(row.ProcessId + " " + (ticks === null ? "-" : ticks));
+  }
+}
+WScript.Echo("done");

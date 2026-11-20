@@ -8,7 +8,6 @@ import { makeTempDir, stopOwnedProcesses } from "./helpers.mjs";
 import { startHelperProcess } from "./store-fixtures.mjs";
 import {
   binaryAvailable,
-  readProcessCommandLines,
   readProcessIdentities,
   readProcessIdentity,
   resolveCommand,
@@ -18,6 +17,7 @@ import {
   terminateProcessTree
 } from "../plugins/agent/scripts/lib/process.mjs";
 import { leaderState } from "../plugins/agent/scripts/lib/state.mjs";
+import * as processLib from "../plugins/agent/scripts/lib/process.mjs";
 
 const windowsOnly = { skip: process.platform !== "win32" && "Windows command resolution" };
 
@@ -236,24 +236,6 @@ test("a child ended by a signal is a failure", () => {
   assert.equal(binaryAvailable(process.execPath, ["--version"], { shell: false, spawnSyncImpl }).available, false);
 });
 
-test("readProcessCommandLines counts a vanished Linux process as not running", () => {
-  const reads = {
-    "/proc/11/cmdline": () => {
-      throw Object.assign(new Error("missing"), { code: "ENOENT" });
-    },
-    "/proc/12/cmdline": () => {
-      throw Object.assign(new Error("gone"), { code: "ESRCH" });
-    },
-    "/proc/13/cmdline": () => "",
-    "/proc/14/cmdline": () => "node\0worker.mjs\0"
-  };
-  const found = readProcessCommandLines([11, 12, 13, 14], {
-    platform: "linux",
-    readFileImpl: (file) => reads[file]()
-  });
-  assert.deepEqual([...found], [[14, "node worker.mjs"]]);
-});
-
 test("resolveCommand turns off delayed expansion for batch files", windowsOnly, () => {
   const dir = makeTempDir();
   fs.writeFileSync(path.join(dir, "codex.cmd"), "");
@@ -385,4 +367,147 @@ test("leaderState answers none, unknown, gone and alive", async (t) => {
   assert.equal(leaderState(row({}), observed), "alive");
   assert.equal(leaderState(row({ leader_start_token: bumpToken(observed.startToken) }), observed), "gone");
   assert.equal(leaderState(row({}), { state: "absent" }), "gone");
+});
+
+// The identities of helpers read in one query: `{ pid, startToken }` and the group id of each.
+async function verifiedIdentities(helpers) {
+  const observed = await readProcessIdentities(
+    helpers.map((helper) => helper.pid),
+    { deadline: performance.now() + 10000 }
+  );
+  return helpers.map((helper) => {
+    const identity = observed.get(helper.pid);
+    assert.equal(identity?.state, "present");
+    return { identity: { pid: helper.pid, startToken: identity.startToken }, groupId: identity.groupId };
+  });
+}
+
+test("stopTrees stops the verified targets and leaves a mismatched one alone", { timeout: 60000 }, async (t) => {
+  const helpers = [await startHelperProcess({ child: true }), await startHelperProcess({ child: true }), await startHelperProcess()];
+  t.after(() => Promise.all(helpers.map(stopHelper)));
+  assert.ok(helpers[0].childPid && helpers[1].childPid, "the helpers did not report their children");
+  const verified = await verifiedIdentities(helpers);
+  const targets = verified.map(({ identity }) => identity);
+  targets[2] = { ...targets[2], startToken: bumpToken(targets[2].startToken) };
+
+  const results = await processLib.stopTrees(targets, {
+    deadline: performance.now() + 10000,
+    expectedGroupIds: verified.map(({ groupId }) => groupId)
+  });
+
+  assert.deepEqual(results, ["stopped", "stopped", "mismatch"]);
+  assert.equal(await waitAbsent([helpers[0].pid, helpers[0].childPid, helpers[1].pid, helpers[1].childPid]), true);
+  assert.equal((await readProcessIdentity(helpers[2].pid, { deadline: performance.now() + 5000 })).state, "present");
+});
+
+test("stopTrees starts nothing once its deadline has passed", { timeout: 60000 }, async (t) => {
+  const helpers = [await startHelperProcess(), await startHelperProcess()];
+  t.after(() => Promise.all(helpers.map(stopHelper)));
+  const verified = await verifiedIdentities(helpers);
+  const targets = verified.map(({ identity }) => identity);
+  const expectedGroupIds = verified.map(({ groupId }) => groupId);
+
+  // A deadline already spent: nothing is read or stopped.
+  assert.deepEqual(await processLib.stopTrees(targets, { deadline: performance.now() - 1, expectedGroupIds }), ["unknown", "unknown"]);
+
+  // A deadline that passes after the identities were verified and before the stop starts: the
+  // check right before each signal or command start refuses it.
+  const previous = process.env.AGENT_PLUGIN_TEST_DELAYS;
+  process.env.AGENT_PLUGIN_TEST_DELAYS = JSON.stringify({ command: 3500, "tree-signal": 3500 });
+  try {
+    assert.deepEqual(await processLib.stopTrees(targets, { deadline: performance.now() + 3000, expectedGroupIds }), ["unknown", "unknown"]);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.AGENT_PLUGIN_TEST_DELAYS;
+    } else {
+      process.env.AGENT_PLUGIN_TEST_DELAYS = previous;
+    }
+  }
+  const after = await readProcessIdentities(
+    helpers.map((helper) => helper.pid),
+    { deadline: performance.now() + 10000 }
+  );
+  assert.ok(helpers.every((helper) => after.get(helper.pid)?.state === "present"), "a helper was stopped after the deadline");
+});
+
+test("both Windows identity routes give one token for one process", { ...windowsOnly, timeout: 60000 }, async (t) => {
+  const helper = await startHelperProcess();
+  t.after(() => stopHelper(helper));
+  const saved = process.env.AGENT_PLUGIN_TEST_PROCESS;
+  t.after(() => {
+    if (saved === undefined) {
+      delete process.env.AGENT_PLUGIN_TEST_PROCESS;
+    } else {
+      process.env.AGENT_PLUGIN_TEST_PROCESS = saved;
+    }
+  });
+  const pids = [helper.pid, process.pid, 4000000];
+  const read = async () => {
+    const started = performance.now();
+    const identities = await readProcessIdentities(pids, { deadline: performance.now() + 20000 });
+    return { identities, elapsed: Math.round(performance.now() - started) };
+  };
+  delete process.env.AGENT_PLUGIN_TEST_PROCESS;
+  const fast = await read();
+  process.env.AGENT_PLUGIN_TEST_PROCESS = JSON.stringify({ windowsQuery: "powershell" });
+  const slow = await read();
+  t.diagnostic(`script host ${fast.elapsed} ms, PowerShell ${slow.elapsed} ms`);
+  for (const pid of [helper.pid, process.pid]) {
+    assert.equal(fast.identities.get(pid).state, "present");
+    assert.match(fast.identities.get(pid).startToken, /^\d{18}$/);
+    assert.equal(fast.identities.get(pid).startToken, slow.identities.get(pid).startToken, `pid ${pid}`);
+  }
+  assert.deepEqual(fast.identities.get(4000000), { state: "absent" });
+  assert.deepEqual(slow.identities.get(4000000), { state: "absent" });
+});
+
+test("a failed stop command is a tree stop only when it stopped the root's child and failed on the root alone", () => {
+  const { failedStopStoppedTree } = processLib;
+  // The two lines the command printed for a wrapper root's children when the whole stop succeeded.
+  const children =
+    "SUCCESS: The process with PID 4340 (child process of PID 37808) has been terminated.\r\n" +
+    "SUCCESS: The process with PID 32348 (child process of PID 37808) has been terminated.";
+  // What it printed for a root that had already exited before it ran.
+  const rootNotFound = 'ERROR: The process "37808" not found.';
+  assert.equal(failedStopStoppedTree(37808, { stdout: children, stderr: rootNotFound }), true);
+  assert.equal(failedStopStoppedTree(37808, { stdout: children, stderr: "" }), true);
+  // A root that exited before the command ran: no child was stopped by this command.
+  assert.equal(failedStopStoppedTree(37808, { stdout: "", stderr: rootNotFound }), false);
+  // Another process could not be stopped, so something may still run.
+  assert.equal(
+    failedStopStoppedTree(37808, {
+      stdout: children,
+      stderr: `${rootNotFound}\r\nERROR: The process with PID 5000 (child process of PID 4340) could not be terminated.`
+    }),
+    false
+  );
+  // Only the root's own success line: nothing shows a child of the root.
+  assert.equal(
+    failedStopStoppedTree(37808, { stdout: "SUCCESS: The process with PID 37808 (child process of PID 25964) has been terminated.", stderr: "" }),
+    false
+  );
+  // The same lines in another language keep their numbers and their order.
+  assert.equal(
+    failedStopStoppedTree(37808, {
+      stdout: "ERFOLGREICH: Der Prozess mit PID 4340 (untergeordneter Prozess von PID 37808) wurde beendet.",
+      stderr: 'FEHLER: Der Prozess "37808" wurde nicht gefunden.'
+    }),
+    true
+  );
+  assert.equal(failedStopStoppedTree(37808, {}), false);
+});
+
+test("a failed batched stop credits a root only when its error output names requested roots alone", () => {
+  const { pidsReportedStopped } = processLib;
+  assert.equal(typeof pidsReportedStopped, "function");
+  const rootStopped = "SUCCESS: The process with PID 37808 (child process of PID 25964) has been terminated.";
+  // A descendant of the reported root survived: nothing is credited from the output.
+  const childFailed = "ERROR: The process with PID 5000 (child process of PID 37808) could not be terminated.";
+  assert.deepEqual([...pidsReportedStopped({ stdout: rootStopped, stderr: childFailed }, [37808, 41000])], []);
+  // The error output is about another requested root only: the reported root is credited.
+  const otherRootMissing = 'FEHLER: Der Prozess "41000" wurde nicht gefunden.';
+  assert.deepEqual([...pidsReportedStopped({ stdout: rootStopped, stderr: otherRootMissing }, [37808, 41000])], [37808]);
+  assert.deepEqual([...pidsReportedStopped({ stdout: rootStopped, stderr: "" }, [37808, 41000])], [37808]);
+  // An error line with no number cannot be read as about a requested root.
+  assert.deepEqual([...pidsReportedStopped({ stdout: rootStopped, stderr: "ERROR: Access denied." }, [37808])], []);
 });

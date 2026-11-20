@@ -1,4 +1,4 @@
-import { DEFAULT_PROVIDER_ID, getProvider, providerForJob } from "./providers.mjs";
+import { getProvider } from "./providers.mjs";
 
 // Results name the provider that produced them; callers pass its label.
 function labelFor(meta) {
@@ -98,28 +98,6 @@ function normalizeReviewResultData(data, meta) {
   };
 }
 
-function isStructuredReviewStoredResult(storedJob) {
-  const result = storedJob?.result;
-  if (!result || typeof result !== "object" || Array.isArray(result)) {
-    return false;
-  }
-  return (
-    Object.prototype.hasOwnProperty.call(result, "result") ||
-    Object.prototype.hasOwnProperty.call(result, "parseError")
-  );
-}
-
-function formatJobLine(job) {
-  const parts = [job.id, `${job.status || "unknown"}`];
-  if (job.kindLabel) {
-    parts.push(job.kindLabel);
-  }
-  if (job.title) {
-    parts.push(job.title);
-  }
-  return parts.join(" | ");
-}
-
 function escapeMarkdownCell(value) {
   return String(value ?? "")
     .replace(/\|/g, "\\|")
@@ -139,73 +117,6 @@ export function fenceFor(text) {
 function fencedText(text) {
   const fence = fenceFor(text);
   return [`${fence}text`, text, fence];
-}
-
-// An ephemeral thread is not saved by its provider, so no resume command is offered for it.
-function formatResumeLine(job) {
-  if (!job?.threadId || job.ephemeralThread === true) {
-    return null;
-  }
-  const provider = providerForJob(job);
-  return `Resume in ${provider.label}: ${provider.resumeCommand(job.threadId)}`;
-}
-
-function appendActiveJobsTable(lines, jobs) {
-  lines.push("Active jobs:");
-  lines.push("| Job | Kind | Status | Phase | Elapsed | Session ID | Summary | Actions |");
-  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
-  for (const job of jobs) {
-    const actions = [`/agent:status ${job.id}`];
-    if (job.status === "queued" || job.status === "running") {
-      actions.push(`/agent:cancel ${job.id}`);
-    }
-    lines.push(
-      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
-    );
-  }
-}
-
-function pushJobDetails(lines, job, options = {}) {
-  lines.push(`- ${formatJobLine(job)}`);
-  if (job.summary) {
-    lines.push(`  Summary: ${job.summary}`);
-  }
-  if (job.phase) {
-    lines.push(`  Phase: ${job.phase}`);
-  }
-  if (options.showElapsed && job.elapsed) {
-    lines.push(`  Elapsed: ${job.elapsed}`);
-  }
-  if (options.showDuration && job.duration) {
-    lines.push(`  Duration: ${job.duration}`);
-  }
-  if (job.threadId) {
-    lines.push(`  ${providerForJob(job).label} session ID: ${job.threadId}`);
-  }
-  const resumeLine = formatResumeLine(job);
-  if (resumeLine) {
-    lines.push(`  ${resumeLine}`);
-  }
-  if (job.logFile && options.showLog) {
-    lines.push(`  Log: ${job.logFile}`);
-  }
-  if ((job.status === "queued" || job.status === "running") && options.showCancelHint) {
-    lines.push(`  Cancel: /agent:cancel ${job.id}`);
-  }
-  if (job.status !== "queued" && job.status !== "running" && options.showResultHint) {
-    lines.push(`  Result: /agent:result ${job.id}`);
-  }
-  if (job.status !== "queued" && job.status !== "running" && job.jobClass === "task" && job.write && options.showReviewHint) {
-    const { reviewCommands } = providerForJob(job);
-    lines.push(`  Review changes: ${reviewCommands.review} --wait`);
-    lines.push(`  Stricter review: ${reviewCommands.adversarialReview} --wait`);
-  }
-  if (job.progressPreview?.length) {
-    lines.push("  Progress:");
-    for (const line of job.progressPreview) {
-      lines.push(`    ${line}`);
-    }
-  }
 }
 
 function appendReasoningSection(lines, reasoningSummary) {
@@ -335,165 +246,311 @@ function renderWorktreeNote(meta) {
 
 export function renderTaskResult(parsedResult, meta) {
   const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
-  if (rawOutput) {
-    return `${rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`}${renderWorktreeNote(meta)}`;
+  const structured = renderStructuredOutput(parsedResult?.structuredOutput, { tooLarge: parsedResult?.structuredResultTooLarge });
+  const failure = String(parsedResult?.failureMessage ?? "").trim();
+  if (rawOutput || structured) {
+    const text = rawOutput && !rawOutput.endsWith("\n") ? `${rawOutput}\n` : rawOutput;
+    return `${text}${text && structured ? "\n" : ""}${structured}${failure ? `\n${failure}\n` : ""}${renderWorktreeNote(meta)}`;
   }
 
-  const message = String(parsedResult?.failureMessage ?? "").trim() || `${labelFor(meta)} did not return a final message.`;
+  const message = failure || `${labelFor(meta)} did not return a final message.`;
   return `${message}\n${renderWorktreeNote(meta)}`;
 }
 
-export function renderStatusReport(report) {
+// ---------------------------------------------------------------------------------------------
+// Job store views (status, result, cancel)
+
+function isoTime(milliseconds) {
+  return milliseconds === null || milliseconds === undefined ? null : new Date(milliseconds).toISOString();
+}
+
+/** The display name of a job view's provider. */
+export function providerLabelOf(view) {
+  try {
+    return getProvider(view.provider).label;
+  } catch {
+    return view.provider;
+  }
+}
+
+/** One job of `status --json`: exactly the fields of the status contract, times as ISO strings. */
+function statusJsonJob(view) {
+  const row = view.row;
+  return {
+    id: view.id,
+    label: view.label ?? null,
+    runId: row.run_id ?? null,
+    provider: view.provider,
+    model: row.model ?? null,
+    status: view.state,
+    chainId: view.chainId,
+    continues: row.continues ?? null,
+    threadId: row.thread_id ?? null,
+    resumable: Boolean(view.resumable),
+    resumeMethod: row.resume_method ?? null,
+    stopFailed: row.stopping_since !== null && row.stopping_since !== undefined,
+    stoppingCause: row.stopping_cause ?? null,
+    providerExitUnobserved: Boolean(view.providerExitUnobserved),
+    pendingMessages: view.pendingMessages,
+    unreadEvents: view.unreadEvents,
+    question: row.question ?? null,
+    resultTruncated: Boolean(row.result_truncated),
+    structuredResultTooLarge: Boolean(row.result_json_too_large),
+    createdAt: isoTime(row.created_at),
+    updatedAt: isoTime(row.updated_at)
+  };
+}
+
+/** The `status --json` payload for job views: `{ jobs: [...] }`. */
+export function renderStatusJson(views) {
+  return { jobs: views.map(statusJsonJob) };
+}
+
+/** The command that fits a job's state, as one sentence. */
+export function renderStateHint(view) {
+  const id = view.id;
+  switch (view.state) {
+    case "queued":
+    case "running":
+      return `Add to its turn with /agent:send ${id} <message>; stop it with /agent:cancel ${id}.`;
+    case "stopping":
+      return "It is stopping: its provider process has not been confirmed gone, so it cannot be continued yet.";
+    case "waiting":
+      return `It is waiting for an answer; reply with /agent:send ${id} <answer>.`;
+    case "interrupted":
+    case "completed":
+      return `Read its output with /agent:result ${id}; continue it with /agent:resume ${id} [message] or /agent:send ${id} <message>.`;
+    default:
+      return `Read its output with /agent:result ${id}; it can be continued only with /agent:resume ${id} --force.`;
+  }
+}
+
+function chainText(view) {
+  const parts = [`position ${view.chainPosition}`];
+  if (view.row.continues) {
+    parts.push(`continues ${view.row.continues}`);
+  }
+  if (view.successorId) {
+    parts.push(`continued by ${view.successorId}`);
+  }
+  return parts.join(", ");
+}
+
+// The notes a job carries beyond its state: question, error, stop state, unobserved exit.
+function jobNotes(view) {
+  const row = view.row;
+  const notes = [];
+  if (row.question) {
+    notes.push(`Question: ${row.question}`);
+  }
+  if (row.error) {
+    notes.push(`Error: ${row.error}`);
+  }
+  if (row.stopping_since !== null && row.stopping_since !== undefined) {
+    notes.push(`Stop not confirmed (${row.stopping_cause ?? "unknown cause"}) since ${isoTime(row.stopping_since)}.`);
+  }
+  if (view.providerExitUnobserved) {
+    notes.push("Provider exit not observed: the provider may still run, so continuing its thread needs --force.");
+  }
+  return notes;
+}
+
+// The lines that say how complete a stored result is.
+function resultNotes(view, logFile) {
+  const row = view.row;
+  const notes = [];
+  if (row.result_truncated) {
+    notes.push(
+      row.result_logged && logFile
+        ? `The stored result was truncated; the full output is in the log: ${logFile}`
+        : "The stored result was truncated; the full output was not kept."
+    );
+  }
+  if (row.result_json_too_large) {
+    notes.push("structured-result-too-large: the structured result was larger than 1 MiB and was not stored.");
+  }
+  return notes;
+}
+
+/** The status table of several jobs, with the notes of each chain tip that has any. */
+export function renderStoreStatus(views, { all = false } = {}) {
+  const lines = ["# Agent Status", ""];
+  if (views.length === 0) {
+    lines.push(all ? "No jobs recorded yet." : "No jobs recorded for this session yet. Pass --all to list every job of this repository.");
+    return `${lines.join("\n")}\n`;
+  }
+  lines.push("| Job | Agent | Kind | State | Label | Chain | Pending messages | Unread events | Title |");
+  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+  for (const view of views) {
+    const cells = [
+      view.id,
+      providerLabelOf(view),
+      view.row.kind,
+      view.state + (view.providerExitUnobserved ? " (provider exit not observed)" : ""),
+      view.label ?? "",
+      chainText(view),
+      String(view.pendingMessages),
+      String(view.unreadEvents),
+      view.row.title
+    ];
+    lines.push(`| ${cells.map(escapeMarkdownCell).join(" | ")} |`);
+  }
+  const notes = views.flatMap((view) => (view.isTip ? [...jobNotes(view), renderStateHint(view)].map((note) => `- ${view.id}: ${note}`) : []));
+  lines.push("", ...notes);
+  lines.push("", "An explicit job id names that exact job; a label names the newest job of its chain.");
+  return `${lines.join("\n")}\n`;
+}
+
+/** The status of one job, with its last log lines as progress. */
+export function renderStoreJobStatus(view, { progress = [], logFile = null } = {}) {
+  const row = view.row;
+  const label = providerLabelOf(view);
   const lines = [
-    "# Agent Status",
+    "# Job Status",
     "",
-    `Session runtime: ${report.sessionRuntime.label}`,
-    `Review gate: ${report.config.stopReviewGate ? "enabled" : "disabled"}`,
-    ""
+    `Job: ${view.id}`,
+    `Agent: ${label}`,
+    `Kind: ${row.kind}`,
+    `Title: ${row.title}`,
+    `State: ${view.state}`,
+    `Label: ${view.label ?? "none"}`,
+    `Chain: ${chainText(view)}`,
+    `Pending messages: ${view.pendingMessages}`,
+    `Unread events: ${view.unreadEvents}`
   ];
+  if (row.thread_id) {
+    lines.push(`${label} session ID: ${row.thread_id}`, ...storedResumeLine(view));
+  }
+  lines.push(...jobNotes(view), ...resultNotes(view, logFile));
+  if (logFile) {
+    lines.push(`Log: ${logFile}`);
+  }
+  if (progress.length > 0) {
+    lines.push("Progress:", ...progress.map((line) => `  ${line}`));
+  }
+  lines.push(
+    view.isTip
+      ? renderStateHint(view)
+      : `This job is not the newest of its chain; read its output with /agent:result ${view.id}, and act on the chain through ${view.successorId ?? "its newest job"}.`
+  );
+  return `${lines.join("\n")}\n`;
+}
 
-  if (report.running.length > 0) {
-    appendActiveJobsTable(lines, report.running);
-    lines.push("");
-    lines.push("Live details:");
-    for (const job of report.running) {
-      pushJobDetails(lines, job, {
-        showElapsed: true,
-        showLog: true
-      });
+// A stored review bound to the review schema, rendered as a review (heading, target, verdict,
+// findings) from its structured result; null for any other job, and for a native review, whose
+// result is prose. A review that failed keeps its failure after the rendering.
+function storedReview(view) {
+  const row = view.row;
+  const review = view.request?.review;
+  if (row.kind !== "review" || !review || review.native) {
+    return null;
+  }
+  const label = providerLabelOf(view);
+  let parsed = null;
+  let parseError = row.error || `${label} returned no structured review.`;
+  if (row.result_json) {
+    try {
+      parsed = JSON.parse(row.result_json);
+    } catch (error) {
+      parseError = `the stored review is not valid JSON (${error.message})`;
     }
-    lines.push("");
   }
+  const meta = {
+    reviewLabel: review.stance === "critical" ? "Critical Review" : "Review",
+    targetLabel: review.targetLabel ?? "the reviewed changes",
+    targetKind: review.target,
+    providerLabel: label
+  };
+  const rendered = renderReviewResult({ parsed, rawOutput: row.result_text ?? "", parseError }, meta);
+  return view.state !== "completed" && row.error && parsed ? `${rendered}${row.error}\n` : rendered;
+}
 
-  if (report.latestFinished) {
-    lines.push("Latest finished:");
-    pushJobDetails(lines, report.latestFinished, {
-      showDuration: true,
-      showLog: report.latestFinished.status === "failed"
-    });
-    lines.push("");
+// The command that opens a stored job's thread in the provider's own tool. None for a thread the
+// provider does not keep (ephemeral) and none for a review, whose thread is not meant to be worked
+// in.
+function storedResumeLine(view) {
+  const row = view.row;
+  if (!row.thread_id || row.ephemeral || row.kind === "review") {
+    return [];
   }
+  try {
+    const provider = getProvider(view.provider);
+    return [`Resume in ${provider.label}: ${provider.resumeCommand(row.thread_id)}`];
+  } catch {
+    return [];
+  }
+}
 
-  if (report.recent.length > 0) {
-    lines.push("Recent jobs:");
-    for (const job of report.recent) {
-      pushJobDetails(lines, job, {
-        showDuration: true,
-        showLog: job.status === "failed"
-      });
+// The line that names the model of a job whose request named none: the provider's saved model when
+// the job recorded one, otherwise that the provider chose it.
+function storedModelNote(view) {
+  const request = view.request;
+  if (!request || request.model || !Object.hasOwn(request, "providerModel")) {
+    return [];
+  }
+  const label = providerLabelOf(view);
+  return [request.providerModel ? `Model: ${request.providerModel} (from the ${label} settings)` : `Model: chosen by ${label}`];
+}
+
+/**
+ * The stored result of one job: its output, then notes on truncation, a dropped structured result,
+ * a waiting question, an unobserved provider exit and its successor. `successor` is the view of
+ * the job that continued this one, or null. A job with no end decision gets one line saying so.
+ */
+export function renderStoreResult(view, { successor = null, logFile = null } = {}) {
+  const row = view.row;
+  const label = providerLabelOf(view);
+  if (["queued", "running", "stopping"].includes(view.state)) {
+    return `Job ${view.id} (${label}) is ${view.state} and has no result yet. Wait for it with /agent:result ${view.id} --wait.\n`;
+  }
+  let body;
+  const review = storedReview(view);
+  if (review) {
+    body = review;
+  } else if (typeof row.result_text === "string" && row.result_text) {
+    body = row.result_json ? `${row.result_text.replace(/\n*$/, "")}\n\n${renderStructuredOutput(JSON.parse(row.result_json))}` : row.result_text;
+    // A failed job keeps its prose; the failure follows it.
+    if (view.state === "failed" && row.error) {
+      body = `${body.replace(/\n*$/, "")}\n\n${row.error}`;
     }
-    lines.push("");
-  } else if (report.running.length === 0 && !report.latestFinished) {
-    lines.push("No jobs recorded yet.", "");
-  }
-
-  if (report.needsReview) {
-    lines.push("The stop-time review gate is enabled.");
-    lines.push(`Ending the session will trigger a fresh ${getProvider(DEFAULT_PROVIDER_ID).label} adversarial review and block if it finds issues.`);
-  }
-
-  return `${lines.join("\n").trimEnd()}\n`;
-}
-
-export function renderJobStatusReport(job) {
-  const lines = ["# Job Status", ""];
-  pushJobDetails(lines, job, {
-    showElapsed: job.status === "queued" || job.status === "running",
-    showDuration: job.status !== "queued" && job.status !== "running",
-    showLog: true,
-    showCancelHint: true,
-    showResultHint: true,
-    showReviewHint: true
-  });
-  return `${lines.join("\n").trimEnd()}\n`;
-}
-
-export function renderStoredJobResult(job, storedJob) {
-  return `${renderStoredJobBody(job, storedJob)}${renderWorktreeNote({
-    worktreePath: storedJob?.worktreePath ?? job.worktreePath,
-    worktreeBranch: storedJob?.worktreeBranch ?? job.worktreeBranch
-  })}`;
-}
-
-/** Returns stored output ending in a newline, followed by the session lines when there are any. */
-export function renderStoredOutputBlock(text, sessionLines = []) {
-  const output = text.endsWith("\n") ? text : `${text}\n`;
-  return sessionLines.length === 0 ? output : `${output}\n${sessionLines.join("\n")}\n`;
-}
-
-// Stored output followed by the job's note lines (`result.notes`, such as the model the job ran on
-// or a model warning) that the output does not already contain.
-function withStoredNotes(text, storedJob) {
-  const notes = Array.isArray(storedJob?.result?.notes) ? storedJob.result.notes : [];
-  const missing = notes.filter((line) => typeof line === "string" && line.trim() && !text.includes(line));
-  if (missing.length === 0) {
-    return text;
-  }
-  return `${text.endsWith("\n") ? text : `${text}\n`}${missing.join("\n")}\n`;
-}
-
-function renderStoredJobBody(job, storedJob) {
-  const provider = providerForJob(job);
-  const threadId = storedJob?.threadId ?? job.threadId ?? null;
-  const ephemeralThread = job.ephemeralThread === true || storedJob?.ephemeralThread === true;
-  const resumeLine = formatResumeLine({ ...job, threadId, ephemeralThread });
-  const sessionLines = threadId
-    ? [`${provider.label} session ID: ${threadId}`, ...(resumeLine ? [resumeLine] : [])]
-    : [];
-  if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
-    return renderStoredOutputBlock(withStoredNotes(storedJob.rendered, storedJob), sessionLines);
-  }
-
-  const rawOutput =
-    (typeof storedJob?.result?.rawOutput === "string" && storedJob.result.rawOutput) ||
-    provider.storedOutputText(storedJob) ||
-    "";
-  if (rawOutput) {
-    return renderStoredOutputBlock(withStoredNotes(rawOutput, storedJob), sessionLines);
-  }
-
-  if (storedJob?.rendered) {
-    return renderStoredOutputBlock(withStoredNotes(storedJob.rendered, storedJob), sessionLines);
-  }
-
-  const lines = [
-    `# ${job.title ?? "Job Result"}`,
-    "",
-    `Job: ${job.id}`,
-    `Status: ${job.status}`,
-    ...sessionLines
-  ];
-
-  if (job.summary) {
-    lines.push(`Summary: ${job.summary}`);
-  }
-
-  if (job.errorMessage) {
-    lines.push("", job.errorMessage);
-  } else if (storedJob?.errorMessage) {
-    lines.push("", storedJob.errorMessage);
+  } else if (row.result_json) {
+    body = renderStructuredOutput(JSON.parse(row.result_json));
   } else {
-    lines.push("", "No captured result payload was stored for this job.");
+    body = [`# ${row.title || "Job Result"}`, "", `Job: ${view.id}`, `State: ${view.state}`, "", row.error || "No output was stored for this job."].join("\n");
   }
-
-  return `${lines.join("\n").trimEnd()}\n`;
+  const notes = [...storedModelNote(view), ...resultNotes(view, logFile)];
+  if (view.state === "waiting" && row.question) {
+    notes.push(`${label} is waiting for an answer: ${row.question}`, `Reply with /agent:send ${view.id} <answer>.`);
+  }
+  if (view.providerExitUnobserved) {
+    notes.push("The provider's exit was not observed; it may still run, so continuing its thread needs --force.");
+  }
+  if (row.thread_id) {
+    notes.push(`${label} session ID: ${row.thread_id}`, ...storedResumeLine(view));
+  }
+  const successorId = successor?.id ?? view.successorId;
+  if (successorId) {
+    const state = successor ? ` (${successor.state})` : "";
+    notes.push(`This job was continued by ${successorId}${state}; /agent:result ${successorId} shows the newer output.`);
+  }
+  const worktree = view.request?.worktree;
+  const output = body.endsWith("\n") ? body : `${body}\n`;
+  const noteText = notes.length > 0 ? `\n${notes.join("\n")}\n` : "";
+  const worktreeMeta = worktree?.path ? { worktreePath: worktree.path, worktreeBranch: worktree.branch, providerLabel: label } : null;
+  return `${output}${noteText}${renderWorktreeNote(worktreeMeta)}`;
 }
 
-export function renderCancelReport(job) {
-  const lines = [
-    "# Cancel",
-    "",
-    `Cancelled ${job.id}.`,
-    ""
-  ];
-
-  if (job.title) {
-    lines.push(`- Title: ${job.title}`);
+/**
+ * The structured output of a task as indented JSON under a "Structured output:" line, or the
+ * structured-result-too-large note when the result was too large to store; empty when there is
+ * neither.
+ */
+export function renderStructuredOutput(value, { tooLarge = false } = {}) {
+  if (tooLarge) {
+    return "structured-result-too-large: the structured result was larger than 1 MiB and was not stored.\n";
   }
-  if (job.summary) {
-    lines.push(`- Summary: ${job.summary}`);
+  if (value === null || value === undefined) {
+    return "";
   }
-  lines.push("- Check `/agent:status` for the updated queue.");
-
-  return `${lines.join("\n").trimEnd()}\n`;
+  return `Structured output:\n${JSON.stringify(value, null, 2)}\n`;
 }

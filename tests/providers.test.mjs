@@ -18,6 +18,7 @@ const CAPABILITIES = [
   "authCheck",
   "effort",
   "fork",
+  "history",
   "interrupt",
   "modelFlag",
   "nativeReview",
@@ -29,10 +30,7 @@ const CAPABILITIES = [
 const HOOKS = [
   "resumeCommand",
   "interruptTurn",
-  "interruptOrphanedTurn",
-  "sessionRuntimeStatus",
-  "storedOutputText",
-  "startFollowUpTurn"
+  "sessionRuntimeStatus"
 ];
 
 // Every file under the shared folders, as paths relative to the scripts folder with "/" separators.

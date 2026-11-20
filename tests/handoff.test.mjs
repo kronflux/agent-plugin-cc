@@ -6,8 +6,9 @@ import { fileURLToPath } from "node:url";
 
 import { installFakeAgy } from "./fake-agy-fixture.mjs";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { listJobs } from "../plugins/agent/scripts/lib/state.mjs";
+import { resolveStateDir } from "../plugins/agent/scripts/lib/state.mjs";
 import { initGitRepo, makeTempDir, run, waitUntil } from "./helpers.mjs";
+import { rawAll, rawExec } from "./store-fixtures.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "agent", "scripts", "codex-companion.mjs");
@@ -60,20 +61,31 @@ test("task --from-last-review without a finished review fails before Codex start
   assert.equal(state.lastTurnStart, undefined);
 });
 
-// The jobs of one class in a workspace, newest first.
-function jobsOfClass(repo, jobClass) {
-  return listJobs(repo)
-    .filter((job) => job.jobClass === jobClass)
-    .sort((left, right) => String(right.createdAt ?? "").localeCompare(String(left.createdAt ?? "")));
+// The jobs of a workspace's job store, newest first; `where` narrows them.
+function storeJobs(repo, where = "1 = 1") {
+  const stateDir = resolveStateDir(repo);
+  if (!fs.existsSync(path.join(stateDir, "store", "state.db"))) {
+    return [];
+  }
+  return rawAll(stateDir, `SELECT * FROM jobs WHERE ${where} ORDER BY created_at DESC, id DESC`);
 }
 
-// Starts a background hand-off and waits until its job has ended; returns the launch payload.
+// The review jobs of a workspace's job store, of both providers, newest first.
+function storeReviews(repo) {
+  return storeJobs(repo, "kind = 'review'");
+}
+
+// Starts a background hand-off and waits until its job has ended and its worker released it;
+// returns the launch payload.
 async function backgroundHandoff(repo, env, extra = []) {
-  const launched = run("node", [SCRIPT, "task", "--background", "--json", "--from-last-review", ...extra], { cwd: repo, env });
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "--from-last-review", ...extra], { cwd: repo, env, timeout: 30000 });
   assert.equal(launched.status, 0, launched.stderr);
   const payload = JSON.parse(launched.stdout);
   const ended = await waitUntil(
-    () => ["completed", "failed", "cancelled"].includes(listJobs(repo).find((job) => job.id === payload.jobId)?.status),
+    () => {
+      const row = storeJobs(repo).find((job) => job.id === payload.jobId);
+      return row?.end_state != null && row.exec_released_at !== null;
+    },
     { timeoutMs: 30000, describe: `job ${payload.jobId} ending` }
   );
   assert.ok(ended, `job ${payload.jobId} did not end`);
@@ -85,9 +97,9 @@ test("the hand-off names the provider and job id of the review it continues", as
   installFakeAgy(binDir);
   const agyReview = run("node", [AGY, "review", "--target", "project"], { cwd: repo, env });
   assert.equal(agyReview.status, 0, agyReview.stderr);
-  const [antigravity] = jobsOfClass(repo, "review");
-  const handoff = await backgroundHandoff(repo, env);
-  assert.equal(handoff.summary, `Address the findings of the Antigravity review ${antigravity.id}`);
+  const [antigravity] = storeReviews(repo);
+  assert.equal(antigravity?.provider, "agy", JSON.stringify(antigravity));
+  await backgroundHandoff(repo, env);
   assert.ok(
     lastPrompt(binDir).includes(`Address the findings of the Antigravity review ${antigravity.id} below.`),
     lastPrompt(binDir)
@@ -96,8 +108,27 @@ test("the hand-off names the provider and job id of the review it continues", as
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
   const codexReview = run("node", [SCRIPT, "review"], { cwd: repo, env });
   assert.equal(codexReview.status, 0, codexReview.stderr);
-  const [codex] = jobsOfClass(repo, "review");
-  const second = await backgroundHandoff(repo, env, ["skip", "style"]);
-  assert.equal(second.summary, `Address the findings of the Codex review ${codex.id}: skip style`);
+  const [codex] = storeReviews(repo);
+  assert.equal(codex?.provider, "codex", JSON.stringify(codex));
+  await backgroundHandoff(repo, env, ["skip", "style"]);
   assert.ok(lastPrompt(binDir).includes(`Address the findings of the Codex review ${codex.id} below.`), lastPrompt(binDir));
+  assert.match(lastPrompt(binDir), /Instructions from the user:\nskip style/);
+});
+
+test("task --from-last-review uses a review that has structured output and no prose", () => {
+  const { repo, binDir, env } = makeRepo();
+  installFakeAgy(binDir);
+  const agyReview = run("node", [AGY, "review", "--target", "project"], { cwd: repo, env, timeout: 60000 });
+  assert.equal(agyReview.status, 0, agyReview.stderr);
+  const [review] = storeReviews(repo);
+  assert.ok(review?.result_json, JSON.stringify(review));
+  // The review answered with its structured result only.
+  rawExec(resolveStateDir(repo), "UPDATE jobs SET result_text = '' WHERE id = ?", [review.id]);
+
+  const result = run("node", [SCRIPT, "task", "--from-last-review", "fix", "it"], { cwd: repo, env, timeout: 60000 });
+
+  assert.equal(result.status, 0, result.stderr);
+  const prompt = lastPrompt(binDir);
+  assert.ok(prompt.includes(`Address the findings of the Antigravity review ${review.id} below.`), prompt);
+  assert.ok(prompt.includes("One project-wide concern surfaced by the fake agy."), prompt);
 });

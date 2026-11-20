@@ -200,9 +200,13 @@ export const WORKER_CONTRACTS = JSON.stringify(
   ["stdin-end", "tree-stop", "owner-death"].map((trigger) => ({ provider: "codex", platform: process.platform, trigger, version: "0.0.1", windowMs: 0 }))
 );
 
-/** The environment of a test-driver worker: the contracts above and this script as worker entry. */
+/**
+ * The environment of a test-driver worker: the contracts above and this script as worker entry.
+ * Without `contracts` the worker gets an empty list; an unset variable would give it the
+ * contracts the provider itself declares.
+ */
 export function workerEnv(extra = {}, { contracts = true } = {}) {
-  return { ...(contracts ? { AGENT_PLUGIN_TEST_CONTRACTS: WORKER_CONTRACTS } : {}), AGENT_PLUGIN_TEST_WORKER_ENTRY: SELF, ...extra };
+  return { AGENT_PLUGIN_TEST_CONTRACTS: contracts ? WORKER_CONTRACTS : "[]", AGENT_PLUGIN_TEST_WORKER_ENTRY: SELF, ...extra };
 }
 
 /** Creates a job whose worker uses the test driver with `testDriver` as its behaviour. */

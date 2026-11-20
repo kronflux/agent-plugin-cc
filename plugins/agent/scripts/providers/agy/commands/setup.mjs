@@ -3,7 +3,7 @@ import { delegationLines, describeDelegation, storeDelegationSetting } from "../
 import { binaryAvailable } from "../../../lib/process.mjs";
 import { getConfig, setConfig } from "../../../lib/state.mjs";
 import { agyProvider } from "../index.mjs";
-import { getAgyAvailability, readAgyModels, readAgySavedModel } from "../runtime.mjs";
+import { getAgyAvailability, readAgyEfforts, readAgyModels, readAgySavedModel, resolveAgyDelegationModel } from "../runtime.mjs";
 
 const WRITE_SANDBOXES = ["workspace-write", "danger-full-access"];
 
@@ -55,6 +55,12 @@ export async function handleSetup(argv) {
     models: login.models,
     writeSandbox: getConfig(workspaceRoot).writeSandbox ?? "workspace-write",
     delegation,
+    contracts: agyProvider.contractSummary(agy.available ? installedVersion(agy.detail) : null),
+    version: agy.available ? installedVersion(agy.detail) : null,
+    modelCount: login.models.length,
+    // The model a delegation uses, by agy's display name (the saved default is one already).
+    delegationModel: resolveAgyDelegationModel(cwd, { setting: getConfig(workspaceRoot).models?.[agyProvider.id]?.model ?? null }),
+    efforts: agy.available ? readAgyEfforts(cwd) : [],
     actionsTaken,
     nextSteps
   };
@@ -73,6 +79,14 @@ export async function handleSetup(argv) {
       modelName: delegation.providerModel ? `${delegation.providerModel} from the Antigravity settings` : null
     })
   ];
+  const delegationSource = { explicit: "given on the command", setting: "from the plugin setting", "agy-settings": "from the Antigravity settings `model` key" }[report.delegationModel.source];
+  lines.push(
+    `- version: ${report.version ?? "unknown"}`,
+    `- models: ${report.modelCount}`,
+    `- delegation model by display name: ${report.delegationModel.displayName ? `${report.delegationModel.displayName}, ${delegationSource}` : "unknown"}`,
+    `- efforts: ${report.efforts.length > 0 ? report.efforts.join(", ") : "unknown"}`
+  );
+  lines.push("", "Cleanup:", ...report.contracts.map((line) => `- ${line}`));
   if (actionsTaken.length > 0) {
     lines.push("", "Actions taken:", ...actionsTaken.map((action) => `- ${action}`));
   }
@@ -80,6 +94,11 @@ export async function handleSetup(argv) {
     lines.push("", "Next steps:", ...nextSteps.map((step) => `- ${step}`));
   }
   outputCommandResult(report, `${lines.join("\n")}\n`, options.json);
+}
+
+// The version number in the text `agy --version` printed, or null.
+function installedVersion(detail) {
+  return /\d+\.\d+\.\d+\S*/.exec(String(detail ?? ""))?.[0] ?? null;
 }
 
 export const run = handleSetup;

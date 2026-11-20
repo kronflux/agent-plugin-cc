@@ -1,11 +1,9 @@
-import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
-import { binaryAvailable, readProcessIdentity, resolveCommand, runCommand, stopTree } from "../../lib/process.mjs";
+import { binaryAvailable, runCommand } from "../../lib/process.mjs";
 
 // Antigravity (agy) runs one process per turn in print mode with stream-json input and output:
 // the prompt is the one NDJSON line written to stdin, and agy answers with init, step_update and
@@ -13,13 +11,11 @@ import { binaryAvailable, readProcessIdentity, resolveCommand, runCommand, stopT
 // process with --conversation.
 
 const DEFAULT_TURN_TIMEOUT_MS = 30 * 60 * 1000;
-const EXIT_WAIT_MS = 5000;
 const DEFAULT_SILENCE_MS = 5 * 60 * 1000;
-const SILENCE_MESSAGE = "Antigravity stopped responding.";
 
 // AGENT_PLUGIN_AGY_SILENCE_MS replaces the five minutes without output after which a turn's agy
 // process is stopped.
-function readAgySilenceMs(env = process.env) {
+export function readAgySilenceMs(env = process.env) {
   const raw = String(env.AGENT_PLUGIN_AGY_SILENCE_MS ?? "").trim();
   return /^\d+$/.test(raw) && Number(raw) > 0 ? Math.min(Number(raw), 2 ** 31 - 1) : DEFAULT_SILENCE_MS;
 }
@@ -245,17 +241,6 @@ export const AGY_DELEGATE_LINE = "Do this work yourself. Do not start subagents,
 export const AGY_READ_ONLY_LINE =
   "This is a read-only task. Do not use any tool that creates, edits or deletes a file, anywhere, including plan files, and do not run commands.";
 
-/** The fixed lines for a turn: the delegate line, and the read-only line unless it may write. */
-export function agyPromptAdditions(sandboxMode = "read-only") {
-  const writes = sandboxMode === "workspace-write" || sandboxMode === "danger-full-access";
-  return writes ? [AGY_DELEGATE_LINE] : [AGY_DELEGATE_LINE, AGY_READ_ONLY_LINE];
-}
-
-/** `text` followed, after a blank line, by the fixed lines of `agyPromptAdditions`. */
-export function withAgyPromptLines(text, sandboxMode = "read-only") {
-  return `${String(text ?? "").replace(/\s+$/, "")}\n\n${agyPromptAdditions(sandboxMode).join("\n")}`;
-}
-
 /** The one stream-json stdin line that carries a turn's prompt. */
 export function encodeAgyPromptLine(text) {
   return `${JSON.stringify({ event: "user", message: { content: text } })}\n`;
@@ -273,18 +258,6 @@ export function writeAgyPrompt(child, text) {
   }
   promptedChildren.add(child);
   child.stdin.write(encodeAgyPromptLine(text));
-}
-
-function emit(onProgress, message, extra = {}) {
-  if (!onProgress || !message) {
-    return;
-  }
-  onProgress(Object.keys(extra).length > 0 ? { message, ...extra } : message);
-}
-
-function shorten(text, limit = 96) {
-  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
-  return normalized.length <= limit ? normalized : `${normalized.slice(0, limit - 3)}...`;
 }
 
 function isSuccess(result) {
@@ -379,14 +352,27 @@ function deniedMessage({ action, displayName, path: deniedPath }) {
  * denied_actions, else refused tool steps), when the result status is not SUCCESS, when the
  * result has an empty response and no structured output, and when the process ended without a
  * result. The answer text is the turn's last agent message, else the result's response.
+ * `processTurns` counts the turns this process ran: each run of user_input steps that the stream
+ * moves past with another step, so a repeated init or a replayed user_input of an earlier turn
+ * adds none. `turns` is the conversation's turn count the result reports. `toolEvents` lists each
+ * tool call the stream shows as done, with its name and path (null when it carries none).
  */
 export function classifyAgyOutcome(events, exit = {}) {
   let conversationId = exit.conversationId ?? null;
   let pending = "";
   let lastMessage = "";
   let result = null;
+  let processTurns = 0;
+  let inUserInput = false;
   const toolDenials = [];
+  const toolEvents = [];
   for (const event of events) {
+    if (event.type === "user-input") {
+      inUserInput = true;
+    } else if (event.type !== "init" && inUserInput) {
+      inUserInput = false;
+      processTurns += 1;
+    }
     if (event.type === "init" && event.conversationId) {
       conversationId = event.conversationId;
     } else if (event.type === "text" && !result) {
@@ -397,6 +383,8 @@ export function classifyAgyOutcome(events, exit = {}) {
       }
     } else if (event.type === "denied") {
       toolDenials.push(event);
+    } else if (event.type === "tool" && event.state === "DONE") {
+      toolEvents.push({ name: event.name, path: event.path });
     } else if (event.type === "result" && !result) {
       result = event;
       conversationId = event.conversationId ?? conversationId;
@@ -405,7 +393,7 @@ export function classifyAgyOutcome(events, exit = {}) {
   const text = lastMessage || (result ? result.response.trim() : "");
   const json = result?.structuredOutput ?? null;
   const deniedActions = result?.deniedActions?.length ? result.deniedActions : toolDenials.map(({ action, displayName, path: deniedPath }) => ({ action, displayName, path: deniedPath }));
-  const outcome = { status: "failed", text, json, error: null, conversationId, turns: result?.turns ?? null, deniedActions };
+  const outcome = { status: "failed", text, json, error: null, conversationId, turns: result?.turns ?? null, processTurns, deniedActions, toolEvents };
   if (exit.error) {
     return { ...outcome, error: String(exit.error) };
   }
@@ -449,219 +437,45 @@ export function createAgyEventAdapter() {
   };
 }
 
-// How long a verified stop of a turn's agy tree may take, identity query included.
-const STOP_DEADLINE_MS = 10000;
-const SIGNALS_TO_FORWARD = ["SIGTERM", "SIGINT", "SIGHUP"];
-// How long after a stop's deadline a caught signal waits before it is raised again regardless.
-const SIGNAL_DEADLINE_MARGIN_MS = 1000;
+/**
+ * The model a delegation from `cwd` uses, by agy's display name: a `model` given on the command,
+ * else the plugin's model setting, each looked up in `agy models` (id to label; the id stands in
+ * when the list cannot be read or lacks it); else the model saved in the Antigravity settings,
+ * which is already a display name; else unknown.
+ */
+export function resolveAgyDelegationModel(cwd, { model = null, setting = null, home = undefined } = {}) {
+  const chosen = model ? { id: String(model), source: "explicit" } : setting ? { id: String(setting), source: "setting" } : null;
+  if (chosen) {
+    const listed = readAgyModels(cwd);
+    const label = listed.ok ? listed.models.find((entry) => entry.id === chosen.id)?.label ?? null : null;
+    return { id: chosen.id, displayName: label ?? chosen.id, source: chosen.source };
+  }
+  const saved = readAgySavedModel(home === undefined ? {} : { settingsPath: path.join(home, ".gemini", "antigravity-cli", "settings.json") });
+  return saved ? { id: null, displayName: saved, source: "agy-settings" } : { id: null, displayName: null, source: "unknown" };
+}
+
+const NO_STRUCTURED_OUTPUT_MESSAGE = "Antigravity returned no structured output.";
 
 /**
- * Runs one agy turn in one agy process: the prompt, ended by the fixed lines of
- * `withAgyPromptLines`, is written to stdin once, stdin is ended after the result event, and the
- * run resolves when the process has exited and its output is read. The process takes no further
- * input. `outcome` is the `classifyAgyOutcome` result; `status` is 0 for an answer and 1 for a
- * failure.
- *
- * On POSIX the agy child leads a process group of its own, whose id is its pid. Its identity is
- * read right after the spawn (`readIdentity`, default `readProcessIdentity`), and every stop (the
- * turn timeout, the silence bound, an agy that does not exit after its result) goes through
- * `stopProcess` (default `stopTree`) with that identity and, on POSIX, that group. A stop of a
- * process whose identity no longer matches stops nothing. `stop` in the result is
- * `{ result, identity, expectedGroupId }` when a stop was attempted, else null.
+ * Decides a finished turn from its adapter outcome, in a fixed order: (1) the failures of
+ * classifyAgyOutcome keep their messages (a denial first); (2) with a schema, a turn without a
+ * structured object fails, whatever its status and prose say, and a structured object is the
+ * answer even without prose; (3) with the read-only guard on, a changed file or a write tool in the
+ * stream fails the turn; (4) otherwise the turn completed.
  */
-export function runAgyTurn(cwd, options = {}) {
-  const env = options.env ?? process.env;
-  const readIdentity = options.readIdentity ?? readProcessIdentity;
-  const stopProcess = options.stopProcess ?? stopTree;
-  const timeoutMs = options.timeoutMs ?? readAgyTurnTimeoutMs(env);
-  const args = buildAgyArgs({ ...options, timeoutMs });
-  const plan = resolveCommand("agy", args, env);
-  const ownGroup = process.platform !== "win32";
-  const child = spawn(plan.file, plan.args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], ...plan.options, windowsHide: true, detached: ownGroup });
-  const onProgress = options.onProgress ?? null;
-  const adapter = createAgyEventAdapter();
-
-  // The child's identity with the group it leads on POSIX, or null when the query found none.
-  const readChildIdentity = (deadline) =>
-    Promise.resolve()
-      .then(() => readIdentity(child.pid, { deadline }))
-      .then(
-        (observed) => (observed?.state === "present" ? { pid: child.pid, startToken: observed.startToken, groupId: observed.groupId ?? null } : null),
-        () => null
-      );
-  // Read once right after the spawn.
-  const identityRead = Number.isInteger(child.pid) ? readChildIdentity(performance.now() + STOP_DEADLINE_MS) : Promise.resolve(null);
-
-  const state = {
-    conversationId: options.conversationId ?? null,
-    sawResult: false,
-    agentText: "",
-    stderr: "",
-    error: null,
-    exit: { code: null, signal: null },
-    stopping: null,
-    stop: null,
-    stopDeadline: null
-  };
-
-  return new Promise((resolve) => {
-    let settled = false;
-    let exitTimer = null;
-
-    const finish = () => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timer);
-      clearTimeout(exitTimer);
-      silence.stop();
-      removeSignalHandlers();
-      const stderr = state.stderr.trim();
-      const outcome = adapter.outcome({ ...state.exit, error: state.error, stderr, conversationId: options.conversationId ?? null });
-      resolve({
-        status: outcome.status === "answer" ? 0 : 1,
-        outcome,
-        conversationId: outcome.conversationId,
-        turnId: "turn-1",
-        finalMessage: outcome.text,
-        structuredOutput: outcome.json,
-        error: outcome.error ? { message: outcome.error } : null,
-        stderr,
-        stop: state.stop
-      });
-    };
-
-    // Stops the child's tree by its verified identity, then ends the run. A failed or refused
-    // stop ends the run as well; the turn reports its own outcome.
-    // When the identity read after the spawn found none, the identity is read once more; without
-    // one nothing is stopped, the stop is "not-attempted" and the turn's message says the process
-    // may still be running.
-    const stopVerified = async (deadline) => {
-      let identity = await identityRead;
-      if (!identity && Number.isInteger(child.pid)) {
-        identity = await readChildIdentity(deadline);
-      }
-      if (!identity) {
-        state.stop = { result: "not-attempted", identity: null, expectedGroupId: null };
-        if (state.error) {
-          state.error = `${state.error} The agy process ${child.pid} could not be identified, so it was not stopped and may still be running.`;
-        }
-        return;
-      }
-      const expectedGroupId = ownGroup && identity.groupId === child.pid ? child.pid : null;
-      let result = "unknown";
-      try {
-        result = await stopProcess(identity, { deadline, expectedGroupId });
-      } catch {
-        result = "unknown";
-      }
-      state.stop = { result, identity, expectedGroupId };
-    };
-
-    const stop = (message) => {
-      if (message) {
-        state.error ??= message;
-      }
-      if (!state.stopping) {
-        state.stopDeadline = performance.now() + STOP_DEADLINE_MS;
-        state.stopping = stopVerified(state.stopDeadline).finally(finish);
-      }
-    };
-
-    const timer = setTimeout(() => stop(`agy did not finish within ${Math.round(timeoutMs / 1000)} s, so it was stopped.`), timeoutMs);
-    timer.unref?.();
-    const silence = startSilenceWatch(child, readAgySilenceMs(env), () => stop(SILENCE_MESSAGE));
-
-    // On POSIX the agy group does not receive a signal sent to this process's group (a cancel,
-    // Ctrl+C, a closed terminal). While the turn runs, such a signal first stops the agy tree by
-    // its verified identity, started now or already pending. The handlers stay installed and
-    // absorb further signals until that stop resolves or its deadline passes; then the first
-    // signal is raised once more, so this process ends as it would without the handlers. When
-    // another handler exists for that signal, that handler decides.
-    const signalHandlers = new Map();
-    let raisedSignal = null;
-    const removeSignalHandlers = () => {
-      for (const [signal, handler] of signalHandlers) {
-        process.off(signal, handler);
-      }
-      signalHandlers.clear();
-    };
-    if (ownGroup) {
-      for (const signal of SIGNALS_TO_FORWARD) {
-        const handler = () => {
-          if (raisedSignal) {
-            return;
-          }
-          raisedSignal = signal;
-          stop(`agy was stopped because this process received ${signal}.`);
-          const remaining = Math.max(0, state.stopDeadline - performance.now()) + SIGNAL_DEADLINE_MARGIN_MS;
-          let deadlineTimer = null;
-          const deadlinePassed = new Promise((resolve) => {
-            deadlineTimer = setTimeout(resolve, remaining);
-          });
-          Promise.race([state.stopping, deadlinePassed]).then(() => {
-            clearTimeout(deadlineTimer);
-            removeSignalHandlers();
-            if (process.listenerCount(signal) === 0) {
-              process.kill(process.pid, signal);
-            }
-          });
-        };
-        signalHandlers.set(signal, handler);
-        process.on(signal, handler);
-      }
+export function classifyAgyTurn(turn, { schemaGiven = false, guard = "off", changedPaths = [], writeToolNames = [] } = {}) {
+  if (turn.status !== "answer") {
+    return { outcome: "failed", error: turn.error ?? NO_ANSWER_MESSAGE };
+  }
+  if (schemaGiven && !(turn.json && typeof turn.json === "object" && !Array.isArray(turn.json))) {
+    return { outcome: "failed", error: NO_STRUCTURED_OUTPUT_MESSAGE };
+  }
+  if (guard === "on") {
+    const written = (turn.toolEvents ?? []).filter((event) => writeToolNames.includes(event.name)).map((event) => event.path ?? event.name);
+    const edited = changedPaths.length > 0 ? changedPaths : written;
+    if (edited.length > 0) {
+      return { outcome: "failed", error: `Antigravity edited files during a read-only task: ${[...new Set(edited)].join(", ")}` };
     }
-
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => {
-      state.stderr += chunk;
-    });
-    child.on("error", (error) => stop(`agy could not be started: ${error.message}`));
-    // A write to an agy that has closed its input fails the turn instead of the worker.
-    child.stdin.on("error", (error) => {
-      state.error ??= `agy closed its input: ${error.message}`;
-    });
-    // "close" comes after stdout has ended, so every line agy wrote has been read by then. While
-    // a stop runs, the stop ends the run.
-    child.on("close", (code, signal) => {
-      state.exit = { code, signal };
-      if (!state.stopping) {
-        finish();
-      }
-    });
-
-    const lines = readline.createInterface({ input: child.stdout });
-    lines.on("line", (line) => {
-      const events = adapter.push(line);
-      if (events.length > 0) {
-        silence.touch();
-      }
-      for (const event of events) {
-        if (event.type === "init") {
-          state.conversationId = event.conversationId ?? state.conversationId;
-          emit(onProgress, `Thread ready (${state.conversationId}).`, { phase: "starting", threadId: state.conversationId });
-          emit(onProgress, "Turn started (turn-1).", { phase: "starting", threadId: state.conversationId, turnId: "turn-1" });
-        } else if (event.type === "text" && !state.sawResult) {
-          state.agentText += event.delta;
-          if (event.done && state.agentText.trim()) {
-            emit(onProgress, { message: `Assistant message captured: ${shorten(state.agentText)}`, logTitle: "Assistant message", logBody: state.agentText.trim() });
-            state.agentText = "";
-          }
-        } else if (event.type === "denied") {
-          emit(onProgress, `agy was denied permission for ${event.action}${event.path ? ` on ${event.path}` : ""}.`);
-        } else if (event.type === "result" && !state.sawResult) {
-          state.sawResult = true;
-          emit(onProgress, `Turn ${isSuccess(event) ? "completed" : String(event.status || "ended").toLowerCase()}.`, { phase: "finalizing" });
-          child.stdin.end();
-          // An agy that has not exited on its own by then is stopped.
-          exitTimer = setTimeout(() => stop(null), EXIT_WAIT_MS);
-          exitTimer.unref?.();
-        }
-      }
-    });
-
-    emit(onProgress, "Starting agy task thread.", { phase: "starting" });
-    writeAgyPrompt(child, withAgyPromptLines(options.prompt, options.sandboxMode ?? "read-only"));
-  });
+  }
+  return { outcome: "completed", error: null };
 }

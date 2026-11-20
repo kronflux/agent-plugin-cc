@@ -70,7 +70,8 @@ export const FAKE_DEBUG_SOL_MODELS = [
 // With `{ recordIdentities: true }` every app server and `codex debug models` process also adds
 // `{ pid, startToken, key }` to processIdentities once readProcessIdentity has read its own
 // identity, so a test can stop it with stopOwnedProcesses; `key` names the pid list it is in.
-export function installFakeCodex(binDir, behavior = "review-ok", { recordIdentities = false } = {}) {
+// `version` makes the app server report that Codex version in its user agent.
+export function installFakeCodex(binDir, behavior = "review-ok", { recordIdentities = false, version = null } = {}) {
   const statePath = path.join(binDir, "fake-codex-state.json");
   const scriptPath = path.join(binDir, "codex");
   const source = `#!/usr/bin/env node
@@ -83,6 +84,7 @@ const readline = require("node:readline");
 	const STATE_PATH = ${JSON.stringify(statePath)};
 	const BEHAVIOR = ${JSON.stringify(behavior)};
 	const RECORD_IDENTITIES = ${JSON.stringify(recordIdentities)};
+	const USER_AGENT = ${JSON.stringify(version ? `fake-codex-app-server/${version}` : "fake-codex-app-server")};
 	const PROCESS_LIB = ${JSON.stringify(PROCESS_LIB)};
 	const LIST_MODELS = ${JSON.stringify(FAKE_LIST_MODELS)};
 	const DEBUG_DEFAULT_MODELS = ${JSON.stringify(FAKE_DEBUG_DEFAULT_MODELS)};
@@ -540,7 +542,7 @@ function taskPayload(prompt, resume) {
 
 const args = process.argv.slice(2);
 if (args[0] === "--version") {
-  console.log("codex-cli test");
+  console.log("codex-cli 0.169.0");
   process.exit(0);
 }
 if (args[0] === "app-server" && args[1] === "--help") {
@@ -615,8 +617,47 @@ if (initializeHangs) {
   process.on("SIGTERM", () => {});
   setInterval(() => {}, 60000);
 }
+// initialize-hangs: no app server answers initialize, and each runs until it is stopped.
+if (BEHAVIOR === "initialize-hangs") {
+  setInterval(() => {}, 60000);
+}
+
+// ignore-eof and interrupt-ignored-eof: the app server keeps running after its input ends, until
+// it is stopped. interrupt-ignored-eof also starts a sleeping child and records its identity.
+if (BEHAVIOR === "ignore-eof" || BEHAVIOR === "interrupt-ignored-eof") {
+  setInterval(() => {}, 60000);
+}
+if (BEHAVIOR === "interrupt-ignored-eof") {
+  const sleeper = require("node:child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 60000)"], { stdio: "ignore", windowsHide: true });
+  withStateLock(() => {
+    const childState = loadState();
+    childState.childPids = [...(childState.childPids || []), sleeper.pid];
+    saveState(childState);
+  });
+  import(PROCESS_LIB)
+    .then((lib) => lib.readProcessIdentity(sleeper.pid, { deadline: performance.now() + 30000 }))
+    .then((identity) => {
+      if (identity.state !== "present") {
+        return;
+      }
+      withStateLock(() => {
+        const identityState = loadState();
+        identityState.processIdentities = [...(identityState.processIdentities || []), { pid: sleeper.pid, startToken: identity.startToken, key: "childPids" }];
+        saveState(identityState);
+      });
+    })
+    .catch(() => {});
+}
 
 const rl = readline.createInterface({ input: process.stdin });
+// The time the app server's input ended, for tests of how it is ended and stopped.
+rl.on("close", () => {
+  withStateLock(() => {
+    const closeState = loadState();
+    closeState.stdinEndedAt = Date.now();
+    saveState(closeState);
+  });
+});
 rl.on("line", (line) => {
   if (!line.trim()) {
     return;
@@ -641,7 +682,7 @@ function handleMessage(message) {
   const state = loadState();
     switch (message.method) {
       case "initialize":
-        if (initializeHangs) {
+        if (initializeHangs || BEHAVIOR === "initialize-hangs") {
           break;
         }
         if (BEHAVIOR === "initialize-fails") {
@@ -650,7 +691,7 @@ function handleMessage(message) {
         }
         state.capabilities = message.params.capabilities || null;
         saveState(state);
-        send({ id: message.id, result: { userAgent: "fake-codex-app-server" } });
+        send({ id: message.id, result: { userAgent: USER_AGENT } });
         break;
 
       case "initialized":
@@ -756,7 +797,11 @@ function handleMessage(message) {
         }
         thread.updatedAt = now();
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), ...reportedSelection(message.params), modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false } } });
+        // turn-in-progress and turn-in-progress-stuck resume a thread whose turn turn-prev still runs.
+        const resumedThread = BEHAVIOR.startsWith("turn-in-progress")
+          ? { ...buildThread(thread), turns: [{ id: "turn-prev", status: "inProgress", items: [], error: null }] }
+          : buildThread(thread);
+        send({ id: message.id, result: { thread: resumedThread, ...reportedSelection(message.params), modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false } } });
         break;
       }
 
@@ -988,8 +1033,13 @@ function handleMessage(message) {
 	          model: message.params.model ?? null,
 	          effort: message.params.effort ?? null,
 	          prompt,
-	          outputSchema: message.params.outputSchema ?? null
+	          outputSchema: message.params.outputSchema ?? null,
+	          clientUserMessageId: message.params.clientUserMessageId ?? null
 	        };
+	        state.turnStarts = [...(state.turnStarts || []), { pid: process.pid, prompt, clientUserMessageId: message.params.clientUserMessageId ?? null }];
+	        // The thread history keeps each turn's user messages under their client ids.
+	        state.history = state.history || {};
+	        state.history[thread.id] = [...(state.history[thread.id] || []), { id: turnId, clientIds: message.params.clientUserMessageId ? [message.params.clientUserMessageId] : [] }];
 	        saveState(state);
 	        if (BEHAVIOR === "close-stdin-on-turn") {
 	          // Leaves turn/start unanswered and stops reading, so the client's next write finds no reader.
@@ -1004,6 +1054,11 @@ function handleMessage(message) {
 	          break;
 	        }
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+	        if (message.params.clientUserMessageId) {
+	          // The request's user message carries its client id, as Codex reports it.
+	          const userItem = { type: "userMessage", id: "user_" + turnId, clientId: message.params.clientUserMessageId, content: message.params.input || [] };
+	          send({ method: "item/started", params: { threadId: thread.id, turnId, item: userItem } });
+	        }
 	        if (BEHAVIOR === "unknown-model" && message.params.model) {
 	          // As Codex 0.169.0 does: the thread exists, and its first turn fails on the model.
 	          const error = {
@@ -1024,9 +1079,18 @@ function handleMessage(message) {
 	        }
 
         const isGateReview = prompt.includes("Only review the work from the previous Claude turn.");
-        const payload = !isGateReview && message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
+        const basePayload = !isGateReview && message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
           : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
+        // Answers for the question and size tests of the job store's worker.
+        const ANSWERS = {
+          "question-line": "Some work is done." + String.fromCharCode(10) + "AGENT-QUESTION: Which file should change?",
+          "structured-question": JSON.stringify({ result: "half done", question: "Keep the old API?" }),
+          "structured-empty-question": JSON.stringify({ result: "all done", question: "" }),
+          "huge-answer": "x".repeat(1048576 + 4096),
+          "huge-json": JSON.stringify({ result: "y".repeat(1048576 + 4096) })
+        };
+        const payload = Object.prototype.hasOwnProperty.call(ANSWERS, BEHAVIOR) ? ANSWERS[BEHAVIOR] : basePayload;
 
         if (
           BEHAVIOR === "with-subagent" ||
@@ -1157,12 +1221,11 @@ function handleMessage(message) {
             ]
             : []),
           {
-            // A message without the final_answer phase leaves turn/completed as the only end.
             completed: {
               type: "agentMessage",
               id: "msg_" + turnId,
               text: payload,
-              phase: BEHAVIOR === "slow-task-no-final-phase" ? null : "final_answer"
+              phase: "final_answer"
             }
           }
         ];
@@ -1185,7 +1248,7 @@ function handleMessage(message) {
 	          });
 	          break;
 	        }
-	        if (BEHAVIOR === "interrupt-ignored") {
+	        if (BEHAVIOR === "interrupt-ignored" || BEHAVIOR === "interrupt-ignored-eof") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          break;
 	        }
@@ -1204,7 +1267,7 @@ function handleMessage(message) {
 	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
 	          }, 5000);
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
-	        } else if (BEHAVIOR === "slow-task" || BEHAVIOR === "slow-task-no-final-phase") {
+	        } else if (BEHAVIOR === "slow-task") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
@@ -1228,6 +1291,10 @@ function handleMessage(message) {
 	        }
 	        const text = (params.input || []).map((part) => part.text || "").join("");
 	        state.steers = [...(state.steers || []), { threadId: params.threadId, expectedTurnId: params.expectedTurnId, clientUserMessageId: params.clientUserMessageId, text }];
+	        const steeredTurn = ((state.history || {})[params.threadId] || []).find((entry) => entry.id === params.expectedTurnId);
+	        if (steeredTurn && params.clientUserMessageId) {
+	          steeredTurn.clientIds.push(params.clientUserMessageId);
+	        }
 	        saveState(state);
 	        send({ id: message.id, result: { turnId: params.expectedTurnId } });
 	        if (BEHAVIOR !== "steer-no-item") {
@@ -1242,13 +1309,37 @@ function handleMessage(message) {
 	        break;
 	      }
 
+	      case "thread/turns/list": {
+	        // history-pages returns one turn per page, so a client id can sit on a later page.
+	        const entries = ((state.history || {})[message.params.threadId] || []);
+	        const size = BEHAVIOR === "history-pages" ? 1 : Math.max(1, Number(message.params.limit) || 50);
+	        const start = Number(message.params.cursor || 0);
+	        const page = entries.slice(start, start + size).map((entry) => ({
+	          id: entry.id,
+	          status: "completed",
+	          items: entry.clientIds.map((clientId) => ({ type: "userMessage", id: "user_" + clientId, clientId, content: [] }))
+	        }));
+	        state.historyPagesServed = (state.historyPagesServed || 0) + 1;
+	        saveState(state);
+	        send({ id: message.id, result: { data: page, nextCursor: start + size < entries.length ? String(start + size) : null } });
+	        break;
+	      }
+
 	      case "turn/interrupt": {
 	        state.lastInterrupt = {
 	          threadId: message.params.threadId,
 	          turnId: message.params.turnId
 	        };
 	        saveState(state);
+	        // interrupt-unanswered: turn/interrupt is recorded and never answered.
+	        if (BEHAVIOR === "interrupt-unanswered") {
+	          break;
+	        }
 	        const pending = interruptibleTurns.get(message.params.turnId);
+	        if (message.params.turnId === "turn-prev" && BEHAVIOR === "turn-in-progress") {
+	          // The previous turn ends on its interrupt; under turn-in-progress-stuck it never ends.
+	          send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: buildTurn("turn-prev", "interrupted") } });
+	        }
 	        if (pending) {
 	          clearTimeout(pending.timer);
 	          interruptibleTurns.delete(message.params.turnId);

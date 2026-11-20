@@ -9,23 +9,13 @@ import * as reviewCommand from "./providers/codex/commands/review.mjs";
 import * as taskCommand from "./providers/codex/commands/task.mjs";
 import * as transferCommand from "./providers/codex/commands/transfer.mjs";
 import * as usageCommand from "./providers/codex/commands/usage.mjs";
-import { executeReviewRun } from "./providers/codex/commands/review.mjs";
-import { executeTaskRun } from "./providers/codex/commands/task.mjs";
-import { takeJobRequest, writeJobFile } from "./lib/state.mjs";
-import { readStoredJob } from "./lib/job-control.mjs";
-import { nowIso, runTrackedJob } from "./lib/tracked-jobs.mjs";
-import {
-  HelpRequested,
-  parseCommandInput,
-  resolveCommandCwd,
-  resolveCommandWorkspace,
-  createTrackedProgress
-} from "./lib/companion-cli.mjs";
+import { runJobExecution } from "./lib/tracked-jobs.mjs";
+import { checkRuntime, runtimeGateMessage } from "./lib/store.mjs";
+import { createCodexDriver } from "./providers/codex/runtime.mjs";
+import { HelpRequested, parseCommandInput } from "./lib/companion-cli.mjs";
 
 // Seams that tests import from this script.
 export { launchManifestTasks } from "./providers/codex/commands/task.mjs";
-export { startTurnWithProviderCompanion } from "./lib/task-launch.mjs";
-export { cancelJob } from "./commands/cancel.mjs";
 
 const COMPANION_SCRIPT = fileURLToPath(import.meta.url);
 
@@ -42,57 +32,14 @@ function printUsage(subcommand = null) {
   console.log(["Usage:", ...names.map((name) => `  node scripts/codex-companion.mjs ${SUBCOMMAND_USAGE[name]}`)].join("\n"));
 }
 
-async function handleTaskWorker(argv) {
-  const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "job-id"]
-  });
-
-  if (!options["job-id"]) {
-    throw new Error("Missing required --job-id for task-worker.");
+// Runs one job of the job store in this process: claims it, runs its Codex turn in an app server
+// of its own and releases it (see runJobExecution).
+async function handleWorker(argv) {
+  const { options } = parseCommandInput(argv, { valueOptions: ["state-dir", "job"] });
+  if (!options["state-dir"] || !options.job) {
+    throw new Error("Missing required --state-dir and --job for worker.");
   }
-
-  const cwd = resolveCommandCwd(options);
-  const workspaceRoot = resolveCommandWorkspace(options);
-  const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
-  if (!storedJob) {
-    throw new Error(`No stored job found for ${options["job-id"]}.`);
-  }
-
-  // A job cancelled or failed while queued is not run.
-  if (storedJob.status !== "queued") {
-    return;
-  }
-
-  const request = takeJobRequest(workspaceRoot, options["job-id"]);
-  if (!request || typeof request !== "object") {
-    const errorMessage = `Stored job ${options["job-id"]} is missing its task request payload.`;
-    writeJobFile(workspaceRoot, storedJob.id, { ...storedJob, status: "failed", phase: "failed", errorMessage, completedAt: nowIso() });
-    throw new Error(errorMessage);
-  }
-
-  const { logFile, progress } = createTrackedProgress(
-    {
-      ...storedJob,
-      workspaceRoot
-    },
-    {
-      logFile: storedJob.logFile ?? null
-    }
-  );
-  await runTrackedJob(
-    {
-      ...storedJob,
-      workspaceRoot,
-      logFile
-    },
-    () =>
-      // A queued review request runs as a review; every other request runs as a task.
-      (request.requestKind === "review" ? executeReviewRun : executeTaskRun)({
-        ...request,
-        onProgress: progress
-      }),
-    { logFile }
-  );
+  process.exitCode = await runJobExecution(options["state-dir"], options.job, createCodexDriver());
 }
 
 async function main() {
@@ -112,6 +59,13 @@ async function main() {
 }
 
 async function runSubcommand(subcommand, argv) {
+  // Every subcommand needs a Node.js and SQLite that the job store supports; nothing runs without.
+  const gate = checkRuntime();
+  if (!gate.ok) {
+    process.stderr.write(`${runtimeGateMessage(gate)}\n`);
+    process.exitCode = 1;
+    return;
+  }
   switch (subcommand) {
     case "setup":
       await setupCommand.run(argv);
@@ -128,8 +82,8 @@ async function runSubcommand(subcommand, argv) {
     case "usage":
       await usageCommand.run(argv);
       break;
-    case "task-worker":
-      await handleTaskWorker(argv);
+    case "worker":
+      await handleWorker(argv);
       break;
     case "task-resume-candidate":
       await taskCommand.runResumeCandidate(argv);

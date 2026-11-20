@@ -55,3 +55,15 @@ test("setup reports the app server user agent", () => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout).appServer, "fake-codex-app-server");
 });
+
+test("usage --json adds the normalised object beside the Codex response", () => {
+  const { repo, env } = makeRepo();
+  const result = run("node", [SCRIPT, "usage", "--json"], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.rateLimits.primary.usedPercent, 42);
+  assert.equal(payload.normalized.schema, 1);
+  assert.equal(payload.normalized.provider, "codex");
+  assert.ok(Math.abs(payload.normalized.groups[0].buckets[0].remainingFraction - 0.58) < 1e-9, JSON.stringify(payload.normalized));
+});

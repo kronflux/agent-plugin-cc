@@ -2,8 +2,7 @@
 // resolves and checks the values; this module only decides which choice applies, in this order:
 // the command line, the job a follow-up continues, the workspace setting, the provider default.
 
-import { DEFAULT_PROVIDER_ID } from "./providers.mjs";
-import { getConfig, listJobs, setConfig } from "./state.mjs";
+import { getConfig, setConfig } from "./state.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 // Sources whose catalog entry also names the effort used when none is given.
@@ -20,22 +19,6 @@ export function readModelSetting(provider, cwd) {
   } catch {
     return null;
   }
-}
-
-/**
- * The newest job record of `providerId` on `threadId`, which a follow-up turn on that thread
- * continues; null when none is recorded. A record without a provider belongs to the default
- * provider.
- */
-export function newestJobOnThread(workspaceRoot, providerId, threadId) {
-  if (!threadId) {
-    return null;
-  }
-  const jobs = listJobs(workspaceRoot).filter(
-    (job) => (job.provider ?? DEFAULT_PROVIDER_ID) === providerId && job.threadId === threadId
-  );
-  jobs.sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
-  return jobs[0] ?? null;
 }
 
 /**

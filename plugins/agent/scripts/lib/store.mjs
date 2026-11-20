@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import process from "node:process";
 
+import { PLUGIN_DATA_ENV } from "./host.mjs";
 import { listLiveFiles } from "./live.mjs";
 
 // The job store: one SQLite database per workspace under <stateDir>/store, opened through
@@ -803,6 +804,24 @@ function migrate(store, opts) {
 }
 
 /**
+ * Throws unless each of `dirs` is a real folder, not a symlink, owned by the calling user. The
+ * store holds prompts and results and names the processes a session end stops, so on POSIX it
+ * is never opened in a folder another user created (the state root can sit in the shared temp
+ * directory). Nothing is checked on Windows, where the temp directory is per user.
+ */
+export function assertPrivateStoreFolders(dirs, { platform = process.platform, lstat = fs.lstatSync, getuid = process.getuid } = {}) {
+  if (platform === "win32" || typeof getuid !== "function") {
+    return;
+  }
+  for (const dir of dirs) {
+    const stat = lstat(dir);
+    if (stat.isSymbolicLink() || !stat.isDirectory() || stat.uid !== getuid()) {
+      throw new Error(`The job store folder ${dir} is not a private folder owned by you; set ${PLUGIN_DATA_ENV} to a folder of your own.`);
+    }
+  }
+}
+
+/**
  * Opens the job store of a workspace state folder, creating `<stateDir>/store` when it is missing,
  * and migrates it to SCHEMA_VERSION when `migrate` is true. The busy timeout of the open is the
  * smaller of `busyTimeoutMs` and the time left before `deadline` (a `performance.now()` value).
@@ -815,6 +834,7 @@ export function openStore(stateDir, { busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS, d
   try {
     makeDir(stateDir, { recursive: true });
     makeDir(storeDir);
+    assertPrivateStoreFolders([path.dirname(stateDir), stateDir, storeDir]);
     makeDir(path.join(storeDir, "live"));
     makeDir(path.join(storeDir, "artifacts"));
     identity = storeFolderIdentity(stateDir);
@@ -867,6 +887,25 @@ export const RETRY_BUDGETS = Object.freeze({
 
 function isRetryable(error) {
   return error instanceof StoreError && error.class === "availability" && (error.code === "busy" || error.code === "locked");
+}
+
+/**
+ * Opens the store for a synchronous caller, trying again while the open reports busy or locked,
+ * within the total time of `budget` (a key of RETRY_BUDGETS). Several commands that start at
+ * once on a new store wait here for the one that creates its tables.
+ */
+export function openStoreRetrying(stateDir, budget = "command") {
+  const { attemptMs, totalMs } = RETRY_BUDGETS[budget];
+  const end = performance.now() + totalMs;
+  for (;;) {
+    try {
+      return openStore(stateDir, { busyTimeoutMs: attemptMs });
+    } catch (error) {
+      if (!isRetryable(error) || performance.now() >= end) {
+        throw error;
+      }
+    }
+  }
 }
 
 /**

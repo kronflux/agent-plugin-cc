@@ -8,15 +8,13 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeCommittedRepo, makeTempDir, run } from "./helpers.mjs";
 import { redactSecrets } from "../plugins/agent/scripts/lib/redact.mjs";
+import { openStore } from "../plugins/agent/scripts/lib/store.mjs";
 import {
-  listJobs,
-  readJobFile,
-  resolveJobFile,
-  resolveJobsDir,
+  createJob,
+  ensureStateDir,
+  recordEnd,
   resolveStateDir,
-  takeJobRequest,
-  upsertJob,
-  writeJobFile
+  setConfig
 } from "../plugins/agent/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -61,65 +59,63 @@ test("redaction leaves prose and commit ids alone", () => {
   }
 });
 
-test("a stored job summary and status show the redacted form", (t) => {
+test("a job's title, error and question are stored and shown in redacted form", (t) => {
   const repo = makeCommittedRepo(t);
-  const summary = CREDENTIAL_PROBES.map((probe) => probe.text).join(" ");
-  writeJobFile(repo, "task-probe", { id: "task-probe", kind: "task", jobClass: "task", status: "queued", summary });
+  const probes = CREDENTIAL_PROBES.map((probe) => probe.text).join(" ");
+  const stateDir = resolveStateDir(repo);
+  const store = openStore(stateDir);
+  const requester = { sessionId: "session-1", leaderPid: null, leaderStartToken: null };
+  const job = (title) => createJob(store, { provider: "codex", kind: "task", title, prompt: "do the work", request: { cwd: repo }, cwd: repo, requester }, {}).jobId;
+  const failed = job(`deploy ${probes}`);
+  const waiting = job("ask something");
+  recordEnd(store, failed, { state: "failed", by: "reconcile", error: `the deploy failed: ${probes}` });
+  recordEnd(store, waiting, { state: "waiting", by: "reconcile", question: `Which of these is right? ${probes}` });
+  const rows = store.read((db) => db.prepare("SELECT title, error, question FROM jobs").all());
+  const events = store.read((db) => db.prepare("SELECT text FROM events").all());
+  store.close();
 
-  const stored = fs.readFileSync(resolveJobFile(repo, "task-probe"), "utf8");
-  const status = run("node", [NEUTRAL, "status", "task-probe", "--json"], { cwd: repo, check: true }).stdout;
-  for (const output of [stored, status]) {
+  const outputs = [
+    JSON.stringify(rows),
+    JSON.stringify(events),
+    run("node", [NEUTRAL, "status", "--all", "--json"], { cwd: repo, check: true }).stdout,
+    run("node", [NEUTRAL, "status", "--all"], { cwd: repo, check: true }).stdout,
+    run("node", [NEUTRAL, "status", failed], { cwd: repo, check: true }).stdout,
+    run("node", [NEUTRAL, "result", failed], { cwd: repo }).stdout,
+    run("node", [NEUTRAL, "result", waiting], { cwd: repo }).stdout
+  ];
+  for (const output of outputs) {
     for (const probe of CREDENTIAL_PROBES) {
       assert.equal(output.includes(probe.value), false, output);
-      assert.equal(output.includes(probe.name.replaceAll('"', "")), true, output);
     }
   }
+  for (const probe of CREDENTIAL_PROBES) {
+    assert.equal(outputs[0].includes(probe.name.replaceAll('"', "")), true, outputs[0]);
+  }
+  assert.equal(outputs[0].includes("[redacted]"), true);
 });
 
-test("job records keep the request out of the record and redact summaries", () => {
-  const workspace = makeTempDir();
-  writeJobFile(workspace, "task-1", {
-    id: "task-1",
-    status: "queued",
-    summary: "deploy with api_key=s3cr3tvalue",
-    errorMessage: "auth failed for Bearer abcdefgh12345678",
-    request: { prompt: "the private prompt" }
+test("the session-start note shows a prompt preview without the credentials in it", (t) => {
+  const repo = makeCommittedRepo(t);
+  const store = openStore(resolveStateDir(repo));
+  const requester = { sessionId: "earlier-session", leaderPid: null, leaderStartToken: null };
+  const prompt = "use api_key=s3cr3tvalue4242 and Bearer abcdefgh12345678 to fetch the report, then summarise it";
+  const { jobId } = createJob(store, { provider: "codex", kind: "task", title: "fetch", prompt, request: { cwd: repo }, cwd: repo, requester }, {});
+  recordEnd(store, jobId, { state: "interrupted", by: "reconcile", reason: "session-end" });
+  store.close();
+
+  const hook = path.join(ROOT, "plugins", "agent", "scripts", "session-lifecycle-hook.mjs");
+  const started = run("node", [hook, "SessionStart"], {
+    cwd: repo,
+    input: JSON.stringify({ hook_event_name: "SessionStart", session_id: "new-session", cwd: repo }),
+    timeout: 30000
   });
-
-  const record = readJobFile(resolveJobFile(workspace, "task-1"));
-  assert.equal("request" in record, false);
-  assert.equal(record.summary, "deploy with api_key=[redacted]");
-  assert.equal(record.errorMessage, "auth failed for Bearer [redacted]");
-  assert.deepEqual(takeJobRequest(workspace, "task-1"), { prompt: "the private prompt" });
-  assert.equal(takeJobRequest(workspace, "task-1"), null);
+  assert.equal(started.status, 0, started.stderr);
+  assert.match(started.stdout, new RegExp(jobId));
+  assert.equal(started.stdout.includes("s3cr3tvalue4242"), false, started.stdout);
+  assert.equal(started.stdout.includes("abcdefgh12345678"), false, started.stdout);
 });
 
-test("a finished job leaves no request file", () => {
-  const workspace = makeTempDir();
-  writeJobFile(workspace, "task-2", { id: "task-2", status: "queued", request: { prompt: "p" } });
-  const requestFile = path.join(resolveJobsDir(workspace), "task-2.request.json");
-  assert.equal(fs.existsSync(requestFile), true);
-
-  writeJobFile(workspace, "task-2", { id: "task-2", status: "failed", errorMessage: "could not start" });
-
-  assert.equal(fs.existsSync(requestFile), false);
-});
-
-test("a stored prompt in an older job record is moved out when its worker starts", () => {
-  const workspace = makeTempDir();
-  const jobFile = resolveJobFile(workspace, "task-old");
-  fs.writeFileSync(jobFile, JSON.stringify({ id: "task-old", status: "completed", request: { prompt: "old prompt" } }));
-  const before = fs.readFileSync(jobFile, "utf8");
-
-  assert.equal(listJobs(workspace).length, 1);
-  assert.equal(fs.readFileSync(jobFile, "utf8"), before);
-
-  assert.deepEqual(takeJobRequest(workspace, "task-old"), { prompt: "old prompt" });
-  assert.equal(fs.readFileSync(jobFile, "utf8").includes("old prompt"), false);
-  assert.equal(fs.existsSync(jobFile.replace(/.json$/, ".request.json")), false);
-});
-
-test("a background task leaves its prompt nowhere in the job records", async () => {
+test("a background task leaves its prompt in no file beside the job store", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -130,33 +126,36 @@ test("a background task leaves its prompt nowhere in the job records", async () 
 
   const launched = run("node", [SCRIPT, "task", "--background", "--json", "secret-marker-7731 investigate"], {
     cwd: repo,
-    env: buildEnv(binDir)
+    env: buildEnv(binDir),
+    timeout: 60000
   });
   assert.equal(launched.status, 0, launched.stderr);
   const { jobId } = JSON.parse(launched.stdout);
   const waited = run("node", [NEUTRAL, "status", jobId, "--wait", "--timeout-ms", "15000", "--json"], {
     cwd: repo,
     env: buildEnv(binDir),
-    check: true
+    check: true,
+    timeout: 60000
   });
-  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+  assert.equal(JSON.parse(waited.stdout).jobs[0].status, "completed");
 
-  // Logs record Codex's own output, which can quote the prompt; job records and request
-  // files must not hold it.
-  const records = filesUnder(resolveStateDir(repo)).filter((file) => file.endsWith(".json"));
-  assert.notEqual(records.length, 0);
-  for (const file of records) {
+  // The job store keeps the prompt, so a worker can replay it, and logs record the agent's own
+  // output, which can quote it. No other file may hold it: no JSON record, request file or
+  // heartbeat file.
+  const others = filesUnder(resolveStateDir(repo)).filter((file) => fs.statSync(file).isFile() && !/[\\/]store[\\/]state\.db/.test(file) && !file.endsWith(".log"));
+  for (const file of others) {
     assert.equal(fs.readFileSync(file, "utf8").includes("secret-marker-7731"), false, file);
   }
 });
 
-test("state directories are private to their owner", { skip: process.platform === "win32" && "POSIX modes" }, () => {
+test("state directories are private to their owner",{ skip: process.platform === "win32" && "POSIX modes" }, () => {
   const workspace = makeTempDir();
-  upsertJob(workspace, { id: "task-mode", status: "queued" });
+  setConfig(workspace, "stopReviewGate", false);
+  ensureStateDir(workspace);
   const stateDir = resolveStateDir(workspace);
   assert.equal(fs.statSync(stateDir).mode & 0o777, 0o700);
   assert.equal(fs.statSync(path.join(stateDir, "jobs")).mode & 0o777, 0o700);
-  assert.equal(fs.statSync(resolveJobFile(workspace, "task-mode")).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(path.join(stateDir, "config.json")).mode & 0o777, 0o600);
 });
 
 // Every redaction pattern, and redactSecrets as a whole, must take time linear in the text
