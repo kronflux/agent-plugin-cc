@@ -6,7 +6,7 @@ function labelFor(meta) {
 }
 
 function severityRank(severity) {
-  switch (severity) {
+  switch (String(severity ?? "").toLowerCase()) {
     case "critical":
       return 0;
     case "high":
@@ -56,7 +56,7 @@ function normalizeReviewFinding(finding, index) {
       : lineStart;
 
   return {
-    severity: typeof source.severity === "string" && source.severity.trim() ? source.severity.trim() : "low",
+    severity: typeof source.severity === "string" && source.severity.trim() ? source.severity.trim().toLowerCase() : "low",
     title: typeof source.title === "string" && source.title.trim() ? source.title.trim() : `Finding ${index + 1}`,
     body: typeof source.body === "string" && source.body.trim() ? source.body.trim() : "No details provided.",
     file: typeof source.file === "string" && source.file.trim() ? source.file.trim() : "unknown",
@@ -106,8 +106,20 @@ function escapeMarkdownCell(value) {
     .trim();
 }
 
+/** Returns a backtick fence one longer than the longest backtick run in `text`, at least three. */
+export function fenceFor(text) {
+  const longestRun = Math.max(0, ...(String(text ?? "").match(/`+/g) ?? []).map((run) => run.length));
+  return "`".repeat(Math.max(3, longestRun + 1));
+}
+
+function fencedText(text) {
+  const fence = fenceFor(text);
+  return [`${fence}text`, text, fence];
+}
+
+// An ephemeral thread is not saved by Codex, so no resume command is offered for it.
 function formatResumeLine(job) {
-  if (!job?.threadId) {
+  if (!job?.threadId || job.ephemeralThread === true) {
     return null;
   }
   const provider = providerForJob(job);
@@ -194,7 +206,7 @@ export function renderReviewResult(parsedResult, meta) {
     ];
 
     if (parsedResult.rawOutput) {
-      lines.push("", "Raw final message:", "", "```text", parsedResult.rawOutput, "```");
+      lines.push("", "Raw final message:", "", ...fencedText(parsedResult.rawOutput));
     }
 
     appendReasoningSection(lines, meta.reasoningSummary ?? parsedResult.reasoningSummary);
@@ -214,7 +226,7 @@ export function renderReviewResult(parsedResult, meta) {
     ];
 
     if (parsedResult.rawOutput) {
-      lines.push("", "Raw final message:", "", "```text", parsedResult.rawOutput, "```");
+      lines.push("", "Raw final message:", "", ...fencedText(parsedResult.rawOutput));
     }
 
     appendReasoningSection(lines, meta.reasoningSummary ?? parsedResult.reasoningSummary);
@@ -279,7 +291,7 @@ export function renderNativeReviewResult(result, meta) {
   }
 
   if (stderr) {
-    lines.push("", "stderr:", "", "```text", stderr, "```");
+    lines.push("", "stderr:", "", ...fencedText(stderr));
   }
 
   appendReasoningSection(lines, meta.reasoningSummary);
@@ -376,18 +388,22 @@ export function renderStoredJobResult(job, storedJob) {
   })}`;
 }
 
+/** Returns stored output ending in a newline, followed by the session lines when there are any. */
+export function renderStoredOutputBlock(text, sessionLines = []) {
+  const output = text.endsWith("\n") ? text : `${text}\n`;
+  return sessionLines.length === 0 ? output : `${output}\n${sessionLines.join("\n")}\n`;
+}
+
 function renderStoredJobBody(job, storedJob) {
   const provider = providerForJob(job);
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
+  const ephemeralThread = job.ephemeralThread === true || storedJob?.ephemeralThread === true;
+  const resumeLine = formatResumeLine({ ...job, threadId, ephemeralThread });
   const sessionLines = threadId
-    ? `${provider.label} session ID: ${threadId}\nResume in ${provider.label}: ${provider.resumeCommand(threadId)}\n`
-    : "";
+    ? [`${provider.label} session ID: ${threadId}`, ...(resumeLine ? [resumeLine] : [])]
+    : [];
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
-    const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
-    if (!threadId) {
-      return output;
-    }
-    return `${output}\n${sessionLines}`;
+    return renderStoredOutputBlock(storedJob.rendered, sessionLines);
   }
 
   const rawOutput =
@@ -395,32 +411,20 @@ function renderStoredJobBody(job, storedJob) {
     provider.storedOutputText(storedJob) ||
     "";
   if (rawOutput) {
-    const output = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
-    if (!threadId) {
-      return output;
-    }
-    return `${output}\n${sessionLines}`;
+    return renderStoredOutputBlock(rawOutput, sessionLines);
   }
 
   if (storedJob?.rendered) {
-    const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
-    if (!threadId) {
-      return output;
-    }
-    return `${output}\n${sessionLines}`;
+    return renderStoredOutputBlock(storedJob.rendered, sessionLines);
   }
 
   const lines = [
     `# ${job.title ?? "Job Result"}`,
     "",
     `Job: ${job.id}`,
-    `Status: ${job.status}`
+    `Status: ${job.status}`,
+    ...sessionLines
   ];
-
-  if (threadId) {
-    lines.push(`${provider.label} session ID: ${threadId}`);
-    lines.push(`Resume in ${provider.label}: ${provider.resumeCommand(threadId)}`);
-  }
 
   if (job.summary) {
     lines.push(`Summary: ${job.summary}`);

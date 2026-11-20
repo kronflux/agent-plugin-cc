@@ -63,7 +63,8 @@ function formatTimeUntil(seconds) {
 }
 
 function formatUsageWindow(window, nowMs) {
-  const parts = [`${formatWindowLabel(window.windowDurationMins)}: ${window.usedPercent}% used`];
+  const usage = Number.isFinite(window.usedPercent) ? `${window.usedPercent}% used` : "usage unknown";
+  const parts = [`${formatWindowLabel(window.windowDurationMins)}: ${usage}`];
   if (Number.isFinite(window.resetsAt)) {
     const resetsAt = new Date(window.resetsAt * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
     parts.push(`resets ${resetsAt} (${formatTimeUntil(window.resetsAt - nowMs / 1000)})`);
@@ -86,14 +87,18 @@ function formatCredits(credits) {
 
 /**
  * Renders the `account/rateLimits/read` response. Each metered limit is listed once; the
- * top-level `rateLimits` snapshot mirrors one of them.
+ * top-level `rateLimits` snapshot mirrors one of them. The snapshot gets its own block only
+ * when no bucket has its limit id and it names a limit or carries a window, or when there are
+ * no buckets at all.
  */
 export function renderUsageReport(response, options = {}) {
   const nowMs = options.now ?? Date.now();
   const main = response?.rateLimits ?? {};
   const byId = response?.rateLimitsByLimitId && typeof response.rateLimitsByLimitId === "object" ? response.rateLimitsByLimitId : {};
   const buckets = Object.values(byId).filter(Boolean);
-  if (!buckets.some((bucket) => bucket.limitId && bucket.limitId === main.limitId)) {
+  const mainHasContent = Boolean(main.limitId || main.primary || main.secondary);
+  const mainDuplicated = buckets.some((bucket) => bucket.limitId && bucket.limitId === main.limitId);
+  if (!mainDuplicated && (mainHasContent || buckets.length === 0)) {
     buckets.unshift(main);
   }
 

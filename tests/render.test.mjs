@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  renderJobStatusReport,
+  renderNativeReviewResult,
   renderReviewResult,
   renderStoredJobResult
 } from "../plugins/agent/scripts/lib/render.mjs";
@@ -116,4 +118,81 @@ test("setup shows the app server user agent when known", () => {
   };
   assert.match(renderSetupReport(report), /^- app server: codex_cli_rs\/0\.160\.0 \(Windows/m);
   assert.doesNotMatch(renderSetupReport({ ...report, appServer: null }), /app server/);
+});
+
+const REVIEW_META = { reviewLabel: "Review", targetLabel: "working tree diff" };
+
+test("severity labels sort regardless of case", () => {
+  const output = renderReviewResult(
+    {
+      parsed: {
+        verdict: "needs-attention",
+        summary: "Two issues.",
+        findings: [
+          { severity: "Medium", title: "Medium thing", body: "b", file: "a.js" },
+          { severity: "CRITICAL", title: "Critical thing", body: "b", file: "a.js" },
+          { severity: "High", title: "High thing", body: "b", file: "a.js" }
+        ],
+        next_steps: []
+      },
+      rawOutput: "{}",
+      parseError: null
+    },
+    REVIEW_META
+  );
+
+  const order = [...output.matchAll(/^- \[(\w+)\] (\w+) thing/gm)].map((match) => `${match[1]} ${match[2]}`);
+  assert.deepEqual(order, ["critical Critical", "high High", "medium Medium"]);
+});
+
+test("raw output with a code fence stays inside its block", () => {
+  const rawOutput = "before\n```\nINJECTED\n````\nafter";
+  const output = renderReviewResult({ parsed: null, parseError: "Unexpected token", rawOutput }, REVIEW_META);
+
+  assert.ok(output.includes(`\`\`\`\`\`text\n${rawOutput}\n\`\`\`\`\``), output);
+  const native = renderNativeReviewResult({ status: 1, stdout: "", stderr: rawOutput }, REVIEW_META);
+  assert.ok(native.includes(`\`\`\`\`\`text\n${rawOutput}\n\`\`\`\`\``), native);
+  const plain = renderReviewResult({ parsed: null, parseError: "x", rawOutput: "no fences" }, REVIEW_META);
+  assert.ok(plain.includes("```text\nno fences\n```"), plain);
+});
+
+test("usage shows no empty Codex block beside real buckets", () => {
+  const output = renderUsageReport(
+    {
+      rateLimits: { planType: "pro", credits: { hasCredits: false, unlimited: false } },
+      rateLimitsByLimitId: {
+        codex: { limitId: "codex", primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: null } }
+      }
+    },
+    { now: NOW }
+  );
+
+  assert.match(output, /^codex:\n- 5-hour window: 10% used$/m);
+  assert.doesNotMatch(output, /No usage window reported/);
+  assert.doesNotMatch(output, /^Codex:$/m);
+});
+
+test("a window without a percent prints usage unknown, never undefined%", () => {
+  const output = renderUsageReport(
+    { rateLimits: { limitId: "codex", primary: { windowDurationMins: 300, resetsAt: null } } },
+    { now: NOW }
+  );
+
+  assert.match(output, /^- 5-hour window: usage unknown$/m);
+  assert.doesNotMatch(output, /undefined%/);
+});
+
+test("status and result print no resume command for an ephemeral thread", () => {
+  const job = { id: "task-eph", status: "completed", jobClass: "task", threadId: "thr_eph", ephemeralThread: true };
+  const stored = { ...job, rendered: "Done.\n" };
+
+  const status = renderJobStatusReport(job);
+  assert.match(status, /Codex session ID: thr_eph/);
+  assert.doesNotMatch(status, /codex resume/);
+  assert.doesNotMatch(renderStoredJobResult(job, stored), /codex resume/);
+  assert.doesNotMatch(renderStoredJobResult(job, { threadId: "thr_eph" }), /codex resume/);
+
+  const durable = { ...job, ephemeralThread: undefined };
+  assert.match(renderJobStatusReport(durable), /Resume in Codex: codex resume thr_eph/);
+  assert.match(renderStoredJobResult(durable, { ...durable, rendered: "Done.\n" }), /Resume in Codex: codex resume thr_eph/);
 });
