@@ -3,6 +3,8 @@
 ## Unreleased
 
 - The plugin needs Node.js 22.13 or later.
+- On POSIX, if the shared temp state root (`$TMPDIR/agent-plugin-<uid>`) is a symlink or belongs to another user, commands stop with "The plugin state folder <dir> is not a private folder owned by you; set CLAUDE_PLUGIN_DATA."
+- An unreadable legacy `state.json` is now kept, with a warning on stderr.
 
 ## 2.0.0
 

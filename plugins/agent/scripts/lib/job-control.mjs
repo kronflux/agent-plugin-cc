@@ -9,6 +9,7 @@ import { resolveWorkspaceRoot } from "./workspace.mjs";
 export const DEFAULT_MAX_STATUS_JOBS = 8;
 export const DEFAULT_MAX_PROGRESS_LINES = 4;
 export const WORKER_START_GRACE_MS = 30_000;
+const MAX_PROGRESS_LOG_BYTES = 64 * 1024;
 
 function isActiveJob(job) {
   return job.status === "queued" || job.status === "running";
@@ -19,29 +20,63 @@ function interruptOrphanedTurn(workspaceRoot, job) {
   return providerForJob(job).interruptOrphanedTurn(workspaceRoot, job);
 }
 
+// The time a queued job's worker had to start from: its creation, else its last update. A
+// record with neither timestamp readable has had its chance.
+function queuedSince(job) {
+  for (const value of [job.createdAt, job.updatedAt]) {
+    const parsed = Date.parse(value ?? "");
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return -Infinity;
+}
+
+function jobProcessMarker(job) {
+  return job.processMarker ?? providerForJob(job).processMarker;
+}
+
 /**
  * Marks active jobs whose worker is gone as failed and returns their ids. A job with a PID
- * fails when that process no longer exists; a queued job without a PID fails once its worker
- * has had `WORKER_START_GRACE_MS` to start. A record that finished in the meantime is kept.
+ * fails when that process no longer exists, or when its command line no longer contains the
+ * job's marker because the PID now belongs to another program. When the command-line lookup
+ * fails or returns an empty line, the job is kept. A queued job without a PID fails once its
+ * worker has had `WORKER_START_GRACE_MS` to start. A record that finished in the meantime is kept.
  */
 export async function reconcileJobLiveness(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const now = options.now ?? Date.now();
   const isAlive = options.isAlive ?? isProcessAlive;
+  const readCommandLines = options.readCommandLines ?? readProcessCommandLines;
   const interruptTurn = options.interruptTurn ?? interruptOrphanedTurn;
   const reaped = [];
 
-  for (const job of listJobs(workspaceRoot)) {
-    if (!isActiveJob(job)) {
-      continue;
+  const activeJobs = listJobs(workspaceRoot).filter(isActiveJob);
+  const alivePids = new Set();
+  for (const job of activeJobs) {
+    if (job.pid != null && isAlive(job.pid)) {
+      alivePids.add(job.pid);
     }
+  }
+  const commandLines = alivePids.size > 0 ? readCommandLines([...alivePids]) : new Map();
+
+  for (const job of activeJobs) {
     let errorMessage = null;
     if (job.pid == null) {
-      if (job.status === "queued" && now - Date.parse(job.createdAt ?? "") > WORKER_START_GRACE_MS) {
+      if (job.status === "queued" && now - queuedSince(job) > WORKER_START_GRACE_MS) {
         errorMessage = "The background worker did not start.";
       }
-    } else if (!isAlive(job.pid)) {
+    } else if (!alivePids.has(job.pid)) {
       errorMessage = "The worker process exited before the job finished.";
+    } else if (commandLines) {
+      const commandLine = commandLines.get(job.pid);
+      if (commandLine === undefined) {
+        errorMessage = "The worker process exited before the job finished.";
+      } else if (commandLine && !commandLine.includes(jobProcessMarker(job))) {
+        errorMessage = "The worker process is gone; its process id now belongs to another program.";
+      }
+    }
+    if (errorMessage && job.pid != null) {
       if (job.threadId && job.turnId) {
         try {
           await interruptTurn(workspaceRoot, job);
@@ -80,8 +115,7 @@ export function terminateJobProcesses(jobs, options = {}) {
     if (commandLines && !commandLines.has(job.pid)) {
       return { jobId: job.id, pid: job.pid, outcome: "not-running" };
     }
-    const marker = job.processMarker ?? providerForJob(job).processMarker;
-    if (commandLines && !commandLines.get(job.pid).includes(marker)) {
+    if (commandLines && !commandLines.get(job.pid).includes(jobProcessMarker(job))) {
       return { jobId: job.id, pid: job.pid, outcome: "pid-reused" };
     }
     try {
@@ -143,13 +177,35 @@ function isProgressBlockTitle(line) {
   );
 }
 
+// Reads at most the last `maxBytes` of a file. When the read starts inside the file, the first
+// line is partial and is dropped.
+function readFileTail(file, maxBytes) {
+  const fd = fs.openSync(file, "r");
+  try {
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(0, size - maxBytes);
+    const buffer = Buffer.alloc(size - start);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const bytesRead = fs.readSync(fd, buffer, offset, buffer.length - offset, start + offset);
+      if (bytesRead === 0) {
+        break;
+      }
+      offset += bytesRead;
+    }
+    const text = buffer.subarray(0, offset).toString("utf8");
+    return start > 0 ? text.slice(text.indexOf("\n") + 1) : text;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 export function readJobProgressPreview(logFile, maxLines = DEFAULT_MAX_PROGRESS_LINES) {
   if (!logFile || !fs.existsSync(logFile)) {
     return [];
   }
 
-  const lines = fs
-    .readFileSync(logFile, "utf8")
+  const lines = readFileTail(logFile, MAX_PROGRESS_LOG_BYTES)
     .split(/\r?\n/)
     .map((line) => line.trimEnd())
     .filter(Boolean)
@@ -309,8 +365,10 @@ export function buildStatusSnapshot(cwd, options = {}) {
   const latestFinishedRaw = jobs.find((job) => job.status !== "queued" && job.status !== "running") ?? null;
   const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw, { maxProgressLines }) : null;
 
-  const recent = (options.all ? jobs : jobs.slice(0, maxJobs))
-    .filter((job) => job.status !== "queued" && job.status !== "running" && job.id !== latestFinished?.id)
+  // Only finished jobs count toward `maxJobs`; active jobs are all listed under `running`.
+  const finished = jobs.filter((job) => !isActiveJob(job));
+  const recent = (options.all ? finished : finished.slice(0, maxJobs))
+    .filter((job) => job.id !== latestFinished?.id)
     .map((job) => enrichJob(job, { maxProgressLines }));
 
   return {
@@ -341,6 +399,18 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
+  if (reference) {
+    // A reference that names an active job gets the still-running answer, not "No job found".
+    let direct = null;
+    try {
+      direct = matchJobReference(jobs, reference);
+    } catch {
+      direct = null;
+    }
+    if (direct && isActiveJob(direct)) {
+      throw new Error(`Job ${direct.id} is still ${direct.status}. Check /agent:status and try again once it finishes.`);
+    }
+  }
   const selected = matchJobReference(
     jobs,
     reference,

@@ -1,13 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run, stopTestBrokers } from "./helpers.mjs";
-import { listJobs } from "../plugins/agent/scripts/lib/state.mjs";
+import { initGitRepo, makeTempDir, run, stopTestBrokers, stopWaiting, waitUntil as sharedWaitUntil } from "./helpers.mjs";
+import { listJobs, markJobCancelled, readJobFile, resolveJobFile, writeJobFile } from "../plugins/agent/scripts/lib/state.mjs";
+import { runTrackedJob } from "../plugins/agent/scripts/lib/tracked-jobs.mjs";
 import { loadBrokerSession, sendBrokerShutdown } from "../plugins/agent/scripts/providers/codex/broker-lifecycle.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -47,6 +48,19 @@ function startMonitor(repo, env, { graceMs = 300, pluginData = null } = {}) {
     output.text += chunk;
   });
   return { child, output };
+}
+
+// Stops a process this file started, by its own id.
+function stopProcessById(pid) {
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+  } else {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  }
 }
 
 async function waitUntil(predicate, timeoutMs) {
@@ -93,8 +107,9 @@ test("the monitor announces a finished background job whose result nobody printe
 });
 
 test("the monitor stays silent for a job whose result a command printed", async () => {
+  const graceMs = 4000;
   const ctx = makeRepo();
-  const { output } = startMonitor(ctx.repo, ctx.env, { graceMs: 4000 });
+  const { output } = startMonitor(ctx.repo, ctx.env, { graceMs });
   const jobId = launchBackgroundTask(ctx);
   const waited = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "20000", "--poll-interval-ms", "100"], {
     cwd: ctx.repo,
@@ -102,7 +117,14 @@ test("the monitor stays silent for a job whose result a command printed", async 
   });
   assert.equal(waited.status, 0, waited.stderr);
 
-  await new Promise((resolve) => setTimeout(resolve, 5000));
+  // The monitor decides once the grace period after it first sees the job finished has passed;
+  // it polls every 100 ms, so one second past the grace covers its decision.
+  const completedAt = Date.parse(listJobs(ctx.repo).find((job) => job.id === jobId).completedAt);
+  const decidedBy = completedAt + graceMs + 1000;
+  await sharedWaitUntil(
+    () => (output.text ? stopWaiting(`the monitor announced: ${output.text}`) : Date.now() >= decidedBy),
+    { timeoutMs: Math.max(0, decidedBy - Date.now()) + 2000, intervalMs: 100, describe: "the monitor's decision time" }
+  );
   assert.equal(output.text, "");
 });
 
@@ -119,10 +141,19 @@ test("the monitor ignores jobs started from another Claude process", async () =>
 test("the monitor exits when its Claude process is gone", async () => {
   const ctx = makeRepo();
   const gone = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
-  await new Promise((resolve) => gone.on("exit", resolve));
+  await new Promise((resolve) => gone.on("close", resolve));
   const { child } = startMonitor(ctx.repo, { ...ctx.env, CLAUDE_PID: String(gone.pid) });
 
-  const code = await new Promise((resolve) => child.on("exit", resolve));
+  const code = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      stopProcessById(child.pid);
+      reject(new Error("the monitor did not exit within 10 s"));
+    }, 10000);
+    child.on("close", (exitCode) => {
+      clearTimeout(timer);
+      resolve(exitCode);
+    });
+  });
   assert.equal(code, 0);
 });
 
@@ -161,4 +192,79 @@ test("the monitor reads jobs from the plugin data directory it is given", async 
 
   assert.ok(await waitUntil(() => output.text.includes(jobId), 20000), `no announcement: ${output.text}`);
   assert.ok(listJobs(ctx.repo).every((job) => job.id !== jobId), "the job was stored outside the plugin data directory");
+});
+
+function readStored(root, id) {
+  return readJobFile(resolveJobFile(root, id));
+}
+
+function queueJob(t, id, fields = {}) {
+  const root = makeTempDir(t);
+  writeJobFile(root, id, { id, status: "queued", phase: "queued", jobClass: "task", ...fields });
+  return { root, job: { ...readStored(root, id), workspaceRoot: root } };
+}
+
+const okExecution = { exitStatus: 0, payload: { ok: true }, rendered: "done\n", summary: "done" };
+
+test("a job cancelled after its pid is recorded never starts its runner", async (t) => {
+  const { isJobCancelled } = await import("../plugins/agent/scripts/lib/state.mjs");
+  const { root, job } = queueJob(t, "task-cancel-early");
+  let runnerCalls = 0;
+
+  const execution = await runTrackedJob(
+    job,
+    async () => {
+      runnerCalls += 1;
+      return okExecution;
+    },
+    { onStarted: () => markJobCancelled(root, job.id) }
+  );
+
+  assert.equal(runnerCalls, 0);
+  assert.equal(execution.cancelled, true);
+  assert.equal(execution.exitStatus, 1);
+  assert.deepEqual(execution.payload, { status: "cancelled", jobId: job.id });
+  assert.equal(execution.rendered, "Cancelled before the turn started.\n");
+  assert.equal(isJobCancelled(root, job.id), true);
+  assert.equal(readStored(root, job.id).status, "cancelled");
+});
+
+test("a completed job stays completed when its log cannot be written", async (t) => {
+  const { job } = queueJob(t, "task-log-folder");
+  const logFolder = makeTempDir(t);
+
+  let error = null;
+  await runTrackedJob(job, async () => okExecution, { logFile: logFolder }).catch((caught) => {
+    error = caught;
+  });
+
+  assert.equal(readStored(job.workspaceRoot, job.id).status, "completed");
+  assert.equal(error, null);
+});
+
+test("an unreadable record does not replace the runner's error", async (t) => {
+  const { root, job } = queueJob(t, "task-corrupt");
+
+  await assert.rejects(
+    runTrackedJob(job, async () => {
+      fs.writeFileSync(resolveJobFile(root, job.id), "{not json");
+      throw new Error("runner broke");
+    }),
+    /runner broke/
+  );
+
+  const stored = readStored(root, job.id);
+  assert.equal(stored.status, "failed");
+  assert.equal(stored.errorMessage, "runner broke");
+});
+
+test("a runner that omits its ids keeps the stored thread and turn ids", async (t) => {
+  const { root, job } = queueJob(t, "task-ids", { threadId: "t1", turnId: "u1" });
+
+  await runTrackedJob(job, async () => okExecution);
+
+  const stored = readStored(root, job.id);
+  assert.equal(stored.status, "completed");
+  assert.equal(stored.threadId, "t1");
+  assert.equal(stored.turnId, "u1");
 });

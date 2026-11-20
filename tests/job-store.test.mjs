@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { makeTempDir } from "./helpers.mjs";
+import { makeTempDir, stopWaiting, waitUntil } from "./helpers.mjs";
 import {
   getConfig,
   listJobs,
@@ -25,16 +25,19 @@ const STATE_MODULE = pathToFileURL(
 ).href;
 
 // Runs `body` in a separate Node process with `upsertJob` in scope and `workspace` bound.
-function runStateProcess(workspace, body) {
+// `onStdout` receives the process's output as it arrives.
+function runStateProcess(workspace, body, { onStdout = null } = {}) {
   const source = `import { upsertJob } from ${JSON.stringify(STATE_MODULE)};\nconst workspace = ${JSON.stringify(workspace)};\n${body}`;
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ["--input-type=module", "-e", source], { stdio: ["ignore", "ignore", "pipe"] });
+    const child = spawn(process.execPath, ["--input-type=module", "-e", source], { stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => onStdout?.(chunk));
     child.stderr.on("data", (chunk) => {
       stderr += chunk;
     });
     child.on("error", reject);
-    child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`state process exited ${code}: ${stderr}`))));
+    child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`state process exited ${code}: ${stderr}`))));
   });
 }
 
@@ -61,6 +64,7 @@ test("concurrent writers keep every job record intact", async () => {
 
   const jobsDir = resolveJobsDir(workspace);
   const records = fs.readdirSync(jobsDir).filter((name) => name.endsWith(".json"));
+  // 204 = 8 x 25 one-write job records + 4 progress records; active jobs are never pruned.
   assert.equal(records.length, 204);
   for (const name of records) {
     JSON.parse(fs.readFileSync(path.join(jobsDir, name), "utf8"));
@@ -71,6 +75,9 @@ test("concurrent writers keep every job record intact", async () => {
       assert.equal(ids.has(`job-${writer}-${i}`), true, `job-${writer}-${i} missing`);
     }
   }
+  for (let worker = 0; worker < 4; worker += 1) {
+    assert.equal(readJobFile(resolveJobFile(workspace, `progress-${worker}`)).phase, "step-49");
+  }
   assert.equal(fs.readdirSync(jobsDir).some((name) => name.endsWith(".tmp")), false);
 });
 
@@ -78,18 +85,46 @@ test("listing jobs during continuous writes never returns an empty list", async 
   const workspace = makeTempDir();
   upsertJob(workspace, { id: "steady", status: "running" });
   const stopFile = path.join(workspace, "stop");
+  let writerOutput = "";
+  let writerEnded = null;
+  let writerError = null;
   const writer = runStateProcess(
     workspace,
-    `import fs from "node:fs";\nfor (let i = 0; !fs.existsSync(${JSON.stringify(stopFile)}); i += 1) upsertJob(workspace, { id: "steady", phase: "step-" + i });`
+    [
+      `import fs from "node:fs";`,
+      `upsertJob(workspace, { id: "steady", phase: "step-first" });`,
+      `process.stdout.write("ready");`,
+      `for (let i = 0; !fs.existsSync(${JSON.stringify(stopFile)}); i += 1) upsertJob(workspace, { id: "steady", phase: "step-" + i });`
+    ].join("\n"),
+    {
+      onStdout(chunk) {
+        writerOutput += chunk;
+      }
+    }
+  ).then(
+    () => {
+      writerEnded ??= "the writer exited before it was stopped";
+    },
+    (error) => {
+      writerEnded ??= error.message;
+      writerError = error;
+    }
   );
 
   try {
+    // The reads start only once the writer is writing.
+    await waitUntil(() => (writerEnded ? stopWaiting(writerEnded) : writerOutput.includes("ready")), {
+      describe: "the writer printing ready"
+    });
     for (let read = 0; read < 10000; read += 1) {
       assert.equal(listJobs(workspace).length, 1, `read ${read} returned no job`);
     }
   } finally {
     fs.writeFileSync(stopFile, "");
     await writer;
+  }
+  if (writerError) {
+    throw writerError;
   }
 });
 

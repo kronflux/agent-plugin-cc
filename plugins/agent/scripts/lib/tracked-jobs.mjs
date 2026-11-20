@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { isJobCancelled, readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 // Text that the command line of a job's process contains. A background worker has its job id
@@ -139,28 +139,55 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
+const CANCELLED_BEFORE_START = "Cancelled before the turn started.";
+
+/**
+ * Runs a job and records its outcome. The running record publishes this process's id; then
+ * `options.onStarted` runs, and a job cancelled by then returns a cancelled result without
+ * calling `runner` (its stored status reads as cancelled through the cancel marker). A
+ * failure to write the log block leaves the completed record in place.
+ */
 export async function runTrackedJob(job, runner, options = {}) {
+  const logFile = options.logFile ?? job.logFile ?? null;
+  // The prompt of a legacy record is handed to the worker separately and never stored again.
+  const { request: _request, ...jobFields } = job;
   const runningRecord = {
-    ...job,
+    ...jobFields,
     status: "running",
     startedAt: nowIso(),
     phase: "starting",
     pid: process.pid,
     processMarker: processMarkerFor(job.id),
-    logFile: options.logFile ?? job.logFile ?? null
+    logFile
   };
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
 
+  // A cancel that ran before this process's id was recorded could not stop it, so it is
+  // honoured here, before the turn starts.
+  options.onStarted?.();
+  if (isJobCancelled(job.workspaceRoot, job.id)) {
+    return {
+      exitStatus: 1,
+      cancelled: true,
+      threadId: null,
+      turnId: null,
+      payload: { status: "cancelled", jobId: job.id },
+      rendered: `${CANCELLED_BEFORE_START}\n`,
+      summary: CANCELLED_BEFORE_START
+    };
+  }
+
+  let execution;
   try {
-    const execution = await runner();
+    execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
     const stored = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     writeJobFile(job.workspaceRoot, job.id, {
       ...stored,
       status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
+      threadId: execution.threadId ?? stored.threadId ?? null,
+      turnId: execution.turnId ?? stored.turnId ?? null,
       ...(execution.summary === undefined ? {} : { summary: execution.summary }),
       pid: null,
       phase: completionStatus === "completed" ? "done" : "failed",
@@ -168,21 +195,30 @@ export async function runTrackedJob(job, runner, options = {}) {
       result: execution.payload,
       rendered: execution.rendered
     });
-    appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
-    return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
-    const completedAt = nowIso();
+    let existing;
+    try {
+      existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
+    } catch {
+      existing = runningRecord;
+    }
     writeJobFile(job.workspaceRoot, job.id, {
       ...existing,
       status: "failed",
       phase: "failed",
       errorMessage,
       pid: null,
-      completedAt,
-      logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
+      completedAt: nowIso(),
+      logFile: logFile ?? existing.logFile ?? null
     });
     throw error;
   }
+
+  try {
+    appendLogBlock(logFile, "Final output", execution.rendered);
+  } catch {
+    // The completed record already holds the output; a log that cannot be written loses only its copy.
+  }
+  return execution;
 }

@@ -78,6 +78,12 @@ function main() {
       return;
     }
     const now = Date.now();
+    const listed = new Set(jobs.map((job) => job.id));
+    for (const id of tracked.keys()) {
+      if (!listed.has(id)) {
+        tracked.delete(id);
+      }
+    }
     for (const job of jobs) {
       if (!belongsHere(job)) {
         continue;

@@ -90,18 +90,52 @@ export function resolveJobsDir(cwd) {
   return path.join(resolveStateDir(cwd), JOBS_DIR_NAME);
 }
 
+/**
+ * Throws unless `dir` is a real folder, not a symlink, owned by the calling user. The fallback
+ * state root sits in the shared temp directory, where another user could have created it first.
+ */
+export function assertPrivateStateRoot(dir, { lstat = fs.lstatSync, getuid = process.getuid } = {}) {
+  const stat = lstat(dir);
+  const ownedByCaller = typeof getuid !== "function" || stat.uid === getuid();
+  if (stat.isSymbolicLink() || !stat.isDirectory() || !ownedByCaller) {
+    throw new Error(`The plugin state folder ${dir} is not a private folder owned by you; set CLAUDE_PLUGIN_DATA.`);
+  }
+}
+
+function stateRootOf(dir) {
+  const roots = [FALLBACK_STATE_ROOT_DIR];
+  if (process.env[PLUGIN_DATA_ENV]) {
+    roots.unshift(path.join(process.env[PLUGIN_DATA_ENV], "state"));
+  }
+  return roots.find((root) => dir === root || dir.startsWith(`${root}${path.sep}`)) ?? null;
+}
+
 // State directories hold prompts and agent output, so on POSIX systems they are readable by
-// their owner only, including directories created before this mode was applied.
+// their owner only, including directories created before this mode was applied. The mode is
+// applied to the folder and its parents up to the state root, never above it.
 const privateDirs = new Set();
 
 function ensurePrivateDir(dir) {
   if (privateDirs.has(dir)) {
     return;
   }
+  const posix = process.platform !== "win32";
+  const root = stateRootOf(dir);
+  if (posix && root === FALLBACK_STATE_ROOT_DIR) {
+    fs.mkdirSync(root, { recursive: true, mode: PRIVATE_DIR_MODE });
+    assertPrivateStateRoot(root);
+  }
   fs.mkdirSync(dir, { recursive: true, mode: PRIVATE_DIR_MODE });
-  if (process.platform !== "win32") {
+  if (posix) {
     fs.chmodSync(dir, PRIVATE_DIR_MODE);
-    fs.chmodSync(path.dirname(dir), PRIVATE_DIR_MODE);
+    for (let current = dir; root && current !== root; ) {
+      current = path.dirname(current);
+      try {
+        fs.chmodSync(current, PRIVATE_DIR_MODE);
+      } catch {
+        // A parent this user cannot change keeps its mode; the folder itself is private.
+      }
+    }
   }
   privateDirs.add(dir);
 }
@@ -154,6 +188,39 @@ function readJsonFile(filePath) {
       }
       sleepSync(20);
     }
+  }
+}
+
+// Record writers that read, compare and replace a job record hold `<job>.json.lock` for that
+// step, so a conditional rewrite cannot overwrite a record written in between. A holder keeps
+// the lock for one read and one rename; a lock still present after every retry is taken to be
+// left by a process that died while holding it, and is replaced once.
+const LOCK_RETRY_COUNT = 50;
+const LOCK_RETRY_DELAY_MS = 20;
+
+function withJobLock(jobFile, body) {
+  const lockFile = `${jobFile}.lock`;
+  ensurePrivateDir(path.dirname(jobFile));
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.closeSync(fs.openSync(lockFile, "wx", PRIVATE_FILE_MODE));
+      break;
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+      if (attempt === LOCK_RETRY_COUNT - 1) {
+        fs.rmSync(lockFile, { force: true });
+      } else if (attempt >= LOCK_RETRY_COUNT) {
+        throw new Error(`Could not lock the job record ${jobFile}; another process holds ${lockFile}.`);
+      }
+      sleepSync(LOCK_RETRY_DELAY_MS);
+    }
+  }
+  try {
+    return body();
+  } finally {
+    fs.rmSync(lockFile, { force: true });
   }
 }
 
@@ -211,9 +278,13 @@ function summarizeJob(record) {
   return summary;
 }
 
+// Legacy index files that could not be parsed, so each is reported once per process.
+const unreadableLegacyFiles = new Set();
+
 // Moves a `state.json` index into per-job files and `config.json`, then renames it to
 // `state.json.migrated`. Index fields win over a job file's fields, because the index was
-// written after the job file for every update.
+// written after the job file for every update. An index that cannot be parsed is left in place
+// with a warning on stderr.
 function migrateLegacyState(cwd) {
   for (const stateDir of candidateStateDirs(cwd)) {
     const legacyFile = path.join(stateDir, LEGACY_STATE_FILE_NAME);
@@ -223,8 +294,13 @@ function migrateLegacyState(cwd) {
     let legacy;
     try {
       legacy = readJsonFile(legacyFile) ?? {};
-    } catch {
-      legacy = {};
+    } catch (error) {
+      if (!unreadableLegacyFiles.has(legacyFile)) {
+        unreadableLegacyFiles.add(legacyFile);
+        const message = error instanceof Error ? error.message : String(error);
+        process.stderr.write(`warning: could not read ${legacyFile}: ${message}; it was left in place\n`);
+      }
+      continue;
     }
     for (const entry of Array.isArray(legacy.jobs) ? legacy.jobs : []) {
       if (typeof entry?.id !== "string" || !entry.id) {
@@ -291,17 +367,40 @@ export function writeJobFile(cwd, jobId, payload) {
   if (isRemoved(jobFile)) {
     return jobFile;
   }
-  const timestamp = nowIso();
-  storeRecord(jobFile, applyCancelMarker({ createdAt: timestamp, ...payload, updatedAt: timestamp }, jobFile));
+  withJobLock(jobFile, () => {
+    const timestamp = nowIso();
+    storeRecord(jobFile, applyCancelMarker({ createdAt: timestamp, ...payload, updatedAt: timestamp }, jobFile));
+  });
   return jobFile;
 }
 
-/** Reads and deletes a job's request, which holds its prompt. Returns null when absent. */
-export function takeJobRequest(cwd, jobId) {
-  const file = requestFile(resolveJobFile(cwd, jobId));
+/**
+ * Reads and deletes a job's request, which holds its prompt. Returns null when absent. A record
+ * written before requests had their own file holds the prompt itself: it is returned, and the
+ * record is rewritten without it unless another writer replaced the record in the meantime.
+ * `beforeReplace` runs between the first read and the rewrite.
+ */
+export function takeJobRequest(cwd, jobId, { beforeReplace } = {}) {
+  const jobFile = resolveJobFile(cwd, jobId);
+  const file = requestFile(jobFile);
   const request = readJsonFile(file);
-  fs.rmSync(file, { force: true });
-  return request;
+  if (request !== null) {
+    fs.rmSync(file, { force: true });
+    return request;
+  }
+  const record = readJsonFile(jobFile);
+  if (record?.request === undefined) {
+    return null;
+  }
+  beforeReplace?.();
+  withJobLock(jobFile, () => {
+    const current = readJsonFile(jobFile);
+    if (current && current.updatedAt === record.updatedAt && current.request !== undefined) {
+      const { request: _legacyRequest, ...stripped } = current;
+      writeJsonAtomic(jobFile, stripped);
+    }
+  });
+  return record.request;
 }
 
 /** Queues `text` for the worker running the job and returns the message id. */
@@ -329,7 +428,10 @@ function claimMessage(dir, id, suffix) {
   }
 }
 
-/** Takes the job's queued messages, oldest first. Each message is returned once. */
+/**
+ * Takes the job's queued messages, oldest first. Each message is returned once. A message file
+ * that cannot be parsed is claimed and skipped, so the others claimed in the same call are kept.
+ */
 export function takeJobMessages(cwd, jobId) {
   const dir = messagesDir(resolveJobFile(cwd, jobId));
   let names;
@@ -338,11 +440,19 @@ export function takeJobMessages(cwd, jobId) {
   } catch {
     return [];
   }
-  return names
-    .filter((name) => name.endsWith(".pending.json"))
-    .sort()
-    .map((name) => claimMessage(dir, name.slice(0, -".pending.json".length), "taken"))
-    .filter((message) => typeof message?.text === "string");
+  const messages = [];
+  for (const name of names.filter((entry) => entry.endsWith(".pending.json")).sort()) {
+    let message;
+    try {
+      message = claimMessage(dir, name.slice(0, -".pending.json".length), "taken");
+    } catch {
+      continue;
+    }
+    if (typeof message?.text === "string") {
+      messages.push(message);
+    }
+  }
+  return messages;
 }
 
 /** Takes back a queued message no worker has taken. Returns false when it was already taken. */
@@ -374,19 +484,24 @@ export function upsertJob(cwd, jobPatch, options = {}) {
   if (isRemoved(jobFile)) {
     return null;
   }
-  const existing = readJsonFile(jobFile);
-  if (options.onlyIf && !options.onlyIf(existing ? applyCancelMarker(existing, jobFile) : null)) {
+  const outcome = withJobLock(jobFile, () => {
+    const existing = readJsonFile(jobFile);
+    if (options.onlyIf && !options.onlyIf(existing ? applyCancelMarker(existing, jobFile) : null)) {
+      return null;
+    }
+    const timestamp = nowIso();
+    const next = existing
+      ? { ...existing, ...jobPatch, updatedAt: timestamp }
+      : { createdAt: timestamp, updatedAt: timestamp, ...jobPatch };
+    return { stored: storeRecord(jobFile, applyCancelMarker(next, jobFile)), created: !existing };
+  });
+  if (!outcome) {
     return null;
   }
-  const timestamp = nowIso();
-  const next = existing
-    ? { ...existing, ...jobPatch, updatedAt: timestamp }
-    : { createdAt: timestamp, updatedAt: timestamp, ...jobPatch };
-  const stored = storeRecord(jobFile, applyCancelMarker(next, jobFile));
-  if (!existing) {
+  if (outcome.created) {
     pruneFinishedJobs(cwd);
   }
-  return stored;
+  return outcome.stored;
 }
 
 /** Lists job summaries from every state root, without request and result fields. */
@@ -419,10 +534,8 @@ export function listJobs(cwd) {
       if (typeof record?.id !== "string" || jobs.has(record.id)) {
         continue;
       }
-      // Records written before requests had their own file still hold the prompt.
-      if (record.request !== undefined) {
-        record = storeRecord(jobFile, record);
-      }
+      // A record written before requests had their own file still holds the prompt; the summary
+      // leaves it out, and the worker moves it out of the record when it starts.
       jobs.set(record.id, summarizeJob(applyCancelMarker(record, jobFile)));
     }
   }
@@ -481,6 +594,11 @@ function pruneFinishedJobs(cwd) {
 export function markJobCancelled(cwd, jobId) {
   const jobFile = resolveJobFile(cwd, jobId);
   fs.writeFileSync(markerFile(jobFile, CANCELLED_MARKER_SUFFIX), `${nowIso()}\n`, "utf8");
+}
+
+/** Returns true when the job's cancel marker exists. */
+export function isJobCancelled(cwd, jobId) {
+  return fs.existsSync(markerFile(resolveJobFile(cwd, jobId), CANCELLED_MARKER_SUFFIX));
 }
 
 /**

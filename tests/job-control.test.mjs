@@ -8,7 +8,14 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run, stopTestBrokers } from "./helpers.mjs";
-import { reconcileJobLiveness, terminateJobProcesses, WORKER_START_GRACE_MS } from "../plugins/agent/scripts/lib/job-control.mjs";
+import {
+  buildStatusSnapshot,
+  readJobProgressPreview,
+  reconcileJobLiveness,
+  resolveResultJob,
+  terminateJobProcesses,
+  WORKER_START_GRACE_MS
+} from "../plugins/agent/scripts/lib/job-control.mjs";
 import { readProcessCommandLines } from "../plugins/agent/scripts/lib/process.mjs";
 import { listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "../plugins/agent/scripts/lib/state.mjs";
 
@@ -27,9 +34,9 @@ const noInterrupt = async () => {};
 
 test("a running job whose worker exited is stored as failed", async () => {
   const workspace = makeTempDir();
-  upsertJob(workspace, { id: "task-dead", status: "running", pid: exitedPid() });
+  upsertJob(workspace, { id: "task-dead", status: "running", pid: 424240 });
 
-  const reaped = await reconcileJobLiveness(workspace, { interruptTurn: noInterrupt });
+  const reaped = await reconcileJobLiveness(workspace, { isAlive: alwaysDead, interruptTurn: noInterrupt });
 
   assert.deepEqual(reaped, ["task-dead"]);
   const stored = readJobFile(resolveJobFile(workspace, "task-dead"));
@@ -161,4 +168,112 @@ test("task --resume-last is not blocked by a task whose worker exited", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
+});
+
+test("a job whose pid now belongs to another program is failed", async (t) => {
+  const workspace = makeTempDir(t);
+  upsertJob(workspace, { id: "task-reused", status: "running", pid: 5001, threadId: "thr_r", turnId: "turn_r" });
+  upsertJob(workspace, { id: "task-live", status: "running", pid: 5002 });
+  const interrupted = [];
+
+  const reaped = await reconcileJobLiveness(workspace, {
+    isAlive: () => true,
+    readCommandLines: () =>
+      new Map([
+        [5001, "notepad.exe"],
+        [5002, "node codex-companion.mjs task-worker --job-id task-live"]
+      ]),
+    async interruptTurn(_root, job) {
+      interrupted.push(job.id);
+    }
+  });
+
+  assert.deepEqual(reaped, ["task-reused"]);
+  assert.deepEqual(interrupted, ["task-reused"]);
+  const reused = readJobFile(resolveJobFile(workspace, "task-reused"));
+  assert.equal(reused.status, "failed");
+  assert.match(reused.errorMessage, /another program/);
+  assert.equal(readJobFile(resolveJobFile(workspace, "task-live")).status, "running");
+});
+
+test("a failed process lookup keeps a live job running", async (t) => {
+  const workspace = makeTempDir(t);
+  upsertJob(workspace, { id: "task-unknown", status: "running", pid: 5003 });
+
+  const reaped = await reconcileJobLiveness(workspace, { isAlive: () => true, readCommandLines: () => null });
+
+  assert.deepEqual(reaped, []);
+  assert.equal(readJobFile(resolveJobFile(workspace, "task-unknown")).status, "running");
+});
+
+test("a queued job with an unreadable createdAt fails after the grace period from updatedAt", async (t) => {
+  const workspace = makeTempDir(t);
+  writeJobFile(workspace, "task-bad-date", { id: "task-bad-date", status: "queued", pid: null, createdAt: "not a date" });
+  const updatedAt = Date.parse(readJobFile(resolveJobFile(workspace, "task-bad-date")).updatedAt);
+
+  assert.deepEqual(await reconcileJobLiveness(workspace, { now: updatedAt + WORKER_START_GRACE_MS - 1000 }), []);
+  assert.deepEqual(await reconcileJobLiveness(workspace, { now: updatedAt + WORKER_START_GRACE_MS + 1000 }), [
+    "task-bad-date"
+  ]);
+});
+
+test("result for a running job says it is still running", (t) => {
+  const workspace = makeTempDir(t);
+  upsertJob(workspace, { id: "task-done", status: "completed" });
+  upsertJob(workspace, { id: "task-busy", status: "running", pid: 5004 });
+
+  assert.throws(() => resolveResultJob(workspace, "task-busy"), /Job task-busy is still running/);
+  assert.throws(() => resolveResultJob(workspace, "task-nope"), /No job found for "task-nope"/);
+  assert.equal(resolveResultJob(workspace, "task-done").job.id, "task-done");
+});
+
+test("active jobs do not take slots from the recent list", async (t) => {
+  const workspace = makeTempDir(t);
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 3));
+  for (let index = 0; index < 3; index += 1) {
+    upsertJob(workspace, { id: `task-finished-${index}`, status: "completed" });
+    await tick();
+  }
+  for (let index = 0; index < 9; index += 1) {
+    upsertJob(workspace, { id: `task-running-${index}`, status: "running", pid: 6000 + index });
+    await tick();
+  }
+
+  const snapshot = buildStatusSnapshot(workspace, { maxJobs: 8, env: {} });
+
+  assert.equal(snapshot.running.length, 9);
+  assert.equal(snapshot.latestFinished.id, "task-finished-2");
+  assert.deepEqual(
+    snapshot.recent.map((job) => job.id),
+    ["task-finished-1", "task-finished-0"]
+  );
+});
+
+test("status reads only the tail of a large log", (t) => {
+  const workspace = makeTempDir(t);
+  const logFile = path.join(workspace, "big.log");
+  const filler = `[2026-01-01T00:00:00.000Z] filler ${"z".repeat(100)}\n`;
+  const fd = fs.openSync(logFile, "w");
+  try {
+    const block = filler.repeat(1000);
+    for (let written = 0; written < 10 * 1024 * 1024; written += block.length) {
+      fs.writeSync(fd, block);
+    }
+    for (let index = 1; index <= 5; index += 1) {
+      fs.writeSync(fd, `[2026-01-01T00:00:01.000Z] TAIL_LINE_${index}\n`);
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  const readFileSync = fs.readFileSync;
+  t.mock.method(fs, "readFileSync", (file, ...rest) => {
+    if (path.resolve(String(file)) === logFile) {
+      throw new Error("the whole log was read");
+    }
+    return readFileSync.call(fs, file, ...rest);
+  });
+
+  const preview = readJobProgressPreview(logFile, 4);
+
+  assert.deepEqual(preview, ["TAIL_LINE_2", "TAIL_LINE_3", "TAIL_LINE_4", "TAIL_LINE_5"]);
 });
