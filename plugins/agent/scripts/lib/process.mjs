@@ -39,20 +39,25 @@ function findWindowsExecutable(command, env) {
 
 // cmd.exe expands %NAME% even inside double quotes and cannot pass a double quote or a
 // line break through to a batch file intact, so those arguments are refused rather than
-// altered.
+// altered. A quoted argument doubles its trailing backslashes, so the program behind the batch
+// file reads them as backslashes and not as an escaped closing quote.
 function quoteForCmd(value) {
   const text = String(value);
   if (/[%"\r\n]/.test(text)) {
     throw new Error(`Cannot pass an argument containing %, ", or a line break to a batch file: ${text}`);
   }
-  return text === "" || /[\s&|<>^(),;=!]/.test(text) ? `"${text}"` : text;
+  if (text !== "" && !/[\s&|<>^(),;=!]/.test(text)) {
+    return text;
+  }
+  return `"${text.replace(/\\+$/, (backslashes) => backslashes + backslashes)}"`;
 }
 
 /**
  * Returns how to spawn `command` without a shell choosing the interpreter. On Windows the
  * command is looked up through PATH and PATHEXT: an executable runs directly with its
  * argument array, and a batch file (such as the `.cmd` shim of an npm-installed CLI) runs through
- * `%ComSpec%`, because Node refuses to start batch files without one. `SHELL` is never read.
+ * `%ComSpec%`, because Node refuses to start batch files without one, with delayed expansion
+ * turned off so `!` in an argument stays as written. `SHELL` is never read.
  */
 export function resolveCommand(command, args = [], env = process.env, platform = process.platform) {
   if (platform !== "win32") {
@@ -68,19 +73,21 @@ export function resolveCommand(command, args = [], env = process.env, platform =
   const commandLine = [executable, ...args].map(quoteForCmd).join(" ");
   return {
     file: readWindowsEnv(env, "COMSPEC") || "cmd.exe",
-    args: ["/d", "/s", "/c", `"${commandLine}"`],
+    args: ["/d", "/v:off", "/s", "/c", `"${commandLine}"`],
     options: { windowsVerbatimArguments: true }
   };
 }
 
 // `shell: false` spawns `command` as given, never through cmd.exe, for callers whose
-// arguments must not be interpreted by a shell.
+// arguments must not be interpreted by a shell. `status` is null when the child did not exit
+// on its own, for example when a signal or the timeout ended it; `signal` then names the signal.
 export function runCommand(command, args = [], options = {}) {
+  const spawnSyncImpl = options.spawnSyncImpl ?? spawnSync;
   const spawnPlan =
     options.shell === false
       ? { file: command, args, options: {} }
       : resolveCommand(command, args, options.env ?? process.env);
-  const result = spawnSync(spawnPlan.file, spawnPlan.args, {
+  const result = spawnSyncImpl(spawnPlan.file, spawnPlan.args, {
     cwd: options.cwd,
     env: options.env,
     encoding: "utf8",
@@ -95,7 +102,7 @@ export function runCommand(command, args = [], options = {}) {
   return {
     command,
     args,
-    status: result.status ?? 0,
+    status: result.status ?? null,
     signal: result.signal ?? null,
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
@@ -108,10 +115,14 @@ export function runCommandChecked(command, args = [], options = {}) {
   if (result.error) {
     throw result.error;
   }
-  if (result.status !== 0) {
+  if (!exitedCleanly(result)) {
     throw new Error(formatCommandFailure(result));
   }
   return result;
+}
+
+function exitedCleanly(result) {
+  return result.signal === null && result.status === 0;
 }
 
 export function binaryAvailable(command, versionArgs = ["--version"], options = {}) {
@@ -122,8 +133,9 @@ export function binaryAvailable(command, versionArgs = ["--version"], options = 
   if (result.error) {
     return { available: false, detail: result.error.message };
   }
-  if (result.status !== 0) {
-    const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.status}`;
+  if (!exitedCleanly(result)) {
+    const ending = result.signal ? `signal ${result.signal}` : `exit ${result.status}`;
+    const detail = result.stderr.trim() || result.stdout.trim() || ending;
     return { available: false, detail };
   }
   return { available: true, detail: result.stdout.trim() || result.stderr.trim() || "ok" };
@@ -140,20 +152,28 @@ function looksLikeMissingProcessMessage(text) {
 export function readProcessCommandLines(pids, options = {}) {
   const platform = options.platform ?? process.platform;
   const runCommandImpl = options.runCommandImpl ?? runCommand;
+  const readFileImpl = options.readFileImpl ?? fs.readFileSync;
   const ids = [...new Set(pids.filter((pid) => Number.isInteger(pid) && pid > 0))];
   const found = new Map();
   if (ids.length === 0) {
     return found;
   }
 
+  // A process that exits while its /proc entry is read gives ENOENT or ESRCH, and a zombie has
+  // an empty command line; each counts as not running.
   if (platform === "linux") {
     for (const pid of ids) {
+      let commandLine;
       try {
-        found.set(pid, fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" ").trim());
+        commandLine = String(readFileImpl(`/proc/${pid}/cmdline`, "utf8")).split("\0").join(" ").trim();
       } catch (error) {
-        if (error?.code !== "ENOENT") {
-          return null;
+        if (error?.code === "ENOENT" || error?.code === "ESRCH") {
+          continue;
         }
+        return null;
+      }
+      if (commandLine) {
+        found.set(pid, commandLine);
       }
     }
     return found;
@@ -206,6 +226,7 @@ export function terminateProcessTree(pid, options = {}) {
   const killImpl = options.killImpl ?? process.kill.bind(process);
 
   if (platform === "win32") {
+    const aliveBefore = isProcessAlive(pid, killImpl);
     const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
       env: options.env
@@ -213,6 +234,14 @@ export function terminateProcessTree(pid, options = {}) {
 
     if (!result.error && result.status === 0) {
       return { attempted: true, delivered: true, method: "taskkill", result };
+    }
+
+    // taskkill exits 128 when a process it was asked to stop is not running, in every display
+    // language. That is the root itself, or a tree member that exited while taskkill ran; only
+    // a root that was running before and is gone now was stopped by this call.
+    if (!result.error && result.status === 128) {
+      const delivered = aliveBefore && !isProcessAlive(pid, killImpl);
+      return { attempted: true, delivered, method: "taskkill", result };
     }
 
     const combinedOutput = `${result.stderr}\n${result.stdout}`.trim();
@@ -246,23 +275,21 @@ export function terminateProcessTree(pid, options = {}) {
     throw new Error(formatCommandFailure(result));
   }
 
+  // A process that is not a group leader has no group of its own, so a failed group kill,
+  // ESRCH included, falls back to signalling the process alone.
   try {
     killImpl(-pid, "SIGTERM");
     return { attempted: true, delivered: true, method: "process-group" };
-  } catch (error) {
-    if (error?.code !== "ESRCH") {
-      try {
-        killImpl(pid, "SIGTERM");
-        return { attempted: true, delivered: true, method: "process" };
-      } catch (innerError) {
-        if (innerError?.code === "ESRCH") {
-          return { attempted: true, delivered: false, method: "process" };
-        }
-        throw innerError;
+  } catch {
+    try {
+      killImpl(pid, "SIGTERM");
+      return { attempted: true, delivered: true, method: "process" };
+    } catch (innerError) {
+      if (innerError?.code === "ESRCH") {
+        return { attempted: true, delivered: false, method: "process" };
       }
+      throw innerError;
     }
-
-    return { attempted: true, delivered: false, method: "process-group" };
   }
 }
 

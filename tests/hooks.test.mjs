@@ -31,7 +31,7 @@ test("repeated SessionStart runs add each export once and keep other hooks' line
   const envFile = path.join(cwd, "env.sh");
   fs.writeFileSync(envFile, "export OTHER=1\n");
 
-  for (let run = 0; run < 5; run += 1) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
     runSessionStart(envFile, "sess-1", cwd);
   }
 
@@ -71,8 +71,12 @@ test("stdin reads retry EAGAIN until the full payload arrives", () => {
       if (step === 0) {
         return 0;
       }
-      step.copy(buffer);
-      return step.length;
+      const count = Math.min(step.length, buffer.length);
+      step.copy(buffer, 0, 0, count);
+      if (count < step.length) {
+        steps.unshift(step.subarray(count));
+      }
+      return count;
     }
   });
 

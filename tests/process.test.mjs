@@ -5,9 +5,20 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveCommand, runCommand, terminateProcessTree } from "../plugins/agent/scripts/lib/process.mjs";
+import {
+  binaryAvailable,
+  readProcessCommandLines,
+  resolveCommand,
+  runCommand,
+  runCommandChecked,
+  terminateProcessTree
+} from "../plugins/agent/scripts/lib/process.mjs";
 
 const windowsOnly = { skip: process.platform !== "win32" && "Windows command resolution" };
+
+function missingProcessKill() {
+  throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+}
 
 function writeArgvBatch(dir, name) {
   const script = path.join(dir, "print-argv.cjs");
@@ -75,6 +86,7 @@ test("terminateProcessTree refuses process-group and own PIDs", () => {
 });
 
 test("terminateProcessTree reports delivery when taskkill fails after the root exited", () => {
+  let probes = 0;
   const outcome = terminateProcessTree(1234, {
     platform: "win32",
     runCommandImpl(command, args) {
@@ -88,11 +100,13 @@ test("terminateProcessTree reports delivery when taskkill fails after the root e
         error: null
       };
     },
+    // The root is running when taskkill starts and gone once it returns.
     killImpl(pid, signal) {
       assert.equal(signal, 0);
-      const error = new Error("no such process");
-      error.code = "ESRCH";
-      throw error;
+      probes += 1;
+      if (probes > 1) {
+        missingProcessKill();
+      }
     }
   });
 
@@ -156,11 +170,99 @@ test("terminateProcessTree treats missing Windows processes as already stopped",
         stderr: "",
         error: null
       };
-    }
+    },
+    killImpl: missingProcessKill
   });
 
   assert.equal(outcome.attempted, true);
+  assert.equal(outcome.delivered, false);
   assert.equal(outcome.method, "taskkill");
   assert.equal(outcome.result.status, 128);
   assert.match(outcome.result.stdout, /not found/i);
+});
+
+test("a localized taskkill message for a missing process is not delivered", () => {
+  const outcome = terminateProcessTree(1234, {
+    platform: "win32",
+    runCommandImpl(command, args) {
+      return {
+        command,
+        args,
+        status: 128,
+        signal: null,
+        stdout: "",
+        stderr: "FEHLER: Der Prozess wurde nicht gefunden.",
+        error: null
+      };
+    },
+    killImpl() {}
+  });
+
+  assert.equal(outcome.delivered, false);
+  assert.equal(outcome.method, "taskkill");
+});
+
+test("terminateProcessTree signals the process when its group is gone", () => {
+  const calls = [];
+  const outcome = terminateProcessTree(1234, {
+    platform: "linux",
+    killImpl(pid, signal) {
+      calls.push([pid, signal]);
+      if (pid < 0) {
+        missingProcessKill();
+      }
+    }
+  });
+
+  assert.deepEqual(calls, [
+    [-1234, "SIGTERM"],
+    [1234, "SIGTERM"]
+  ]);
+  assert.equal(outcome.delivered, true);
+  assert.equal(outcome.method, "process");
+});
+
+test("a child ended by a signal is a failure", () => {
+  const spawnSyncImpl = () => ({ status: null, signal: "SIGTERM", stdout: "", stderr: "" });
+  const result = runCommand(process.execPath, ["-e", "0"], { shell: false, spawnSyncImpl });
+  assert.equal(result.status, null);
+  assert.equal(result.signal, "SIGTERM");
+  assert.throws(() => runCommandChecked(process.execPath, ["-e", "0"], { shell: false, spawnSyncImpl }), /signal=SIGTERM/);
+  assert.equal(binaryAvailable(process.execPath, ["--version"], { shell: false, spawnSyncImpl }).available, false);
+});
+
+test("readProcessCommandLines counts a vanished Linux process as not running", () => {
+  const reads = {
+    "/proc/11/cmdline": () => {
+      throw Object.assign(new Error("missing"), { code: "ENOENT" });
+    },
+    "/proc/12/cmdline": () => {
+      throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    },
+    "/proc/13/cmdline": () => "",
+    "/proc/14/cmdline": () => "node\0worker.mjs\0"
+  };
+  const found = readProcessCommandLines([11, 12, 13, 14], {
+    platform: "linux",
+    readFileImpl: (file) => reads[file]()
+  });
+  assert.deepEqual([...found], [[14, "node worker.mjs"]]);
+});
+
+test("resolveCommand turns off delayed expansion for batch files", windowsOnly, () => {
+  const dir = makeTempDir();
+  fs.writeFileSync(path.join(dir, "codex.cmd"), "");
+  const plan = resolveCommand("codex", ["a!b"], { PATH: dir, PATHEXT: ".EXE;.CMD" }, "win32");
+  assert.deepEqual(plan.args.slice(0, 4), ["/d", "/v:off", "/s", "/c"]);
+});
+
+test("a batch-file argument with a space and a trailing backslash reaches the batch file unchanged", windowsOnly, () => {
+  const dir = makeTempDir();
+  writeArgvBatch(dir, "echo-args");
+  const input = ["C:\\dir with space\\", "a!b!c", "C:\\plain\\", "last"];
+  const result = runCommand("echo-args", input, {
+    env: { ...process.env, PATH: `${dir};${process.env.PATH}` }
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), input);
 });
