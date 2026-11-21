@@ -14,13 +14,17 @@ concurrency:
 
 jobs:
   test:
-    name: Test (${{ matrix.os }})
+    name: Test (${{ matrix.os }}, ${{ matrix.shard }}/4)
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        # The suite starts many processes that share one SQLite store per test. Test files that run
+        # side by side on a small runner push those tests past their time limits, so each shard
+        # runs its files one after another.
+        shard: [1, 2, 3, 4]
 
     steps:
       - name: Check out repository
@@ -35,8 +39,21 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Real-time scanning of each new file and process stalls the store tests on Windows runners.
+      - name: Exclude the test folders from Defender scanning
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE, $env:RUNNER_TEMP, $env:TEMP, (Join-Path $env:LOCALAPPDATA 'Temp')
+          Add-MpPreference -ExclusionProcess node.exe, git.exe
+
+      # As npm does for its scripts, so the tests find the Codex CLI of the dev dependencies.
+      - name: Put the dependency commands on the path
+        shell: bash
+        run: echo "${{ github.workspace }}/node_modules/.bin" >> "$GITHUB_PATH"
+
       - name: Run test suite
-        run: npm test
+        run: node --import ./tests/test-env.mjs --test --test-concurrency=1 --test-shard=${{ matrix.shard }}/4 "tests/*.test.mjs"
 
   typecheck:
     name: Type check
