@@ -350,8 +350,11 @@ async function removeWorktreeCommand(options, positionals) {
   let outcome;
   try {
     const deadline = Date.now() + RELEASE_WAIT_MS;
+    // A label can pass to another chain while this waits, so every try names the chain that the
+    // reference meant at the start, by the id of its first job.
+    const pinned = resolveFirstJob(store, ref).firstId ?? ref;
     for (;;) {
-      outcome = removePluginWorktree(ref, { cwd, stateDir, store, identity, force });
+      outcome = removePluginWorktree(pinned, { cwd, stateDir, store, identity, force });
       if (outcome.ok || !String(outcome.message).includes(RELEASE_PENDING) || Date.now() >= deadline) {
         break;
       }
