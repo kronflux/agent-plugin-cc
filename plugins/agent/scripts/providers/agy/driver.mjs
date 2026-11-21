@@ -21,7 +21,7 @@ import {
   startSilenceWatch,
   writeAgyPrompt
 } from "./runtime.mjs";
-import { AGY_WRITE_TOOL_NAMES, changedPaths, readOnlyGuardMode, snapshotWorkingTree } from "./readonly-guard.mjs";
+import { AGY_READ_TOOL_NAMES, AGY_WRITE_TOOL_NAMES, changedPaths, readOnlyGuardMode, snapshotWorkingTree } from "./readonly-guard.mjs";
 
 // The Antigravity driver of the store worker (see "The provider driver contract" in
 // lib/tracked-jobs.mjs): one agy process per execution, one stdin line, and the events of that
@@ -240,7 +240,8 @@ export function createAgyDriver(job = null, { env = process.env } = {}) {
       // A task without --write is guarded: the working tree is compared before the turn and after its
       // process exited, and the stream is watched for write tools.
       const workingFolder = ctx.cwd ?? row.cwd;
-      const guard = !request.review && sandboxModeOf(request) === "read-only" ? readOnlyGuardMode(ctx.env ?? env) : "off";
+      const readOnly = sandboxModeOf(request) === "read-only";
+      const guard = !request.review && readOnly ? readOnlyGuardMode(ctx.env ?? env) : "off";
       const before = guard === "on" ? await snapshotWorkingTree(workingFolder) : null;
       let guardedOutcome = null;
       adapter = createAgyEventAdapter();
@@ -296,7 +297,7 @@ export function createAgyDriver(job = null, { env = process.env } = {}) {
             ctx.onReceipt(receiptClientId);
           }
           if (event.type === "result") {
-            const outcome = adapter.outcome({ code: 0, signal: null, conversationId: row.thread_id ?? null });
+            const outcome = adapter.outcome({ code: 0, signal: null, conversationId: row.thread_id ?? null, readOnly });
             if (guard === "on") {
               // The guarded turn is decided once agy has exited, so its input ends here.
               guardedOutcome = outcome;
@@ -316,9 +317,9 @@ export function createAgyDriver(job = null, { env = process.env } = {}) {
           if (!turnSettled && guardedOutcome) {
             const after = await snapshotWorkingTree(workingFolder);
             const changed = before && after ? changedPaths(before, after) : [];
-            settleTurn(taskOutcome(guardedOutcome, request, { guard: "on", changedPaths: changed, writeToolNames: AGY_WRITE_TOOL_NAMES }));
+            settleTurn(taskOutcome(guardedOutcome, request, { guard: "on", changedPaths: changed, writeToolNames: AGY_WRITE_TOOL_NAMES, readToolNames: AGY_READ_TOOL_NAMES }));
           } else if (!turnSettled) {
-            const outcome = adapter.outcome({ code, signal, stderr: stderr.trim(), conversationId: row.thread_id ?? null });
+            const outcome = adapter.outcome({ code, signal, stderr: stderr.trim(), conversationId: row.thread_id ?? null, readOnly });
             settleTurn({ status: outcome.status, text: outcome.text, json: outcome.json, error: outcome.error });
           }
           schema?.remove();

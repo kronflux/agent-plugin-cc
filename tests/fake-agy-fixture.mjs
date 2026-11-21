@@ -50,7 +50,10 @@ const LINGERING = new Set(["slow", "hang", "silent", "chatty-silent", "replay-th
 // - "schema-prose-json": prose ending in {"answer":"x"} and no structured output.
 // - "denied-with-schema": denied_actions and the structured output in one SUCCESS result.
 // - "write-tool": a write_file tool step on a path outside the working folder, then the answer.
-// - "edit-readme": appends one line to README.md in the working folder, then answers.
+// - "edit-readme": runs a tool step that is not a reading tool, appends one line to README.md in
+//   the working folder, then answers.
+// - "outside-change": appends one line to README.md with no tool step, as another program would,
+//   then answers.
 // With --json-schema the structured output is a review object for the review schema (which has a
 // verdict property), and otherwise holds each of the schema's required keys with a string value.
 // - `agy --print /usage --output-format json` prints the quota object of agy 1.5.10 and exits;
@@ -333,10 +336,21 @@ function specialTurn() {
       finishTurn({ response: "I wrote the notes.\\n" });
       return true;
     }
-    case "edit-readme":
+    case "edit-readme": {
+      // A tool that is not a reading tool ran (here a server tool), and the file changed.
+      const toolInfo = { display_name: "Tool", summary: "mcp_tool" };
+      emit({ event: "step_update", step_update: { conversation_id: conversationId, step_index: step, state: "ACTIVE", step_type: "tool", tool_name: "mcp_tool", tool_info: toolInfo } });
       fs.appendFileSync(require("node:path").join(process.cwd(), "README.md"), "edited by the fake agy\\n");
+      emit({ event: "step_update", step_update: { conversation_id: conversationId, step_index: step++, state: "DONE", step_type: "tool", tool_name: "mcp_tool", duration_seconds: 0.1, tool_info: toolInfo } });
       agentText("I edited the README.");
       finishTurn({ response: "I edited the README.\\n" });
+      return true;
+    }
+    case "outside-change":
+      // The file changes while the turn runs, and the turn itself runs no tool.
+      fs.appendFileSync(require("node:path").join(process.cwd(), "README.md"), "changed by another program\\n");
+      agentText("I only answered.");
+      finishTurn({ response: "I only answered.\\n" });
       return true;
     default:
       return false;

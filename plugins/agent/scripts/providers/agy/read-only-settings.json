@@ -1,1 +1,1 @@
-{"permissions":{"deny":["write_file(*)","command(*)"]}}
+{"permissions":{"deny":["write_file(*)","command(*)"],"allow":["read_file(*)","read_url(*)"]}}

@@ -121,14 +121,16 @@ test("a background agy task completes with its response in the store", async (t)
   assert.match(agyRun.args.join(" "), /--sandbox --settings \S+read-only-settings\.json/);
 });
 
-test("write tasks keep the terminal sandbox without the read-only settings", (t) => {
+test("write tasks get the settings that allow every tool, since print mode cannot ask", (t) => {
   const ctx = makeRepo(undefined, t);
   const result = run("node", [AGY, "task", "--write", "--json", "edit", "it"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(result.status, 0, result.stderr);
   const args = readFakeAgyState(ctx.binDir).runs[0].args;
   assert.ok(args.includes("--sandbox"));
   assert.ok(!args.includes("--mode"));
-  assert.ok(!args.includes("--settings"));
+  assert.match(args.join(" "), /--settings \S+write-settings\.json/);
+  const settings = JSON.parse(fs.readFileSync(args[args.indexOf("--settings") + 1], "utf8"));
+  assert.deepEqual(settings, { permissions: { allow: ["write_file(*)", "command(*)", "read_file(*)", "read_url(*)", "mcp(*)"] } });
 });
 
 // A stand-in child process whose stdin records every write.
@@ -202,11 +204,12 @@ test("normal, read-only, review and continuation turns use the same argv and std
   }
   const [readOnly, write, continued, review] = runs;
   const settingsOf = (args) => (args.includes("--settings") ? JSON.parse(fs.readFileSync(args[args.indexOf("--settings") + 1], "utf8")) : null);
-  const denyWrites = { permissions: { deny: ["write_file(*)", "command(*)"] } };
+  const denyWrites = { permissions: { deny: ["write_file(*)", "command(*)"], allow: ["read_file(*)", "read_url(*)"] } };
   assert.ok(readOnly.args.includes("--sandbox"));
   assert.deepEqual(settingsOf(readOnly.args), denyWrites);
   assert.ok(write.args.includes("--sandbox"));
-  assert.equal(settingsOf(write.args), null);
+  assert.deepEqual(settingsOf(write.args).permissions.allow.slice(0, 2), ["write_file(*)", "command(*)"]);
+  assert.equal(settingsOf(write.args).permissions.deny, undefined);
   assert.equal(continued.args[continued.args.indexOf("--conversation") + 1], "conv-1");
   assert.deepEqual(settingsOf(continued.args), denyWrites);
   assert.ok(review.args.includes("--json-schema"));
@@ -1595,12 +1598,12 @@ test("agy question-schema conflicts are refused before any job", (t) => {
 });
 
 // ---------------------------------------------------------------------------------------------
-// Each denial source fails a turn
+// Each denial source fails a write-capable turn; a read-only turn that still answers completes
 
-test("denied_actions alone fails the turn", (t) => {
+test("denied_actions alone fails a write-capable turn", (t) => {
   const ctx = makeRepo("denied-actions-only", t);
 
-  const { result, stored, reply } = runEndedTask(ctx, ["read", "it"]);
+  const { result, stored, reply } = runEndedTask(ctx, ["--write", "read", "it"]);
 
   assert.equal(result.status, 1, result.stdout);
   assert.equal(stored.end_state, "failed", JSON.stringify(stored));
@@ -1608,10 +1611,31 @@ test("denied_actions alone fails the turn", (t) => {
   assert.ok(!reply.error.includes(" on "), reply.error);
 });
 
-test("a TOOL_ERROR event alone fails the turn", (t) => {
+test("a TOOL_ERROR event alone fails a write-capable turn", (t) => {
   const ctx = makeRepo("tool-error-only", t);
 
-  const { result, stored, reply } = runEndedTask(ctx, ["run", "ping"]);
+  const { result, stored, reply } = runEndedTask(ctx, ["--write", "run", "ping"]);
+
+  assert.equal(result.status, 1, result.stdout);
+  assert.equal(stored.end_state, "failed", JSON.stringify(stored));
+  assert.match(reply.error, /^Antigravity was denied permission for command /);
+});
+
+test("a read-only turn that was refused a command and still answers completes", (t) => {
+  for (const behavior of ["denied-actions-only", "tool-error-only"]) {
+    const ctx = makeRepo(behavior, t);
+
+    const { result, stored } = runEndedTask(ctx, ["read", "it"]);
+
+    assert.equal(result.status, 0, `${behavior}: ${result.stdout}${result.stderr}`);
+    assert.equal(stored.end_state, "completed", JSON.stringify(stored));
+  }
+});
+
+test("a read-only turn that was refused and gives no answer fails with the refusal", (t) => {
+  const ctx = makeRepo("denied", t);
+
+  const { result, stored, reply } = runEndedTask(ctx, ["read", "it"]);
 
   assert.equal(result.status, 1, result.stdout);
   assert.equal(stored.end_state, "failed", JSON.stringify(stored));
@@ -1712,11 +1736,21 @@ for (const [name, behavior] of [["a schema turn without structured output fails"
   });
 }
 
-test("a denial outranks a structured answer", (t) => {
+test("in a read-only turn a structured answer stands although a command was refused", (t) => {
   const ctx = makeRepo("denied-with-schema", t);
   const schema = writeSchema(ctx.repo, "schema.json", ["answer"]);
 
   const result = run("node", [AGY, "task", "--json", "--output-schema", schema, "x"], { cwd: ctx.repo, env: ctx.env });
+
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(JSON.parse(result.stdout).status, "completed");
+});
+
+test("in a write-capable turn a denial outranks a structured answer", (t) => {
+  const ctx = makeRepo("denied-with-schema", t);
+  const schema = writeSchema(ctx.repo, "schema.json", ["answer"]);
+
+  const result = run("node", [AGY, "task", "--write", "--json", "--output-schema", schema, "x"], { cwd: ctx.repo, env: ctx.env });
 
   assert.equal(result.status, 1, result.stdout);
   const reply = JSON.parse(result.stdout);
@@ -1875,6 +1909,15 @@ test("with the guard on, a read-only task that edits a file fails and names it",
   assert.equal(ended.status, "failed");
   assert.equal(ended.error, "Antigravity edited files during a read-only task: README.md");
   await spawned.exited;
+});
+
+test("a file that another program changed during a turn without tools is not blamed on the turn", (t) => {
+  const ctx = makeRepo("outside-change", t);
+
+  const result = run("node", [AGY, "task", "--json", "answer", "only"], { cwd: ctx.repo, env: { ...ctx.env, ...GUARD_ON } });
+
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(JSON.parse(result.stdout).status, "completed");
 });
 
 test("the guard sees an edit to a file that was already modified", (t) => {

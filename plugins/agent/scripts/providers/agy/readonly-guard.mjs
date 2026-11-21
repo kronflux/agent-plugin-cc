@@ -16,6 +16,9 @@ import { gitExecutable } from "../../lib/system-tools.mjs";
  */
 export const READ_ONLY_ENFORCED_BY_FLAGS = false;
 
+/** The tool names that only read; a turn that ran no other tool cannot have changed a file. */
+export const AGY_READ_TOOL_NAMES = Object.freeze(["read_file", "read_url", "invoke_subagent"]);
+
 /** The tool names whose call in a read-only turn counts as a write. */
 export const AGY_WRITE_TOOL_NAMES = Object.freeze(["write_file", "edit_file", "run_command"]);
 

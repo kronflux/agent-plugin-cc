@@ -335,18 +335,22 @@ export function readAgyModels(cwd) {
   return { ok: models.length > 0, models, detail: models.length > 0 ? `${models.length} models available` : "agy listed no models." };
 }
 
-// A session-only settings file that denies agy's file-writing and command tools. It is passed
-// with --settings on every read-only turn and leaves agy's own settings files untouched.
+// Session-only settings files, passed with --settings; they leave agy's own settings files
+// untouched. In print mode agy cannot ask for a permission, so it denies every tool call that
+// needs one: a turn gets exactly the permissions its file grants. The read-only file denies the
+// file-writing and command tools and allows reading files and URLs; the write file allows every
+// tool, so a write-capable job can edit files and run commands.
 export const AGY_READ_ONLY_SETTINGS = fileURLToPath(new URL("./read-only-settings.json", import.meta.url));
+export const AGY_WRITE_SETTINGS = fileURLToPath(new URL("./write-settings.json", import.meta.url));
 
-// Read-only turns run in the terminal sandbox with the deny settings; workspace-write keeps the
-// terminal sandbox; danger-full-access lifts it.
+// Read-only turns run in the terminal sandbox with the read-only settings. Write-capable turns
+// get the write settings; workspace-write also keeps agy's terminal sandbox, where the host has one.
 function sandboxArgs(sandboxMode) {
   if (sandboxMode === "danger-full-access") {
-    return [];
+    return ["--settings", AGY_WRITE_SETTINGS];
   }
   if (sandboxMode === "workspace-write") {
-    return ["--sandbox"];
+    return ["--sandbox", "--settings", AGY_WRITE_SETTINGS];
   }
   return ["--sandbox", "--settings", AGY_READ_ONLY_SETTINGS];
 }
@@ -571,7 +575,10 @@ export function classifyAgyOutcome(events, exit = {}) {
   if (exit.error) {
     return { ...outcome, error: String(exit.error) };
   }
-  if (deniedActions.length > 0) {
+  // In a read-only turn a refused write or command is the read-only rule at work: the turn still
+  // counts when it ends with an answer. A write-capable turn that was refused could not do its work.
+  const answered = result && isSuccess(result) && (result.response.trim() || json != null);
+  if (deniedActions.length > 0 && !(exit.readOnly && answered)) {
     return { ...outcome, error: [...new Set(deniedActions.map(deniedMessage))].join(" ") };
   }
   if (!result) {
@@ -634,10 +641,10 @@ const NO_STRUCTURED_OUTPUT_MESSAGE = "Antigravity returned no structured output.
  * Decides a finished turn from its adapter outcome, in a fixed order: (1) the failures of
  * classifyAgyOutcome keep their messages (a denial first); (2) with a schema, a turn without a
  * structured object fails, whatever its status and prose say, and a structured object is the
- * answer even without prose; (3) with the read-only guard on, a changed file or a write tool in the
- * stream fails the turn; (4) otherwise the turn completed.
+ * answer even without prose; (3) with the read-only guard on, a write tool in the stream fails the turn, and so does a
+ * changed file when the turn ran any tool other than a reading tool; (4) otherwise the turn completed.
  */
-export function classifyAgyTurn(turn, { schemaGiven = false, guard = "off", changedPaths = [], writeToolNames = [] } = {}) {
+export function classifyAgyTurn(turn, { schemaGiven = false, guard = "off", changedPaths = [], writeToolNames = [], readToolNames = [] } = {}) {
   if (turn.status !== "answer") {
     return { outcome: "failed", error: turn.error ?? NO_ANSWER_MESSAGE };
   }
@@ -645,8 +652,12 @@ export function classifyAgyTurn(turn, { schemaGiven = false, guard = "off", chan
     return { outcome: "failed", error: NO_STRUCTURED_OUTPUT_MESSAGE };
   }
   if (guard === "on") {
-    const written = (turn.toolEvents ?? []).filter((event) => writeToolNames.includes(event.name)).map((event) => event.path ?? event.name);
-    const edited = changedPaths.length > 0 ? changedPaths : written;
+    const tools = turn.toolEvents ?? [];
+    const written = tools.filter((event) => writeToolNames.includes(event.name)).map((event) => event.path ?? event.name);
+    // A changed file counts against the turn only when the turn ran a tool that can change one.
+    // With reading tools alone, another program changed the working tree while the turn ran.
+    const couldWrite = tools.some((event) => !readToolNames.includes(event.name));
+    const edited = changedPaths.length > 0 && couldWrite ? changedPaths : written;
     if (edited.length > 0) {
       return { outcome: "failed", error: `Antigravity edited files during a read-only task: ${[...new Set(edited)].join(", ")}` };
     }
