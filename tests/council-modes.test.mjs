@@ -676,3 +676,20 @@ test("a reply with a number that JSON cannot hold is left as it came and stays i
   const text = '{"schema":1,"stance":"A","sameAs":[],"responses":[],"added":[{"id":"f9","severity":"P3","claim":"c","path":"a.txt","line":1e400,"evidence":"e"}]}';
   assert.equal(normalizeAnswerBytes("council-round2-question", Buffer.from(text)).toString("utf8"), text);
 });
+
+test("a sameAs group of three answer labels is stored as its pairs and is valid", async () => {
+  const { normalizeAnswerBytes, validateAnswer } = await import("../plugins/agent/scripts/lib/council/validate.mjs");
+  const reply = { schema: 1, stance: "C", sameAs: [["A", "B", "C"]], responses: [], added: [] };
+  const context = { kind: "question", answerLabels: ["A", "B", "C"], ownAnswerLabel: "C", findings: [], ownFindingIds: [] };
+  assert.deepEqual(validateAnswer(2, reply, context).errors, ["sameAs[0]: must hold exactly two answer labels, got 3"]);
+
+  const normalised = JSON.parse(normalizeAnswerBytes("council-round2-question", Buffer.from(JSON.stringify(reply))).toString("utf8"));
+  assert.deepEqual(normalised.sameAs, [["A", "B"], ["A", "C"], ["B", "C"]]);
+  assert.deepEqual(validateAnswer(2, normalised, context).errors, []);
+
+  // Pairs stay as they are, and a group with an entry that is not a label is left for validation.
+  const pairs = { ...reply, sameAs: [["A", "C"]] };
+  assert.deepEqual(JSON.parse(normalizeAnswerBytes("council-round2-question", Buffer.from(JSON.stringify(pairs))).toString("utf8")).sameAs, [["A", "C"]]);
+  const odd = { ...reply, sameAs: [["A", 2, "C"]] };
+  assert.deepEqual(JSON.parse(normalizeAnswerBytes("council-round2-question", Buffer.from(JSON.stringify(odd))).toString("utf8")).sameAs, [["A", 2, "C"]]);
+});

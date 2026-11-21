@@ -547,15 +547,42 @@ function hasNonFiniteNumber(value) {
 
 /**
  * The bytes of a reply in the form the council stores and validates: the JSON object of the reply
- * with omitted nullable required properties set to null. A reply that holds no JSON object is
- * returned unchanged, so its validation reports it.
+ * with omitted nullable required properties set to null and a top-level `sameAs` group of three or
+ * more labels written as its pairs. A reply that holds no JSON object is returned unchanged, so
+ * its validation reports it.
  */
 export function normalizeAnswerBytes(schemaName, bytes) {
   const parsed = parseReplyObject(Buffer.from(bytes).toString("utf8"));
   if (parsed === undefined || parsed === null || typeof parsed !== "object" || Array.isArray(parsed) || hasNonFiniteNumber(parsed)) {
     return Buffer.from(bytes);
   }
-  return Buffer.from(JSON.stringify(fillNullable(loadCouncilSchema(schemaName), parsed)), "utf8");
+  return Buffer.from(JSON.stringify(pairSameAsGroups(fillNullable(loadCouncilSchema(schemaName), parsed))), "utf8");
+}
+
+// A seat that finds three or more answers alike often names them in one top-level `sameAs` group,
+// such as [["A", "B", "C"]], where the reply form asks for pairs. Such a group is written as its
+// pairs, so the slip costs the seat no repair turn. Anything else is left for validation.
+function pairSameAsGroups(reply) {
+  if (!Array.isArray(reply.sameAs)) {
+    return reply;
+  }
+  const isGroup = (entry) => Array.isArray(entry) && entry.length > 2 && entry.every((label) => typeof label === "string");
+  if (!reply.sameAs.some(isGroup)) {
+    return reply;
+  }
+  const pairs = [];
+  for (const entry of reply.sameAs) {
+    if (!isGroup(entry)) {
+      pairs.push(entry);
+      continue;
+    }
+    for (let first = 0; first < entry.length; first += 1) {
+      for (let second = first + 1; second < entry.length; second += 1) {
+        pairs.push([entry[first], entry[second]]);
+      }
+    }
+  }
+  return { ...reply, sameAs: pairs };
 }
 
 export function validateAnswer(round, answer, context = {}) {
