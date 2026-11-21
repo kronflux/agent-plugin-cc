@@ -54,6 +54,7 @@ const SCAN_DEADLINE_MS = 8000;
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 const INTEGRITY_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const LEADER_TIMEOUT_MS = 5000;
+const LEADER_IDENTITY_SCANS = 30;
 // A command that waits for a job, such as the delegate agent's result --wait, gets this long after
 // the job's event to return the outcome before the monitor announces it.
 const DELIVERY_GRACE_MS = 5000;
@@ -265,6 +266,7 @@ async function main() {
     }
   }
 
+  let leaderScans = 0;
   async function scan() {
     if (scanning || stopping) {
       scanRequested = scanning;
@@ -272,9 +274,18 @@ async function main() {
     }
     scanning = true;
     try {
-      if (leader && confirmIdentity(leader, await readProcessIdentity(leader.pid, { deadline: performance.now() + LEADER_TIMEOUT_MS })) === "absent") {
-        stop(0);
-        return;
+      if (leader) {
+        // The cheap check runs every scan. The identity query starts a helper process on Windows,
+        // so it runs only every LEADER_IDENTITY_SCANS scans, to catch a process id that was reused.
+        leaderScans += 1;
+        if (!isProcessAlive(leader.pid)) {
+          stop(0);
+          return;
+        }
+        if (leaderScans % LEADER_IDENTITY_SCANS === 0 && confirmIdentity(leader, await readProcessIdentity(leader.pid, { deadline: performance.now() + LEADER_TIMEOUT_MS })) === "absent") {
+          stop(0);
+          return;
+        }
       }
       const deadline = performance.now() + SCAN_DEADLINE_MS;
       await scanWorkspace(store, {
