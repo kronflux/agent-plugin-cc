@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildEnv, FAKE_DEBUG_SOL_MODELS, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { makeCommittedRepo, makeTempDir, stopOwnedProcesses, waitUntil } from "./helpers.mjs";
 import { isProcessAlive } from "../plugins/agent/scripts/lib/process.mjs";
-import { getConfig, listJobViews, resolveStateDir, setConfig } from "../plugins/agent/scripts/lib/state.mjs";
+import { getConfig, listJobViews, resolveStateDir, setConfig, setUserConfig, userConfigFile } from "../plugins/agent/scripts/lib/state.mjs";
 import { openStore } from "../plugins/agent/scripts/lib/store.mjs";
 import {
   listCatalogModels,
@@ -429,8 +429,8 @@ test("setup --model stores the delegation default and reports the model a delega
 
   const text = companion(ctx, ["setup"]);
   assert.equal(text.status, 0, text.stderr);
-  assert.match(text.stdout, /^- delegation model: gpt-5\.6-luna \(setting\)$/m);
-  assert.match(text.stdout, /^- delegation effort: high \(setting\)$/m);
+  assert.match(text.stdout, /^- delegation model: gpt-5\.6-luna \(project setting\)$/m);
+  assert.match(text.stdout, /^- delegation effort: high \(project setting\)$/m);
 
   // --effort alone keeps the stored model.
   setupJson(ctx, ["--effort", "medium"]);
@@ -605,4 +605,60 @@ test("setup warns that a model it could not check was stored unchecked", (t) => 
   assert.doesNotMatch(result.stdout, /Delegations now use model gpt-0-custom/);
   assert.match(result.stdout, /Stored model gpt-0-custom for delegations in .* without checking it\./);
   assert.deepEqual(getConfig(ctx.repo).models, { codex: { model: "gpt-0-custom", effort: null } });
+});
+
+// Stores `models` in the user config of this test process, which the companions it starts share,
+// and removes the file when the test ends.
+function useUserModels(t, models) {
+  setUserConfig("models", models);
+  t.after(() => fs.rmSync(userConfigFile(), { force: true }));
+}
+
+test("a fresh task uses the user setting when the workspace has none", (t) => {
+  const ctx = makeRepo(t);
+  useUserModels(t, { codex: { model: "luna", effort: "high" } });
+  firstTask(ctx);
+  const job = latestJob(ctx);
+  assert.equal(job.row.model, "gpt-5.6-luna");
+  assert.equal(job.request.effort, "high");
+  assert.equal(job.request.modelSource, "user-setting");
+  assert.equal(job.request.effortSource, "user-setting");
+});
+
+test("the workspace setting wins over the user setting, and a flag wins over both", (t) => {
+  const ctx = makeRepo(t);
+  useUserModels(t, { codex: { model: "luna", effort: "high" } });
+  setConfig(ctx.repo, "models", { codex: { model: "m-default", effort: null } });
+  firstTask(ctx);
+  let job = latestJob(ctx);
+  assert.equal(job.row.model, "m-default");
+  assert.equal(job.request.modelSource, "setting");
+  assert.equal(job.request.effort, "low");
+  firstTask(ctx, ["--model", "luna"]);
+  job = latestJob(ctx);
+  assert.equal(job.row.model, "gpt-5.6-luna");
+  assert.equal(job.request.modelSource, "explicit");
+});
+
+test("a workspace setting cleared by --model default uses the provider default, not the user model", (t) => {
+  const ctx = makeRepo(t);
+  useUserModels(t, { codex: { model: "luna", effort: "high" } });
+  setConfig(ctx.repo, "models", { codex: null });
+  firstTask(ctx);
+  const job = latestJob(ctx);
+  assert.equal(job.row.model, "m-default");
+  assert.equal(job.request.modelSource, "catalog-default");
+});
+
+test("a follow-up keeps its recorded model after the user setting changed", (t) => {
+  const ctx = makeRepo(t);
+  useUserModels(t, { codex: { model: "luna", effort: "high" } });
+  firstTask(ctx);
+  setUserConfig("models", { codex: { model: "m-default", effort: "low" } });
+  const resumed = companion(ctx, ["task", "--resume-last", "more"]);
+  assert.equal(resumed.status, 0, resumed.stderr);
+  const job = latestJob(ctx);
+  assert.equal(job.row.model, "gpt-5.6-luna");
+  assert.equal(job.request.effort, "high");
+  assert.equal(job.request.modelSource, "user-setting");
 });

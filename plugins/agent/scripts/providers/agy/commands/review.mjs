@@ -6,10 +6,10 @@ import { fileURLToPath } from "node:url";
 import { resolveCommandCwd } from "../../../lib/companion-cli.mjs";
 import { collectReviewContext } from "../../../lib/git.mjs";
 import { readRequesterIdentity } from "../../../lib/host.mjs";
-import { resolveModelSelection } from "../../../lib/model-selection.mjs";
+import { delegationOptions, resolveModelSelection } from "../../../lib/model-selection.mjs";
 import { renderReviewResult } from "../../../lib/render.mjs";
 import { buildReviewPrompt, parseReviewArguments, resolveReviewTarget } from "../../../lib/review-target.mjs";
-import { createJob, getConfig, InvalidLabelError } from "../../../lib/state.mjs";
+import { createJob, InvalidLabelError } from "../../../lib/state.mjs";
 import { resolveWorkspaceRoot } from "../../../lib/workspace.mjs";
 import { agyProvider } from "../index.mjs";
 import { ensureAgyAvailable, outsideFolders, readAgySavedModel } from "../runtime.mjs";
@@ -105,7 +105,7 @@ export async function handleReview(argv) {
   const selection = await resolveModelSelection(agyProvider, {
     model: options.model,
     effort: options.effort,
-    setting: getConfig(workspaceRoot).models?.[agyProvider.id] ?? null,
+    ...delegationOptions(agyProvider, workspaceRoot),
     cwd
   });
   for (const warning of selection.warnings ?? []) {

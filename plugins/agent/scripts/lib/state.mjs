@@ -315,6 +315,178 @@ export function setConfig(cwd, key, value) {
   return next;
 }
 
+// The settings that apply in every workspace, below each workspace's own config.
+const USER_CONFIG_FILE_NAME = "user-config.json";
+const USER_CONFIG_VERSION = 1;
+const USER_CONFIG_LOCK_RETRY_MS = 5000;
+// A lock file older than this was left by a process that ended inside its write.
+const USER_CONFIG_LOCK_STALE_MS = 30000;
+const warnedUserConfigFiles = new Set();
+
+/** The user config file: in the plugin data folder, else in the fallback state root. */
+export function userConfigFile() {
+  const pluginDataDir = getPluginDataDir();
+  return path.join(pluginDataDir || FALLBACK_STATE_ROOT_DIR, USER_CONFIG_FILE_NAME);
+}
+
+function defaultUserConfig() {
+  return { version: USER_CONFIG_VERSION, models: {} };
+}
+
+// Reads the user config file. Returns `{ config }`, or `{ error }` when the file exists but
+// cannot be read, does not parse, or has a version this plugin does not know.
+function readUserConfigFile(file) {
+  let stored;
+  try {
+    stored = readJsonFile(file);
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+  if (stored == null) {
+    return { config: defaultUserConfig() };
+  }
+  if (typeof stored !== "object" || Array.isArray(stored)) {
+    return { error: "it does not hold a JSON object" };
+  }
+  if (stored.version !== USER_CONFIG_VERSION) {
+    return { error: `it has version ${JSON.stringify(stored.version ?? null)}, and this plugin reads version ${USER_CONFIG_VERSION}` };
+  }
+  const models = stored.models && typeof stored.models === "object" && !Array.isArray(stored.models) ? stored.models : {};
+  return { config: { ...stored, version: USER_CONFIG_VERSION, models } };
+}
+
+/**
+ * The user config `{ version: 1, models, writeSandbox? }`. A missing file reads as the defaults;
+ * a file that cannot be read reads as the defaults with one warning per file and process.
+ */
+export function getUserConfig() {
+  const file = userConfigFile();
+  const read = readUserConfigFile(file);
+  if (read.error) {
+    if (!warnedUserConfigFiles.has(file)) {
+      warnedUserConfigFiles.add(file);
+      process.stderr.write(`warning: could not read ${file}: ${read.error}; the user settings are not used\n`);
+    }
+    return defaultUserConfig();
+  }
+  return read.config;
+}
+
+function readLockToken(file) {
+  try {
+    return fs.readFileSync(file, "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Takes the user config lock `lockFile` and returns the random token it now holds. The lock is
+ * created exclusively. A lock older than `staleMs` was left by a process that ended inside its
+ * write; it is recovered only by renaming it to a unique name, which one process alone can do,
+ * and the renamed file is checked to still hold the token that was judged stale. A fresh lock
+ * taken by mistake is put back. Throws, naming the lock file, when the lock stays held past
+ * `retryMs`. `hooks.beforeStaleRename` (tests) runs between the stale check and the rename.
+ * Exported for tests.
+ */
+export function acquireUserConfigLock(lockFile, { retryMs = USER_CONFIG_LOCK_RETRY_MS, staleMs = USER_CONFIG_LOCK_STALE_MS, hooks = null } = {}) {
+  ensurePrivateDir(path.dirname(lockFile));
+  const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
+  const deadline = Date.now() + retryMs;
+  for (let delay = 10; ; delay = Math.min(delay * 2, 100)) {
+    try {
+      fs.writeFileSync(lockFile, `${token}\n`, { flag: "wx", mode: PRIVATE_FILE_MODE });
+      return token;
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+    }
+    let stale = null;
+    try {
+      if (Date.now() - fs.statSync(lockFile).mtimeMs > staleMs) {
+        stale = readLockToken(lockFile);
+      }
+    } catch {
+      continue;
+    }
+    if (stale !== null) {
+      hooks?.beforeStaleRename?.();
+      const moved = `${lockFile}.stale-${token}`;
+      let renamed = false;
+      try {
+        fs.renameSync(lockFile, moved);
+        renamed = true;
+      } catch {
+        // Another process moved or released it first.
+      }
+      if (renamed) {
+        if (readLockToken(moved) === stale) {
+          fs.rmSync(moved, { force: true });
+          continue;
+        }
+        // The lock was replaced by a fresh one after the stale check: put it back, unless a third
+        // process has taken the free lock meanwhile; that holder and the owner of the moved lock
+        // then meet in `holdsUserConfigLock` before either writes.
+        try {
+          fs.linkSync(moved, lockFile);
+        } catch {
+          // The lock is held again; the owner of the moved one fails its check.
+        }
+        fs.rmSync(moved, { force: true });
+      }
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`The user settings file is locked by another setup (${lockFile}); try again.`);
+    }
+    sleepSync(delay);
+  }
+}
+
+/** True when `lockFile` still holds `token`. Exported for tests. */
+export function holdsUserConfigLock(lockFile, token) {
+  return readLockToken(lockFile) === token;
+}
+
+/** Removes `lockFile` only when it still holds `token`. Exported for tests. */
+export function releaseUserConfigLock(lockFile, token) {
+  if (holdsUserConfigLock(lockFile, token)) {
+    fs.rmSync(lockFile, { force: true });
+  }
+}
+
+/**
+ * Changes the user config under an exclusive lock: reads it, passes a copy to `mutator`, and
+ * writes the result atomically. A file that exists but cannot be read, or has an unknown version,
+ * is never overwritten; the call throws an error that names it. The lock is checked again just
+ * before the write, so a writer that lost it writes nothing. Returns the written config.
+ */
+export function updateUserConfig(mutator, lockOptions = {}) {
+  const file = userConfigFile();
+  const lockFile = `${file}.lock`;
+  const token = acquireUserConfigLock(lockFile, lockOptions);
+  try {
+    const read = readUserConfigFile(file);
+    if (read.error) {
+      throw new Error(`The user settings file ${file} cannot be used: ${read.error}. Fix or remove it, then run setup again.`);
+    }
+    const next = mutator(structuredClone(read.config)) ?? read.config;
+    const written = { ...next, version: USER_CONFIG_VERSION, models: next.models ?? {} };
+    if (!holdsUserConfigLock(lockFile, token)) {
+      throw new Error(`The user settings lock ${lockFile} was taken by another setup; nothing was written. Run setup again.`);
+    }
+    writeJsonAtomic(file, written);
+    return written;
+  } finally {
+    releaseUserConfigLock(lockFile, token);
+  }
+}
+
+/** Sets one key of the user config; see `updateUserConfig`. */
+export function setUserConfig(key, value) {
+  return updateUserConfig((config) => ({ ...config, [key]: value }));
+}
+
 // ---------------------------------------------------------------------------------------------
 // Job store. Everything below keeps job state in the SQLite store of lib/store.mjs; nothing below
 // reads or writes the JSON job records above. Mutation primitives run exactly one transaction and

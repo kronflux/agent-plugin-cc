@@ -171,6 +171,11 @@ function argValue(name) {
   return index === -1 ? null : args[index + 1];
 }
 
+// Every call records its first argument and the value of agy's auto-update switch it was given.
+updateState((current) => {
+  current.autoUpdateEnv = [...(current.autoUpdateEnv || []), { command: args[0] || "", value: process.env.AGY_CLI_DISABLE_AUTO_UPDATE ?? null }];
+});
+
 if (args[0] === "--version") {
   console.log("1.5.10");
   process.exit(0);

@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { resolveStateDir } from "../plugins/agent/scripts/lib/state.mjs";
+import { resolveStateDir, setUserConfig, userConfigFile } from "../plugins/agent/scripts/lib/state.mjs";
 import { FIXTURE_SCRIPT, jobProcesses, rawAll, trackProcesses } from "./store-fixtures.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -61,6 +61,18 @@ test("the gate follows the verdict field, not BLOCK text in the reason", () => {
   const gate = setupGate();
   const { decision } = runStopHook(gate, { json: { verdict: "allow", reason: "BLOCK would be wrong here; VERDICT: BLOCK" } });
   assert.equal(decision, null);
+});
+
+test("the gate's review uses the user delegation setting when the repository has none", (t) => {
+  setUserConfig("models", { codex: { model: "luna", effort: "high" } });
+  t.after(() => fs.rmSync(userConfigFile(), { force: true }));
+  const gate = setupGate();
+  runStopHook(gate, allow);
+  const request = JSON.parse(reviewJobs(gate)[0].request_json);
+  assert.match(String(request.model), /luna/);
+  assert.equal(request.modelSource, "user-setting");
+  assert.equal(request.effort, "high");
+  assert.equal(request.effortSource, "user-setting");
 });
 
 test("the gate asks Codex for a structured verdict", () => {

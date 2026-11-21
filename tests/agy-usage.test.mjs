@@ -182,6 +182,22 @@ test("a model from the plugin setting is resolved through agy models", (t) => {
   );
 });
 
+test("a stored base name and effort are resolved into the model id before the lookup", (t) => {
+  const ctx = usageEnv(t, "usage-fake-model", { settings: { model: "Gemini 4 Argon (Medium)" } });
+  const setup = run("node", [AGY, "setup", "--model", "fake-model", "--effort", "low"], { cwd: ctx.cwd, env: ctx.env, timeout: 60000 });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const result = run("node", [AGY, "usage", "--json"], { cwd: ctx.cwd, env: ctx.env, timeout: 60000 });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(
+    JSON.parse(result.stdout)
+      .groups.filter((group) => group.defaultDelegation)
+      .map((group) => group.name),
+    ["Fake Group"]
+  );
+});
+
 test("a missing or malformed settings file makes the default unknown", (t) => {
   for (const settings of [null, "not json", {}]) {
     const ctx = usageEnv(t, "usage-json", { settings });

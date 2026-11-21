@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import { outputCommandResult, resolveCommandCwd, resolveCommandWorkspace } from "../../../lib/companion-cli.mjs";
 import { collectReviewContext } from "../../../lib/git.mjs";
-import { resolveModelSelection } from "../../../lib/model-selection.mjs";
+import { delegationOptions, resolveModelSelection } from "../../../lib/model-selection.mjs";
 import { renderNativeReviewResult, renderReviewResult } from "../../../lib/render.mjs";
 import {
   buildReviewPrompt,
@@ -12,7 +12,6 @@ import {
   resolveReviewTarget
 } from "../../../lib/review-target.mjs";
 import { readRequesterIdentity } from "../../../lib/host.mjs";
-import { getConfig } from "../../../lib/state.mjs";
 import { codexProvider } from "../index.mjs";
 import { KNOWN_REASONING_EFFORTS } from "../model-catalog.mjs";
 import { buildTaskJobFields, startStoreJob, waitStoreJob } from "./task.mjs";
@@ -131,7 +130,7 @@ export async function handleReviewCommand(argv) {
   const selection = await resolveModelSelection(codexProvider, {
     model: options.model,
     effort: options.effort,
-    setting: getConfig(workspaceRoot).models?.[codexProvider.id] ?? null,
+    ...delegationOptions(codexProvider, workspaceRoot),
     cwd
   });
   printWarnings(selection);

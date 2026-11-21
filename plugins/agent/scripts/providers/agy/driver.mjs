@@ -8,6 +8,9 @@ import { capUtf8 } from "../../lib/state.mjs";
 import { CONTINUE_LINE } from "../../lib/mailbox.mjs";
 import { resolveCommand, runCommand } from "../../lib/process.mjs";
 import {
+  agyEnv,
+  agyTurnModel,
+  readCatalogLists,
   AGY_DELEGATE_LINE,
   AGY_READ_ONLY_LINE,
   buildAgyArgs,
@@ -35,7 +38,7 @@ let cachedVersion;
 /** The installed agy version as `agy --version` prints it, read once per process; null if unread. */
 export function readAgyVersion(cwd, env = process.env) {
   if (cachedVersion === undefined) {
-    const result = runCommand("agy", ["--version"], { cwd, env, timeout: 30000 });
+    const result = runCommand("agy", ["--version"], { cwd, env: agyEnv(env), timeout: 30000 });
     const match = result.status === 0 ? /\d+\.\d+\.\d+\S*/.exec(String(result.stdout ?? "")) : null;
     cachedVersion = match ? match[0] : null;
   }
@@ -216,10 +219,15 @@ export function createAgyDriver(job = null, { env = process.env } = {}) {
       const request = parseRequest(row);
       schema = writeSchemaFile(request.outputSchema ?? null);
       const timeoutMs = readAgyTurnTimeoutMs(ctx.env ?? env);
+      // A continuation copies its job's stored request; one recorded before model ids carried
+      // their effort is joined into the id here, as agy is never given --effort.
+      const turnModel = agyTurnModel(request, { readLists: () => readCatalogLists(ctx.cwd ?? row.cwd) });
+      if (turnModel.warning) {
+        ctx.log?.(turnModel.warning);
+      }
       const args = buildAgyArgs({
         conversationId: row.thread_id ?? null,
-        model: request.model ?? null,
-        effort: request.effort ?? null,
+        model: turnModel.model,
         sandboxMode: sandboxModeOf(request),
         jsonSchema: schema?.file ?? null,
         timeoutMs,
@@ -239,7 +247,7 @@ export function createAgyDriver(job = null, { env = process.env } = {}) {
       lastThreadId = row.thread_id ?? null;
       child = spawn(plan.file, plan.args, {
         cwd: ctx.cwd ?? row.cwd,
-        env: ctx.env ?? env,
+        env: agyEnv(ctx.env ?? env),
         stdio: ["pipe", "pipe", "pipe"],
         ...plan.options,
         windowsHide: true,
