@@ -2267,4 +2267,7 @@ test("the guard counts a tool that failed without a refusal, or never ended, as 
   assert.equal(decide([tool("ACTIVE", "mcp_tool"), tool("ERROR", "mcp_tool", "the server crashed")]).outcome, "failed");
   // A tool started and never reported its end.
   assert.equal(decide([tool("ACTIVE", "mcp_tool")]).outcome, "failed");
+  // A tool that ran and hit a permission error of the system is no refusal by agy.
+  const osError = { type: "tool", state: "ERROR", name: "mcp_tool", path: null, error: { type: "OS_ERROR", message: "EACCES: permission denied" } };
+  assert.equal(decide([tool("ACTIVE", "mcp_tool"), osError]).outcome, "failed");
 });

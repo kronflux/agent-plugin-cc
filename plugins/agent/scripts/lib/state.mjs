@@ -390,8 +390,14 @@ function readUserConfigFile(file) {
  * a file that cannot be read reads as the defaults with one warning per file and process.
  */
 export function getUserConfig() {
-  const file = readableUserConfigFile(userConfigFile());
-  const read = readUserConfigFile(file);
+  const profileFile = userConfigFile();
+  let file = readableUserConfigFile(profileFile);
+  let read = readUserConfigFile(file);
+  // An update that ran meanwhile moved the earlier file into the profile: read it there.
+  if (file !== profileFile && !fs.existsSync(file)) {
+    file = profileFile;
+    read = readUserConfigFile(file);
+  }
   if (read.error) {
     if (!warnedUserConfigFiles.has(file)) {
       warnedUserConfigFiles.add(file);

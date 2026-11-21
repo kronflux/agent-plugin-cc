@@ -571,7 +571,7 @@ export function classifyAgyOutcome(events, exit = {}) {
     } else if (event.type === "tool" && event.state === "ERROR") {
       openTools.set(event.name, Math.max(0, (openTools.get(event.name) ?? 0) - 1));
       // A refused tool never ran. A tool that failed for another reason may have written first.
-      if (!/permission/i.test(String(event.error?.message ?? ""))) {
+      if (!(event.error?.type === "TOOL_ERROR" && /permission/i.test(String(event.error?.message ?? "")))) {
         toolEvents.push({ name: event.name, path: event.path });
       }
     } else if (event.type === "tool") {

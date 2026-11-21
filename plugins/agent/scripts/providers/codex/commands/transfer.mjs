@@ -115,8 +115,10 @@ export async function executeTransfer(cwd, options = {}) {
   try {
     summary = await readClaudeSession(sourcePath, { snapshot, profileDir });
     // Codex imports nothing from a transcript without messages and then reports no thread.
-    if ((summary.counts?.userTurns ?? 0) === 0 && (summary.counts?.assistantMessages ?? 0) === 0) {
-      throw new Error(`The Claude session in ${sourcePath} holds no user or assistant messages, so there is nothing to transfer.`);
+    const counts = summary.counts ?? {};
+    const toolCalls = Object.values(counts.toolCalls ?? {}).reduce((total, count) => total + count, 0);
+    if ((counts.userTurns ?? 0) + (counts.assistantMessages ?? 0) + (counts.compactions ?? 0) + toolCalls === 0) {
+      throw new Error(`The Claude session in ${sourcePath} holds no messages, summaries or tool calls, so there is nothing to transfer.`);
     }
     record = readTransferRecord(stateDir, sessionId);
     reused = Boolean(record && record.sourceSha256 === snapshot.sha256 && (await threadExists(cwd, record.threadId)));
