@@ -201,10 +201,10 @@ test("agy setup --scope user applies in every workspace without a project settin
   usePluginData(t);
   const first = makeWorkspace(t);
   const second = makeWorkspace(t, first.binDir);
-  const stored = companion(AGY, first, ["setup", "--scope", "user", "--model", "fake-model-low", "--write-sandbox", "danger-full-access"]);
+  const stored = companion(AGY, first, ["setup", "--scope", "user", "--model", "fake-model", "--effort", "low", "--write-sandbox", "danger-full-access"]);
   assert.equal(stored.status, 0, stored.stderr);
-  assert.match(stored.stdout, /Delegations now use model fake-model-low in every workspace without its own setting\./);
-  assert.deepEqual(state.getUserConfig(), { version: 1, models: { agy: { model: "fake-model-low", effort: null } }, writeSandbox: "danger-full-access" });
+  assert.match(stored.stdout, /Delegations now use model fake-model with effort low in every workspace without its own setting\./);
+  assert.deepEqual(state.getUserConfig(), { version: 1, models: { agy: { model: "fake-model", effort: "low" } }, writeSandbox: "danger-full-access" });
   for (const ctx of [first, second]) {
     const before = configBytes(ctx.repo);
     const result = companion(AGY, ctx, ["setup"]);
@@ -214,7 +214,7 @@ test("agy setup --scope user applies in every workspace without a project settin
     assert.deepEqual(configBytes(ctx.repo), before);
     assert.equal(Object.hasOwn(state.getConfig(ctx.repo), "models"), false);
     const report = JSON.parse(companion(AGY, ctx, ["setup", "--json"]).stdout);
-    assert.deepEqual(report.sources, { model: "user", effort: "provider-default", writeSandbox: "user" });
+    assert.deepEqual(report.sources, { model: "user", effort: "user", writeSandbox: "user" });
   }
 });
 

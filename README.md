@@ -575,7 +575,24 @@ Reviews, fleet entries and `/agent:codex-setup` follow the same rules.
 
 Setting rules for `/agent:codex-setup`, at either scope: `--model default` clears the stored setting, `--effort` alone keeps the stored model, and `--model` alone clears the stored effort. A model no catalog can check is stored with a warning.
 
-An Antigravity job uses `--model` from the command, then, on a continued conversation, the model choice of the job it continues, then the delegation setting stored by `/agent:agy-setup --model <id>`, and otherwise names no model, so agy runs on the model saved in the Antigravity settings. When the plugin names no model, the output of a delegated job shows, after Antigravity's result and before any resume information, `Model: <name> (from the Antigravity settings)`, or `Model: chosen by Antigravity` when no model is saved. `--model <id>` is checked against `agy models` before the job starts; if that list cannot be read, the model is sent as given, with one line that says it was not checked. A model id that already ends in an effort, together with a different `--effort`, is refused. When you continue a conversation after the saved model changed, the output says so.
+An Antigravity job uses `--model` from the command, then, on a continued conversation, the model choice of the job it continues, then the delegation setting stored by `/agent:agy-setup --model <id>` (the repository's, then the user's), and otherwise names no model, so agy runs on the model saved in the Antigravity settings. When the plugin names no model, the output of a delegated job shows, after Antigravity's result and before any resume information, `Model: <name> (from the Antigravity settings)`, or `Model: chosen by Antigravity` when no model is saved. When you continue a conversation after the saved model changed, the output says so. How a model and its effort are named is described under [Antigravity models](#antigravity-models).
+
+### Antigravity models
+
+Antigravity model ids carry their effort: `agy models` lists ids such as `model-x-low` and `model-x-high`, where the last word is one of the efforts `agy --help` lists and the part before it is the base name. The plugin never passes `--effort` to agy; it names the model in one of two forms:
+
+- the full id, such as `--model model-x-high`
+- the base name and an effort, such as `--model model-x --effort high`, which runs `model-x-high` when `agy models` lists that id
+
+A model whose id has no effort word, such as `gemini-pro-orchestrator-neon`, runs as given. Giving the effort twice, or not at all, exits with code 1 before a job exists:
+
+- `--model model-x-high --effort high` (also with the same effort): `Antigravity model model-x-high already includes effort high. Use either --model model-x-high, or --model model-x --effort <effort>.`
+- `--model model-x` with no effort from the command or a setting: `Antigravity model model-x needs an effort. Use --model model-x-<effort> or --model model-x --effort <effort>; model-x has: <list>.`
+- an effort the base name does not have, `--effort` with a model that has no efforts, an `--effort` with no model at all, and a model `agy models` does not list are refused with a message that names the choices.
+
+The effort may also come from a setting: `/agent:agy-setup --model model-x --effort medium` stores the base name and the effort, and a delegation joins them. A stored full id with a stored effort, as earlier versions of setup stored it, runs the full id and prints `The stored Antigravity effort is ignored because model <id> includes one; run setup again.` A full id on the command ignores a stored effort with a note. A follow-up keeps the id of the job it continues.
+
+If `agy models` cannot be read or lists nothing, a full id runs unchecked and a base name with `--effort` runs as `<base>-<effort>` unchecked, each with one line that says the model was not checked; a base name without an effort is refused, because the plugin cannot tell whether the model has efforts. The setup report names the efforts of the delegation model's base name (`efforts of <base>: <list>`); with no delegation model it lists agy's efforts.
 
 ## Configuration
 
