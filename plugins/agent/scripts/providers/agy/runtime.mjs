@@ -67,6 +67,15 @@ export function readAgyTurnTimeoutMs(env = process.env) {
 }
 
 const FALLBACK_EFFORTS = ["low", "medium", "high"];
+// The effort words agy documents. Model ids are split and efforts accepted with these as well as
+// the words `agy --help` prints, so an id such as `<base>-xhigh` parses when the help cannot be
+// read; with a model list, a composed id must still be listed.
+const DOCUMENTED_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+
+/** The documented effort words followed by any other word in `efforts`, each once. */
+export function agyEffortWords(efforts) {
+  return [...new Set([...DOCUMENTED_EFFORTS, ...(efforts ?? [])])];
+}
 
 /**
  * Returns the reasoning efforts the installed agy accepts, read from the --effort line of
@@ -95,7 +104,7 @@ function normalizeEffort(effort, efforts, cwd) {
     return null;
   }
   const normalized = String(effort).trim().toLowerCase();
-  const supported = Array.isArray(efforts) ? efforts : readAgyEfforts(cwd);
+  const supported = agyEffortWords(Array.isArray(efforts) ? efforts : readAgyEfforts(cwd));
   if (!supported.includes(normalized)) {
     throw new Error(`agy does not support reasoning effort "${effort}". Use one of: ${supported.join(", ")}.`);
   }
@@ -113,7 +122,7 @@ function modelIds(models) {
  */
 export function agyModelEfforts(base, models, efforts) {
   const ids = new Set(modelIds(models));
-  return (efforts ?? []).filter((effort) => ids.has(`${base}-${effort}`));
+  return agyEffortWords(efforts).filter((effort) => ids.has(`${base}-${effort}`));
 }
 
 /**
@@ -126,7 +135,7 @@ export function splitAgyModel(model, { models = [], efforts = [], catalogStatus 
   if (catalogStatus === "available" && !modelIds(models).includes(id)) {
     return null;
   }
-  const effort = (efforts ?? []).find((word) => id.length > word.length + 1 && id.endsWith(`-${word}`));
+  const effort = agyEffortWords(efforts).find((word) => id.length > word.length + 1 && id.endsWith(`-${word}`));
   return effort ? { base: id.slice(0, -(effort.length + 1)), effort } : null;
 }
 
@@ -161,8 +170,8 @@ export function resolveAgyModel({ model, effort = null, models = [], efforts = [
     if (!given) {
       return { error: `Antigravity model ${id} needs an effort. ${FORMS(id)}; ${id} has: unknown, because the Antigravity model list is unavailable.` };
     }
-    if (!(efforts ?? []).includes(given)) {
-      return { error: `agy does not support reasoning effort "${effort}". Use one of: ${(efforts ?? []).join(", ")}.` };
+    if (!agyEffortWords(efforts).includes(given)) {
+      return { error: `agy does not support reasoning effort "${effort}". Use one of: ${agyEffortWords(efforts).join(", ")}.` };
     }
     return { model: `${id}-${given}`, effort: given, warning: warning(`${id}-${given}`) };
   }

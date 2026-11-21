@@ -298,9 +298,11 @@ test("setup reports sign-in from the model list", (t) => {
 
 test("agy accepts the efforts its help lists and rejects others before starting", (t) => {
   const ctx = makeRepo(undefined, t);
-  const rejected = run("node", [AGY, "task", "--effort", "max", "do it"], { cwd: ctx.repo, env: ctx.env });
+  // max is a documented effort word even where this agy's help omits it, so a word outside both
+  // lists stands for an unknown effort.
+  const rejected = run("node", [AGY, "task", "--effort", "ultra", "do it"], { cwd: ctx.repo, env: ctx.env });
   assert.notEqual(rejected.status, 0);
-  assert.match(rejected.stderr, /agy does not support reasoning effort "max"\. Use one of: low, medium, high, xhigh/);
+  assert.match(rejected.stderr, /agy does not support reasoning effort "ultra"\. Use one of: low, medium, high, xhigh, max\./);
   assert.equal(readFakeAgyState(ctx.binDir).runs.length, 0);
 
   // A listed effort is accepted in the base-plus-effort form, joined into the model id.
@@ -2125,4 +2127,23 @@ test("every agy process the plugin starts has agy's background updater off unles
   const presetCalls = readFakeAgyState(preset.binDir).autoUpdateEnv ?? [];
   assert.ok(presetCalls.length > 0);
   assert.deepEqual(presetCalls.filter((call) => call.value !== "0"), []);
+});
+
+test("resolveAgyModel parses the documented effort words when agy's help gives only the fallback", () => {
+  const efforts = ["low", "medium", "high"];
+  const models = ["y-low", "y-xhigh", "y-max"];
+  const resolve = (model, effort = null, catalogStatus = "available") =>
+    agyRuntime.resolveAgyModel({ model, effort, models: catalogStatus === "available" ? models : [], efforts, catalogStatus });
+  assert.deepEqual(resolve("y-xhigh"), { model: "y-xhigh", effort: "xhigh" });
+  assert.deepEqual(resolve("y", "max"), { model: "y-max", effort: "max" });
+  assert.match(resolve("y-max", "max").error, /already includes effort max/);
+  assert.match(resolve("y").error, /; y has: low, xhigh, max\.$/);
+  // With a model list, a composed id must be listed.
+  assert.match(resolve("y", "medium").error, /^Antigravity model y has no effort medium\./);
+  assert.match(resolve("z-max").error, /^Model "z-max" is not in the Antigravity model list/);
+  assert.deepEqual(resolve("w", "xhigh", "unavailable"), {
+    model: "w-xhigh",
+    effort: "xhigh",
+    warning: 'The Antigravity model list is unavailable, so "w-xhigh" was not checked.'
+  });
 });
