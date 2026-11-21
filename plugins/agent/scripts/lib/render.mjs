@@ -348,13 +348,33 @@ export function renderFleetTable(members) {
   return `${lines.join("\n")}\n`;
 }
 
+// Whether the job's provider takes a message into a turn that is still running.
+function steersRunningTurn(view) {
+  try {
+    return getProvider(view.provider).capabilities?.steer !== false;
+  } catch {
+    return true;
+  }
+}
+
+/** The state shown for a job: a waiting job that was continued has been answered. */
+export function displayState(view) {
+  return view.state === "waiting" && view.successorId ? "answered" : view.state;
+}
+
 /** The command that fits a job's state, as one sentence. */
 export function renderStateHint(view) {
   const id = view.id;
+  // A job that another job continued is history: its question was answered or its thread went on.
+  if (view.successorId) {
+    return `It was continued by ${view.successorId}; read its own output with /agent:result ${id}.`;
+  }
   switch (view.state) {
     case "queued":
     case "running":
-      return `Add to its turn with /agent:send ${id} <message>; stop it with /agent:cancel ${id}.`;
+      return steersRunningTurn(view)
+        ? `Add to its turn with /agent:send ${id} <message>; stop it with /agent:cancel ${id}.`
+        : `Send it a message with /agent:send ${id} <message>, which continues the conversation as a new job when this turn ends; stop it with /agent:cancel ${id}.`;
     case "stopping":
       return "It is stopping: its provider process has not been confirmed gone, so it cannot be continued yet.";
     case "waiting":
@@ -428,7 +448,7 @@ export function renderStoreStatus(views, { all = false } = {}) {
       view.id,
       providerLabelOf(view),
       view.row.kind,
-      view.state + (view.providerExitUnobserved ? " (provider exit not observed)" : ""),
+      displayState(view) + (view.providerExitUnobserved ? " (provider exit not observed)" : ""),
       view.label ?? "",
       chainText(view),
       String(view.pendingMessages),
@@ -454,7 +474,7 @@ export function renderStoreJobStatus(view, { progress = [], logFile = null } = {
     `Agent: ${label}`,
     `Kind: ${row.kind}`,
     `Title: ${row.title}`,
-    `State: ${view.state}`,
+    `State: ${displayState(view)}`,
     `Label: ${view.label ?? "none"}`,
     `Chain: ${chainText(view)}`,
     `Pending messages: ${view.pendingMessages}`,

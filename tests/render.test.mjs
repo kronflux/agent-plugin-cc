@@ -474,3 +474,20 @@ test("a stored task result names the command that opens its thread, unless the t
   assert.doesNotMatch(renderStoreResult(view({ kind: "review" })), /codex resume/);
   assert.doesNotMatch(renderStoreResult(view({ thread_id: null })), /codex resume/);
 });
+test("a waiting job that was continued reads as answered and points at its successor", async () => {
+  const { displayState, renderStateHint } = await import("../plugins/agent/scripts/lib/render.mjs");
+  const answered = { id: "task-1", provider: "codex", state: "waiting", successorId: "task-2", row: {} };
+  assert.equal(displayState(answered), "answered");
+  assert.equal(renderStateHint(answered), "It was continued by task-2; read its own output with /agent:result task-1.");
+  assert.equal(displayState({ ...answered, successorId: null }), "waiting");
+  assert.match(renderStateHint({ ...answered, successorId: null }), /^It is waiting for an answer; reply with \/agent:send task-1 /);
+});
+
+test("the hint of a running job says how its provider takes a message", async () => {
+  const { renderStateHint } = await import("../plugins/agent/scripts/lib/render.mjs");
+  assert.match(renderStateHint({ id: "task-1", provider: "codex", state: "running", successorId: null, row: {} }), /^Add to its turn with \/agent:send task-1 /);
+  assert.match(
+    renderStateHint({ id: "task-1", provider: "agy", state: "running", successorId: null, row: {} }),
+    /^Send it a message with \/agent:send task-1 <message>, which continues the conversation as a new job when this turn ends;/
+  );
+});
