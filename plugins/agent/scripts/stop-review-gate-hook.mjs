@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import { getCodexAvailability } from "./providers/codex/runtime.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { resolveModelSelection } from "./lib/model-selection.mjs";
+import { delegationOptions, resolveModelSelection } from "./lib/model-selection.mjs";
 import { getProvider } from "./lib/providers.mjs";
 import { createJob, getConfig, listJobViews, resolveStateDir } from "./lib/state.mjs";
 import { checkRuntime, openStore, runtimeGateMessage } from "./lib/store.mjs";
@@ -134,7 +134,7 @@ function verdictOfJob(view) {
 // working tree's changes with the verdict schema.
 async function buildReviewFields(provider, cwd, input) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const selection = await resolveModelSelection(provider, { setting: getConfig(workspaceRoot).models?.[provider.id] ?? null, cwd });
+  const selection = await resolveModelSelection(provider, { ...delegationOptions(provider, workspaceRoot), cwd });
   const outputSchema = JSON.parse(fs.readFileSync(VERDICT_SCHEMA, "utf8"));
   const request = {
     cwd,
