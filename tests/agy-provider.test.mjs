@@ -2248,3 +2248,23 @@ test("a resumed job with a recorded effort and no model logs that the effort was
   const log = fs.readFileSync(path.join(resolveStateDir(ctx.repo), "store", "artifacts", `${successor.id}.log`), "utf8");
   assert.match(log, /The recorded Antigravity effort high was not used, because the job names no model\./);
 });
+
+test("the guard counts a tool that failed without a refusal, or never ended, as one that may have written", () => {
+  const answer = { type: "result", status: "SUCCESS", response: "done", conversationId: "c1", turns: 1, deniedActions: [], structuredOutput: null };
+  const input = { type: "user-input" };
+  const decide = (events) =>
+    agyRuntime.classifyAgyTurn(agyRuntime.classifyAgyOutcome([input, ...events, answer], { code: 0, signal: null, readOnly: true }), {
+      guard: "on",
+      changedPaths: ["README.md"],
+      writeToolNames: ["write_file", "edit_file", "run_command"],
+      readToolNames: ["read_file", "read_url", "invoke_subagent"]
+    });
+  const tool = (state, name, message) => ({ type: "tool", state, name, path: null, error: message ? { type: "TOOL_ERROR", message } : null });
+
+  // Only reading tools ran: another program changed the file.
+  assert.equal(decide([tool("ACTIVE", "read_file"), tool("DONE", "read_file")]).outcome, "completed");
+  // A tool failed for a reason other than a refused permission.
+  assert.equal(decide([tool("ACTIVE", "mcp_tool"), tool("ERROR", "mcp_tool", "the server crashed")]).outcome, "failed");
+  // A tool started and never reported its end.
+  assert.equal(decide([tool("ACTIVE", "mcp_tool")]).outcome, "failed");
+});

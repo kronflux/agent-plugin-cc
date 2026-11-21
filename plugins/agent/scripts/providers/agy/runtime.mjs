@@ -533,7 +533,9 @@ function deniedMessage({ action, displayName, path: deniedPath }) {
  * `processTurns` counts the turns this process ran: each run of user_input steps that the stream
  * moves past with another step, so a repeated init or a replayed user_input of an earlier turn
  * adds none. `turns` is the conversation's turn count the result reports. `toolEvents` lists each
- * tool call the stream shows as done, with its name and path (null when it carries none).
+ * tool call that ran: one the stream shows as done, one that failed for a reason other than a
+ * refused permission, and one that never reported its end; each with its name and path (null
+ * when it carries none).
  */
 export function classifyAgyOutcome(events, exit = {}) {
   let conversationId = exit.conversationId ?? null;
@@ -544,6 +546,8 @@ export function classifyAgyOutcome(events, exit = {}) {
   let inUserInput = false;
   const toolDenials = [];
   const toolEvents = [];
+  // Tool steps that started and have not ended, by tool name.
+  const openTools = new Map();
   for (const event of events) {
     if (event.type === "user-input") {
       inUserInput = true;
@@ -563,9 +567,24 @@ export function classifyAgyOutcome(events, exit = {}) {
       toolDenials.push(event);
     } else if (event.type === "tool" && event.state === "DONE") {
       toolEvents.push({ name: event.name, path: event.path });
+      openTools.set(event.name, Math.max(0, (openTools.get(event.name) ?? 0) - 1));
+    } else if (event.type === "tool" && event.state === "ERROR") {
+      openTools.set(event.name, Math.max(0, (openTools.get(event.name) ?? 0) - 1));
+      // A refused tool never ran. A tool that failed for another reason may have written first.
+      if (!/permission/i.test(String(event.error?.message ?? ""))) {
+        toolEvents.push({ name: event.name, path: event.path });
+      }
+    } else if (event.type === "tool") {
+      openTools.set(event.name, (openTools.get(event.name) ?? 0) + 1);
     } else if (event.type === "result" && !result) {
       result = event;
       conversationId = event.conversationId ?? conversationId;
+    }
+  }
+  // A tool that started and never reported its end counts as run: it may have written.
+  for (const [name, open] of openTools) {
+    if (open > 0) {
+      toolEvents.push({ name, path: null });
     }
   }
   const text = lastMessage || (result ? result.response.trim() : "");
