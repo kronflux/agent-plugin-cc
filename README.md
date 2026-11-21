@@ -588,7 +588,8 @@ A model whose id has no effort word, such as `gemini-pro-orchestrator-neon`, run
 
 - `--model model-x-high --effort high` (also with the same effort): `Antigravity model model-x-high already includes effort high. Use either --model model-x-high, or --model model-x --effort <effort>.`
 - `--model model-x` with no effort from the command or a setting: `Antigravity model model-x needs an effort. Use --model model-x-<effort> or --model model-x --effort <effort>; model-x has: <list>.`
-- an effort the base name does not have, `--effort` with a model that has no efforts, an `--effort` with no model at all, and a model `agy models` does not list are refused with a message that names the choices.
+- `--effort` with no model from the command, a setting or a continued job: `Antigravity needs a model for --effort <e>. Use --model <base> --effort <e> or --model <base>-<e>.` The effort must name a concrete model id, so it cannot apply to the model saved in the Antigravity settings. A stored effort without a stored model is ignored with a warning, and a follow-up of a job that named no model drops an effort it would inherit.
+- an effort the base name does not have, `--effort` with a model that has no efforts, and a model `agy models` does not list are refused with a message that names the choices.
 
 The effort may also come from a setting: `/agent:agy-setup --model model-x --effort medium` stores the base name and the effort, and a delegation joins them. A stored full id with a stored effort, as earlier versions of setup stored it, runs the full id and prints `The stored Antigravity effort is ignored because model <id> includes one; run setup again.` A full id on the command ignores a stored effort with a note. A follow-up keeps the id of the job it continues.
 

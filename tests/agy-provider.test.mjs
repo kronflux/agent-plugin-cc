@@ -303,11 +303,18 @@ test("agy accepts the efforts its help lists and rejects others before starting"
   assert.match(rejected.stderr, /agy does not support reasoning effort "max"\. Use one of: low, medium, high, xhigh/);
   assert.equal(readFakeAgyState(ctx.binDir).runs.length, 0);
 
+  // A listed effort is accepted in the base-plus-effort form, joined into the model id.
+  const accepted = run("node", [AGY, "task", "--model", "fake-model", "--effort", "high", "do it"], { cwd: ctx.repo, env: ctx.env, timeout: 60000 });
+  assert.equal(accepted.status, 0, accepted.stderr);
+  const acceptedArgs = readFakeAgyState(ctx.binDir).runs[0].args;
+  assert.match(acceptedArgs.join(" "), /--model fake-model-high/);
+  assert.equal(acceptedArgs.includes("--effort"), false, acceptedArgs.join(" "));
+
   // agy is never given --effort, so an effort needs a model whose id can carry it.
   const withoutModel = run("node", [AGY, "task", "--effort", "xhigh", "do it"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(withoutModel.status, 1);
   assert.match(withoutModel.stderr, /^Antigravity needs a model for --effort xhigh\. Use --model <base> --effort xhigh or --model <base>-xhigh\.$/m);
-  assert.equal(readFakeAgyState(ctx.binDir).runs.length, 0);
+  assert.equal(readFakeAgyState(ctx.binDir).runs.length, 1);
 });
 
 test("an agy that exits before reading its prompt fails the job with a message", async (t) => {
