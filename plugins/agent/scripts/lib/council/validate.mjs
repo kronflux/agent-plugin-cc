@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { selfLabel } from "./anonymise.mjs";
+import { selfLabel, standInAnswerMap } from "./anonymise.mjs";
 import { readObject as readStoredObject } from "./objects.mjs";
 
 // Checks council answers against the round schemas and the rules a schema cannot express.
@@ -423,8 +423,8 @@ function readJsonObject(readObject, runDir, sha256) {
  * The context validateAnswer needs for `seat`'s answer in `round`, from the committed rows of the
  * snapshot `view` (readCouncil) and their verified objects only: `{ schema, kind, options,
  * bundleRefs, ownFindingIds, answerLabels }`. `answerLabels` (Round 2 of a question or open run)
- * are the letters of the actor's letter map, then its own answer's label (selfLabel) unless the
- * actor is a fresh Round 2 stand-in, which has no answer of its own. Round 2 reads the seat's accepted Round 1 answer, the committed
+ * are the letters of the actor's letter map, then its own answer's label (selfLabel); a fresh Round
+ * 2 stand-in, which has no answer of its own, uses the letters of its answer map (standInAnswerMap). Round 2 reads the seat's accepted Round 1 answer, the committed
  * map and the other lettered seats' Round 1 answers, each through the digest-checked reader.
  * `actor` names the answering actor when it is not the seat's original: a carried Round 1
  * stand-in (`<seat>~r1`) owns its Round 1 findings and its primary map entry; a fresh Round 2
@@ -460,7 +460,9 @@ export function validationContext(runDir, view, seat, round, { readObject = read
       bundleRefs.push(`${letter}-${finding.id}`);
     }
   }
-  const answerLabels = answersInOwnWords(kind) ? [...letters, ...(own ? [selfLabel(letterMap)] : [])] : [];
+  // A fresh stand-in names the answers by its own answer map, which covers every Round 1 answer.
+  const answerLetters = fresh ? Object.keys(standInAnswerMap(mapping, actor) ?? {}).sort() : letters;
+  const answerLabels = answersInOwnWords(kind) ? [...answerLetters, ...(own ? [selfLabel(letterMap)] : [])] : [];
   return { schema: roundSchemaName(2, kind), kind, options, bundleRefs, ownFindingIds, answerLabels };
 }
 

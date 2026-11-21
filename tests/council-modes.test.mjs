@@ -500,6 +500,44 @@ test("an agreement verdict is refused on a review or question council, on a stal
   }
 });
 
+test("a fresh Round 2 stand-in on a question council sees every answer, the replaced seat's included, and its vote counts", async (t) => {
+  const clock = useTestClock(t, 0);
+  const fx = await round1Closed(t, clock, "question");
+  clock.set(1000);
+  const sent = await council(["crossexam", fx.runId, "--json"], { cwd: fx.cwd, built: fx.built });
+  assert.equal(sent.code, 0, sent.stderr);
+  const map = mapOf(fx);
+  clock.set(1100);
+  const vote = (seat) => answer2(map, seat, { kind: "question", stance: labelFor(map, seat, "s1") });
+  assert.equal((await submit(fx, "s1", sent.json.deliveries.find((entry) => entry.seat === "s1").intentId, vote("s1"))).json.state, "valid");
+  completeJob(fx, currentOf(fx, "s2", 2).job_id, 1100, vote("s2"));
+  failJob(fx, currentOf(fx, "s3", 2).job_id, 1100);
+  const woke = await collect(fx);
+  const standIn = woke.json.deliveries.find((delivery) => delivery.actor === "s3~r2");
+  assert.ok(standIn, woke.stdout);
+  // Its answer labels cover all three Round 1 answers, none marked as its own.
+  const labels = mapOf(fx).$answerAlternates["s3~r2"];
+  assert.deepEqual(Object.values(labels).sort(), ["s1", "s2", "s3"]);
+  const prompt = fs.readFileSync(standIn.promptFile, "utf8");
+  assert.match(prompt, /"answer": "Use a queue\."/);
+  assert.doesNotMatch(prompt, /"yours": true/);
+  assert.doesNotMatch(prompt, /Your own answer is labelled/);
+  // It votes for the replaced seat's answer, still on the ballot; its findings bundle leaves s3's findings out.
+  const own = Object.keys(labels).find((letter) => labels[letter] === "s3");
+  const findings = mapOf(fx).$alternates["s3~r2"];
+  assert.ok(!Object.values(findings).includes("s3"));
+  const responses = Object.keys(findings)
+    .sort()
+    .map((letter) => ({ finding: `${letter}-f1`, response: "validate", disputes: null, sameAs: null, reason: null, evidence: null }));
+  clock.set(1200);
+  const submitted = await submit(fx, "s3", standIn.intentId, JSON.stringify({ schema: 1, stance: own, sameAs: [], responses, added: [] }));
+  assert.equal(submitted.json.state, "valid", submitted.stdout);
+  const closed = await collect(fx);
+  assert.deepEqual([closed.json.wake, closed.json.quorum], ["closed", true], closed.stdout);
+  const merged = await mergeRun(fx);
+  assert.deepEqual(merged.merge.decision.tally, { A: 2, C: 1 });
+});
+
 test("an agreement verdict with --merge binds to the merge the leader read and refuses another", async (t) => {
   const clock = useTestClock(t, 0);
   const fx = await round1Closed(t, clock, "open");

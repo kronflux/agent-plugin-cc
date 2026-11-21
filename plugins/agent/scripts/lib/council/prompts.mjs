@@ -145,7 +145,9 @@ export function renderRound2Prompt({ brief, lens, ownFindings, bundle, schemaTex
     LENS: lens,
     OWN_FINDINGS: jsonBlock(ownFindings ?? []),
     BUNDLE: jsonBlock(bundle ?? []),
-    ANSWERS: ownWords ? `The members' answers to the question, each under a label (yours is marked \`"yours": true\`):\n\n${jsonBlock(answers)}\n\n` : "",
+    ANSWERS: ownWords
+      ? `The members' answers to the question, each under a label${ownLabel ? ' (yours is marked `"yours": true`)' : ""}:\n\n${jsonBlock(answers)}\n\n`
+      : "",
     STANCE_RULE: round2StanceRule(kind, ownLabel),
     SCHEMA: trimEnd(schemaText)
   });

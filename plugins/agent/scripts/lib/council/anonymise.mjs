@@ -150,6 +150,24 @@ export function answerBundle(seats, round1, letterMap, ownAnswer = null, { runId
   return answers;
 }
 
+/**
+ * A shuffled letter map (`{ letter: author key }`) over every author in `authors`: the answer
+ * labels of a fresh Round 2 stand-in in a question or open council, which sees every effective
+ * Round 1 answer, none of them its own. random(max) returns an integer in [0, max).
+ */
+export function answerLetterMap(authors, { random = crypto.randomInt } = {}) {
+  return Object.fromEntries(shuffle(authors, random).map((author, index) => [LETTERS[index], author]));
+}
+
+/**
+ * The answer labels of a fresh Round 2 stand-in (`actor`, `<seat>~r2`) in a stored Round 2 map:
+ * its `$answerAlternates` entry, which covers every effective Round 1 answer, or for a map written
+ * without one its `$alternates` entry.
+ */
+export function standInAnswerMap(mapping, actor) {
+  return mapping?.$answerAlternates?.[actor] ?? mapping?.$alternates?.[actor] ?? null;
+}
+
 export function resolveRef(mapping, responder, ref) {
   const match = REF_PATTERN.exec(typeof ref === "string" ? ref : "");
   if (!match) {

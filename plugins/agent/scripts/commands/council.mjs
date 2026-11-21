@@ -32,7 +32,7 @@ import { checkProviders, newRunId } from "../lib/runs.mjs";
 import { launchWorker } from "../lib/task-launch.mjs";
 import { buildSeatJob, readSeatUsage } from "../lib/council/jobs.mjs";
 import { installObject, ObjectDamagedError, publishExport, readObject } from "../lib/council/objects.mjs";
-import { answerBundle, buildBundles, bundleFromMap, selfLabel } from "../lib/council/anonymise.mjs";
+import { answerBundle, answerLetterMap, buildBundles, bundleFromMap, selfLabel, standInAnswerMap } from "../lib/council/anonymise.mjs";
 import { depositExtensionReceipt, depositSubstitutionOptIn } from "../lib/council/extensions.mjs";
 import { canonicalAnswers, mergeCouncil, mergeQuestion, serializeMerge, sortedTally, unanimousPanel } from "../lib/council/merge.mjs";
 import {
@@ -1419,7 +1419,7 @@ export function prepareStandIns(runDir, snapshot, round, jobModels = () => []) {
         }
         const { answers, rows } = round1Actors(runDir, snapshot, jobModels);
         const bundle = bundleFromMap(rows, answers, letterMap, { runId: snapshot.run.id });
-        // A fresh stand-in sees the other answers and has none of its own.
+        // A fresh stand-in sees every Round 1 answer, the replaced seat's included, none as its own.
         basePrompt = renderRound2Prompt({
           brief,
           lens,
@@ -1427,7 +1427,7 @@ export function prepareStandIns(runDir, snapshot, round, jobModels = () => []) {
           bundle,
           schemaText: fs.readFileSync(roundSchemaPath(2, kind), "utf8"),
           kind,
-          answers: answersInOwnWords(kind) ? answerBundle(rows, answers, letterMap, null, { runId: snapshot.run.id }) : []
+          answers: answersInOwnWords(kind) ? answerBundle(rows, answers, standInAnswerMap(mapping, actorKey(seat, 2)), null, { runId: snapshot.run.id }) : []
         });
       }
       prepared[seat] = installObject(runDir, renderSubstitutePrompt({ basePrompt }), "md");
@@ -2473,6 +2473,11 @@ export async function crossExamine(runDir, deps) {
     // Round 2 stand-in for that seat answers, without that seat's own Round 1 findings.
     const alternates = buildBundles(actorRows, answers, { runId, ...random }).mapping;
     mapping.$alternates = Object.fromEntries(ordinary.map((entry) => [actorKey(entry.seat, 2), alternates[entry.seat]]));
+    if (answersInOwnWords(snapshot.run.kind)) {
+      // Its answer labels cover every effective Round 1 answer, the replaced seat's included.
+      const authors = actorRows.map((row) => row.seat);
+      mapping.$answerAlternates = Object.fromEntries(ordinary.map((entry) => [actorKey(entry.seat, 2), answerLetterMap(authors, random)]));
+    }
   }
   const mapSha256 = installObject(runDir, `${JSON.stringify(mapping, null, 2)}\n`, "json");
   const briefText = readObject(runDir, snapshot.run.brief_sha256, "md").toString("utf8");
@@ -2558,17 +2563,20 @@ export function mergeInput(runDir, snapshot, { extensions = {} } = {}) {
   const map = round2?.map_sha256 ? readJsonObject(runDir, round2.map_sha256) : {};
   const logical = (actor) => String(actor).replace(/~r[12]$/, "");
   const anonymisation = {};
-  // A question or open responder's answer labels: its letters, then its own answer's label unless
-  // it is a fresh Round 2 stand-in, which has no answer of its own.
+  // A question or open responder's answer labels: its letters, then its own answer's label; a
+  // fresh Round 2 stand-in, which has no answer of its own, uses its answer map.
   const answerMaps = {};
   const ownWords = answersInOwnWords(snapshot.run.kind);
   const round1Seats = new Set(panels[1].filter((item) => item.valid).map((item) => item.seat));
   for (const entry of panels[2].filter((item) => item.valid)) {
     const letterMap = (entry.kind === "substitute" ? map.$alternates?.[entry.actor] : map[entry.actor]) ?? {};
     anonymisation[entry.seat] = Object.fromEntries(Object.entries(letterMap).map(([letter, author]) => [letter, logical(author)]));
-    if (ownWords) {
+    if (ownWords && entry.kind === "substitute") {
+      const labels = standInAnswerMap(map, entry.actor) ?? {};
+      answerMaps[entry.seat] = Object.fromEntries(Object.entries(labels).map(([letter, author]) => [letter, logical(author)]));
+    } else if (ownWords) {
       answerMaps[entry.seat] = { ...anonymisation[entry.seat] };
-      if (entry.kind !== "substitute" && round1Seats.has(entry.seat)) {
+      if (round1Seats.has(entry.seat)) {
         answerMaps[entry.seat][selfLabel(letterMap)] = entry.seat;
       }
     }
