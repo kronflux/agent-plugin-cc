@@ -126,6 +126,11 @@ function resolveFirstJob(store, ref) {
   return { firstId: FOLDER_NAME.test(ref) ? ref : null, firstJob: null };
 }
 
+// A job that has just ended releases its provider process a moment later; remove waits for that.
+const RELEASE_PENDING = "has not released its provider process yet.";
+const RELEASE_WAIT_MS = 8000;
+const RELEASE_POLL_MS = 400;
+
 // One read of the chain: the reason it is not idle, or null. A chain that is gone is idle.
 function chainBusyReason(store, chainId) {
   return store.read((db) => {
@@ -141,7 +146,7 @@ function chainBusyReason(store, chainId) {
     const held = db
       .prepare("SELECT id FROM jobs WHERE chain_id = ? AND claimed_at IS NOT NULL AND exec_released_at IS NULL ORDER BY created_at, id LIMIT 1")
       .get(chainId);
-    return held ? `Job ${held.id} has not released its provider process yet. Try again after it is released.` : null;
+    return held ? `Job ${held.id} ${RELEASE_PENDING} Try again after it is released.` : null;
   });
 }
 
@@ -344,7 +349,14 @@ async function removeWorktreeCommand(options, positionals) {
   const store = await openCommandStore(stateDir);
   let outcome;
   try {
-    outcome = removePluginWorktree(ref, { cwd, stateDir, store, identity, force });
+    const deadline = Date.now() + RELEASE_WAIT_MS;
+    for (;;) {
+      outcome = removePluginWorktree(ref, { cwd, stateDir, store, identity, force });
+      if (outcome.ok || !String(outcome.message).includes(RELEASE_PENDING) || Date.now() >= deadline) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, RELEASE_POLL_MS));
+    }
   } finally {
     store.close();
   }

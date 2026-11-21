@@ -7,7 +7,7 @@ import { outputCommandResult, parseCommandInput, resolveCommandCwd } from "../li
 import { isGitRepository } from "../lib/git.mjs";
 import { getSessionId } from "../lib/host.mjs";
 import { reconcileStore } from "../lib/job-control.mjs";
-import { fenceFor, renderFleetTable } from "../lib/render.mjs";
+import { fenceFor, renderFleetTable, renderStoreResult } from "../lib/render.mjs";
 import {
   ManifestError,
   buildRunRecord,
@@ -198,6 +198,9 @@ function resultSection(entry) {
   let body;
   if (NOT_STARTED.has(entry.status) && entry.startError) {
     body = `(start failed: ${entry.startError})`;
+  } else if (row && row.kind === "review" && (row.result_text || row.result_json)) {
+    // A review reads as /agent:result shows it, not as its raw JSON.
+    body = renderStoreResult(entry.view).trimEnd();
   } else if (row && (row.result_text || row.result_json)) {
     const parts = [];
     if (row.result_text) {
