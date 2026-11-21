@@ -1480,7 +1480,7 @@ export const usage =
   " | crossexam <run-id> [--json] | merge <run-id> [--json]" +
   " | followup <run-id> <seat> --finding <cluster-id|stance> [--] <question> [--json]" +
   " | verdict <run-id> <cluster-id|claim-id> verified|rejected|not-checked [--strongest <n>] [--] [reason]" +
-  " | verdict <run-id> agreement agreed|partly|disagreed [--] <reason>" +
+  " | verdict <run-id> agreement agreed|partly|disagreed [--merge <sha256>] [--] <reason>" +
   " | export <run-id> brief|map|merge|report|followups [--json] | status <run-id> [--json] | report <run-id> [--json]";
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
@@ -2822,9 +2822,12 @@ export function currentMerge(runDir, snapshot) {
 // of how far the answers of an open council agree, on its current merge.
 async function agreementCouncil(options, { runId, value, reasonWords }, ctx) {
   const deadline = performance.now() + BUDGET_MS.submit;
-  const usageText = "verdict <run-id> agreement agreed|partly|disagreed [--] <reason>";
+  const usageText = "verdict <run-id> agreement agreed|partly|disagreed [--merge <sha256>] [--] <reason>";
   if (!AGREEMENT_VALUES.includes(value)) {
     throw new CouncilRefusal("invalid-arguments", `Usage: council ${usageText}`);
+  }
+  if (options.merge !== undefined && !/^[0-9a-f]{64}$/.test(String(options.merge))) {
+    throw new CouncilRefusal("invalid-arguments", "--merge must be the 64-character SHA-256 of the merge you reviewed (mergeSha256 in the council merge JSON).");
   }
   if (options.strongest !== undefined) {
     throw new CouncilRefusal("invalid-arguments", "--strongest applies only to a disputed cluster.");
@@ -2844,7 +2847,9 @@ async function agreementCouncil(options, { runId, value, reasonWords }, ctx) {
     if (!currentMerge(runDir, snapshot)) {
       throw new CouncilRefusal("stale-merge", "Run council merge first.");
     }
-    const recorded = await recordAgreement(store, { runId, value, reason, mergeSha256: snapshot.run.merge_sha256, inputRev: snapshot.run.input_rev, deadline });
+    // With --merge, the write transaction compares the reviewed digest with the current merge.
+    const mergeSha256 = options.merge ?? snapshot.run.merge_sha256;
+    const recorded = await recordAgreement(store, { runId, value, reason, mergeSha256, inputRev: snapshot.run.input_rev, deadline });
     if (!recorded.ok) {
       throw new CouncilRefusal(recorded.reason, recorded.reason === "stale-merge" ? "The council changed since its merge; run council merge again." : `The agreement was not recorded: ${recorded.reason}.`);
     }
@@ -2862,6 +2867,9 @@ async function verdictCouncil(options, positionals, ctx) {
   const [runId, targetId, verdict, ...reasonWords] = positionals;
   if (runId && targetId === "agreement") {
     return agreementCouncil(options, { runId, value: verdict, reasonWords }, ctx);
+  }
+  if (options.merge !== undefined) {
+    throw new CouncilRefusal("invalid-arguments", "--merge applies only to an agreement verdict.");
   }
   const usageText = "verdict <run-id> <cluster-id|claim-id> verified|rejected|not-checked [--strongest <n>] [--] [reason]";
   if (!runId || !targetId || !["verified", "rejected", "not-checked"].includes(verdict)) {
@@ -3531,7 +3539,7 @@ const SUBCOMMANDS = {
     run: (parsed, ctx) => followupCouncil(parsed.options, parsed.positionals, ctx)
   },
   verdict: {
-    args: { valueOptions: ["strongest"], dashPositionals: true },
+    args: { valueOptions: ["strongest", "merge"], dashPositionals: true },
     run: (parsed, ctx) => verdictCouncil(parsed.options, parsed.positionals, ctx)
   },
   export: {

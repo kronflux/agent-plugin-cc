@@ -500,6 +500,26 @@ test("an agreement verdict is refused on a review or question council, on a stal
   }
 });
 
+test("an agreement verdict with --merge binds to the merge the leader read and refuses another", async (t) => {
+  const clock = useTestClock(t, 0);
+  const fx = await round1Closed(t, clock, "open");
+  await round2Answered(fx, clock, (seat, letters) => answer2(letters, seat, { kind: "open" }));
+  const merged = await council(["merge", fx.runId, "--json"], { cwd: fx.cwd });
+  const read = merged.json.mergeSha256;
+  assert.match(read, /^[0-9a-f]{64}$/);
+  const other = read === "a".repeat(64) ? "b".repeat(64) : "a".repeat(64);
+  const stale = await council(["verdict", fx.runId, "agreement", "agreed", "--merge", other, "--json", "--", "same", "answers"], { cwd: fx.cwd });
+  assert.deepEqual([stale.code, stale.json?.error], [1, "stale-merge"], stale.stdout);
+  assert.equal(snap(fx).agreement, null);
+  const malformed = await council(["verdict", fx.runId, "agreement", "agreed", "--merge", "abc", "--json", "--", "same"], { cwd: fx.cwd });
+  assert.deepEqual([malformed.code, malformed.json?.error], [1, "invalid-arguments"], malformed.stdout);
+  const onCluster = await council(["verdict", fx.runId, "c1", "not-checked", "--merge", read, "--json"], { cwd: fx.cwd });
+  assert.deepEqual([onCluster.code, onCluster.json?.error], [1, "invalid-arguments"], onCluster.stdout);
+  const bound = await council(["verdict", fx.runId, "agreement", "partly", "--merge", read, "--json", "--", "two", "answers", "differ"], { cwd: fx.cwd });
+  assert.equal(bound.code, 0, bound.stdout);
+  assert.deepEqual([snap(fx).agreement.value, snap(fx).agreement.reason, snap(fx).agreement.merge_sha256], ["partly", "two answers differ", read]);
+});
+
 // ---------------------------------------------------------------------------------------------
 // The documents.
 

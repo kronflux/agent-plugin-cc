@@ -652,7 +652,9 @@ you have no vote.
   finding.
 - `open`: each seat answers in its own words, and in Round 2 lists the answers it agrees with in
   `agreesWith`. There is no vote. You judge how far the answers agree and record
-  `council verdict <run-id> agreement agreed|partly|disagreed [--] <reason>`; the report shows
+  `council verdict <run-id> agreement agreed|partly|disagreed [--merge <sha256>] [--] <reason>`
+  (`--merge` names the merge you read, as `council merge --json` reports it in `mergeSha256`; a
+  different current merge is refused with `stale-merge`); the report shows
   `Agreement (leader judgement): <value>` and lists every answer with the seats that agreed with it.
   An agreement verdict on any other kind of council exits 1.
 
