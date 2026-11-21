@@ -650,3 +650,23 @@ test("the skill, the seat agent, the prompts and the README describe the four mo
     assert.doesNotMatch(read(...file), /review council/, file.join("/"));
   }
 });
+
+test("a reply that omits a nullable required property, or wraps its JSON, is normalised before validation", async () => {
+  const { normalizeAnswerBytes, validateSchemaFile } = await import("../plugins/agent/scripts/lib/council/validate.mjs");
+  const response = { finding: "A-f1", response: "challenge", disputes: "claim", reason: "r", evidence: "e" };
+  const reply = { schema: 1, stance: "A", sameAs: [], responses: [response], added: [] };
+  assert.deepEqual(validateSchemaFile("council-round2-question", reply).errors, ["responses[0].sameAs: required property is missing"]);
+
+  const normalised = JSON.parse(normalizeAnswerBytes("council-round2-question", Buffer.from(JSON.stringify(reply))).toString("utf8"));
+  assert.equal(normalised.responses[0].sameAs, null);
+  assert.equal(validateSchemaFile("council-round2-question", normalised).ok, true);
+
+  const fenced = Buffer.from("Here is my answer:\n```json\n" + JSON.stringify(reply) + "\n```\n");
+  assert.deepEqual(JSON.parse(normalizeAnswerBytes("council-round2-question", fenced).toString("utf8")), normalised);
+
+  // A required property that may not be null stays missing, and text without an object stays as it is.
+  const noStance = { ...reply };
+  delete noStance.stance;
+  assert.equal(validateSchemaFile("council-round2-question", JSON.parse(normalizeAnswerBytes("council-round2-question", Buffer.from(JSON.stringify(noStance))).toString("utf8"))).ok, false);
+  assert.equal(normalizeAnswerBytes("council-round2-question", Buffer.from("no json here")).toString("utf8"), "no json here");
+});

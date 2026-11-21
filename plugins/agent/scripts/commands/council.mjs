@@ -98,6 +98,7 @@ import {
   answersInOwnWords,
   classifyFailure,
   classifyJob,
+  normalizeAnswerBytes,
   roundSchemaName,
   validateAnswer,
   validateFollowupAnswer,
@@ -625,7 +626,8 @@ function completedVerdict(runDir, snapshot, attempt, row, eventAt) {
   if (row.result_json === null || row.result_json === undefined) {
     return { outcome: "invalid", eventAt, reason: "missing structured output" };
   }
-  const bytes = Buffer.from(String(row.result_json), "utf8");
+  const context = validationContext(runDir, snapshot, attempt.seat, attempt.round);
+  const bytes = normalizeAnswerBytes(roundSchemaName(attempt.round, context.kind), Buffer.from(String(row.result_json), "utf8"));
   const answerSha256 = installObject(runDir, bytes, "json");
   let answer;
   try {
@@ -633,7 +635,6 @@ function completedVerdict(runDir, snapshot, attempt, row, eventAt) {
   } catch {
     answer = undefined;
   }
-  const context = validationContext(runDir, snapshot, attempt.seat, attempt.round);
   const checked = answer === undefined ? { ok: false, errors: ["answer: not valid JSON"] } : validateAnswer(attempt.round, answer, context);
   if (checked.ok) {
     return { outcome: "valid", eventAt, answerSha256 };
@@ -2030,7 +2031,9 @@ async function collectCouncil(options, positionals, ctx) {
 
 // The receipt verdict of a reply's bytes, with its objects (and at layer 1 or more the repair
 // prompt of an invalid reply) installed outside any transaction.
-function receiptVerdict(runDir, snapshot, attempt, bytes, layer) {
+function receiptVerdict(runDir, snapshot, attempt, received, layer) {
+  const context = attempt ? validationContext(runDir, snapshot, attempt.seat, attempt.round) : null;
+  const bytes = attempt ? normalizeAnswerBytes(roundSchemaName(attempt.round, context.kind), received) : received;
   let answer;
   try {
     answer = JSON.parse(bytes.toString("utf8"));
@@ -2042,7 +2045,6 @@ function receiptVerdict(runDir, snapshot, attempt, bytes, layer) {
     return { outcome: "invalid", reason: "schema validation failed" };
   }
   const answerSha256 = installObject(runDir, bytes, "json");
-  const context = validationContext(runDir, snapshot, attempt.seat, attempt.round);
   const checked = answer === undefined ? { ok: false, errors: ["answer: not valid JSON"] } : validateAnswer(attempt.round, answer, context);
   if (checked.ok) {
     return { outcome: "valid", answerSha256 };
@@ -2054,7 +2056,9 @@ function receiptVerdict(runDir, snapshot, attempt, bytes, layer) {
 // The receipt verdict of a stand-in's or carry's reply: its answer checked as that actor's (a
 // carry owns its Round 1 findings, a fresh Round 2 stand-in answers its alternate bundle and owns
 // none). An invalid reply has no repair: an extension turn settles once.
-function extensionReceiptVerdict(runDir, snapshot, turn, bytes) {
+function extensionReceiptVerdict(runDir, snapshot, turn, received) {
+  const context = validationContext(runDir, snapshot, turn.seat, turn.round, { actor: turnActor(turn) });
+  const bytes = normalizeAnswerBytes(roundSchemaName(turn.round, context.kind), received);
   let answer;
   try {
     answer = JSON.parse(bytes.toString("utf8"));
@@ -2062,7 +2066,6 @@ function extensionReceiptVerdict(runDir, snapshot, turn, bytes) {
     answer = undefined;
   }
   const answerSha256 = installObject(runDir, bytes, "json");
-  const context = validationContext(runDir, snapshot, turn.seat, turn.round, { actor: turnActor(turn) });
   const checked = answer === undefined ? { ok: false, errors: ["answer: not valid JSON"] } : validateAnswer(turn.round, answer, context);
   if (checked.ok) {
     return { outcome: "valid", answerSha256 };

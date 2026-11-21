@@ -492,6 +492,63 @@ export function validationContext(runDir, view, seat, round, { readObject = read
 // round: 1 or 2. context: { kind, options, bundleRefs, ownFindingIds, answerLabels }; bundleRefs,
 // ownFindingIds and answerLabels are used in round 2. The kind picks the round's schema. The
 // round rules run only on a schema-valid answer.
+// Fills what a careless but well-meant answer leaves out: a required property that the schema
+// allows to be null and the answer omits becomes null, at every depth. Nothing else is changed.
+function fillNullable(schema, value) {
+  if (!schema || typeof schema !== "object" || value === null || typeof value !== "object") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return schema.items ? value.map((item) => fillNullable(schema.items, item)) : value;
+  }
+  const properties = schema.properties ?? {};
+  const filled = { ...value };
+  for (const key of schema.required ?? []) {
+    const types = [].concat(properties[key]?.type ?? []);
+    if (!(key in filled) && types.includes("null")) {
+      filled[key] = null;
+    }
+  }
+  for (const [key, child] of Object.entries(properties)) {
+    if (key in filled) {
+      filled[key] = fillNullable(child, filled[key]);
+    }
+  }
+  return filled;
+}
+
+// The JSON object in a reply: the reply itself, or the text between its first "{" and its last
+// "}" when the reply wraps the object in a code fence or a sentence. Undefined when there is none.
+function parseReplyObject(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start === -1 || end <= start) {
+      return undefined;
+    }
+    try {
+      return JSON.parse(text.slice(start, end + 1));
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+/**
+ * The bytes of a reply in the form the council stores and validates: the JSON object of the reply
+ * with omitted nullable required properties set to null. A reply that holds no JSON object is
+ * returned unchanged, so its validation reports it.
+ */
+export function normalizeAnswerBytes(schemaName, bytes) {
+  const parsed = parseReplyObject(Buffer.from(bytes).toString("utf8"));
+  if (parsed === undefined || parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return Buffer.from(bytes);
+  }
+  return Buffer.from(JSON.stringify(fillNullable(loadCouncilSchema(schemaName), parsed)), "utf8");
+}
+
 export function validateAnswer(round, answer, context = {}) {
   const schemaName = roundSchemaName(round, context?.kind);
   const schemaCheck = validateSchemaFile(schemaName, answer);
