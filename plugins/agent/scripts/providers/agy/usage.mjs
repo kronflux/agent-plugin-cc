@@ -1,4 +1,5 @@
 import { runCommand } from "../../lib/process.mjs";
+import { agyEnv } from "./runtime.mjs";
 
 // The Antigravity quota report: `agy --print /usage --output-format json` prints one object whose
 // `command.data.groups` holds the quota groups and their buckets, and whose `response` holds the
@@ -11,7 +12,7 @@ const USAGE_ARGS = ["--print", "/usage", "--output-format", "json"];
  * parsed object, or `{ ok: false, reason, output }`.
  */
 export function readAgyUsage(cwd, { env = process.env, timeoutMs = 30000 } = {}) {
-  const result = runCommand("agy", USAGE_ARGS, { cwd, env, timeout: timeoutMs, input: "" });
+  const result = runCommand("agy", USAGE_ARGS, { cwd, env: agyEnv(env), timeout: timeoutMs, input: "" });
   const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
   if (result.error) {
     const reason = result.error.code === "ETIMEDOUT" ? `agy did not answer within ${Math.round(timeoutMs / 1000)} s` : `agy could not be run: ${result.error.message}`;

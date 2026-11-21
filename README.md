@@ -880,6 +880,11 @@ use `--sandbox` together with settings that deny agy's file-writing and command 
 outside the working folder that a turn must read are passed with `--add-dir`. An agy process
 is stopped after 30 minutes; set `AGY_COMPANION_TURN_TIMEOUT_MS` to change the limit.
 
+Every agy process the plugin starts runs with `AGY_CLI_DISABLE_AUTO_UPDATE=1`, because agy's
+background updater opens a visible console window on Windows. agy therefore updates only when you
+run it directly, for example with `agy update`. If you set `AGY_CLI_DISABLE_AUTO_UPDATE` yourself,
+the plugin keeps your value.
+
 The plugin's `agy-companion.mjs task` command, which the delegate subagent runs, also accepts
 `--output-schema <file>`, which asks for structured output and fails a turn that returns none,
 and `--prompt-file <file>`, which reads the prompt from a file.

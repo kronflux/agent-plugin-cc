@@ -5,6 +5,16 @@ import { fileURLToPath } from "node:url";
 
 import { binaryAvailable, runCommand } from "../../lib/process.mjs";
 
+// agy's background updater starts `agy --version` with a visible console window, so every agy
+// process the plugin starts runs with the updater off, unless the user set the variable. agy
+// then updates only when it is run directly.
+const AUTO_UPDATE_ENV = "AGY_CLI_DISABLE_AUTO_UPDATE";
+
+/** `env` with agy's background updater turned off, unless the variable is already set. */
+export function agyEnv(env = process.env) {
+  return env[AUTO_UPDATE_ENV] === undefined ? { ...env, [AUTO_UPDATE_ENV]: "1" } : env;
+}
+
 // Antigravity (agy) runs one process per turn in print mode with stream-json input and output:
 // the prompt is the one NDJSON line written to stdin, and agy answers with init, step_update and
 // one result event. The conversation id from those events continues the conversation in a later
@@ -64,13 +74,13 @@ const FALLBACK_EFFORTS = ["low", "medium", "high"];
  * versions; when it cannot be read, the efforts every known version accepts are returned.
  */
 export function readAgyEfforts(cwd) {
-  const result = runCommand("agy", ["--help"], { cwd, timeout: 30000 });
+  const result = runCommand("agy", ["--help"], { cwd, env: agyEnv(), timeout: 30000 });
   const match = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.match(/--effort[^\n]*\(([a-z|]+)\)/);
   return match ? match[1].split("|").filter(Boolean) : FALLBACK_EFFORTS;
 }
 
 export function getAgyAvailability(cwd) {
-  return binaryAvailable("agy", ["--version"], { cwd });
+  return binaryAvailable("agy", ["--version"], { cwd, env: agyEnv() });
 }
 
 export function ensureAgyAvailable(cwd) {
@@ -269,7 +279,7 @@ export const agyModelCatalog = Object.freeze({
 
 /** Lists the models agy offers; agy has no login-status command, so this doubles as the login check. */
 export function readAgyModels(cwd) {
-  const result = runCommand("agy", ["models"], { cwd, timeout: 60000 });
+  const result = runCommand("agy", ["models"], { cwd, env: agyEnv(), timeout: 60000 });
   if (result.error || result.status !== 0) {
     const detail = String(result.stderr || result.stdout || result.error?.message || "").trim();
     return { ok: false, failed: true, models: [], detail: detail || `agy models exited with ${result.status}.` };

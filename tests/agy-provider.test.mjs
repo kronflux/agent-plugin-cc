@@ -2098,3 +2098,24 @@ test("a job recorded with an id and its effort resumes without --effort", (t) =>
   assert.match(args.join(" "), /--model fake-model-high/);
   assert.equal(args.includes("--effort"), false, args.join(" "));
 });
+
+test("every agy process the plugin starts has agy's background updater off unless the variable is set", (t) => {
+  const ctx = makeRepo(undefined, t);
+  for (const args of [["setup"], ["usage"], ["task", "hi"]]) {
+    run("node", [AGY, ...args], { cwd: ctx.repo, env: ctx.env, timeout: 60000 });
+  }
+  const calls = readFakeAgyState(ctx.binDir).autoUpdateEnv ?? [];
+  const commands = new Set(calls.map((call) => call.command));
+  for (const command of ["--version", "models", "--help", "--print", "--input-format"]) {
+    assert.ok(commands.has(command), `no agy ${command} call in ${JSON.stringify(calls)}`);
+  }
+  assert.deepEqual(calls.filter((call) => call.value !== "1"), []);
+
+  const preset = makeRepo(undefined, t);
+  const env = { ...preset.env, AGY_CLI_DISABLE_AUTO_UPDATE: "0" };
+  run("node", [AGY, "setup"], { cwd: preset.repo, env, timeout: 60000 });
+  run("node", [AGY, "task", "hi"], { cwd: preset.repo, env, timeout: 60000 });
+  const presetCalls = readFakeAgyState(preset.binDir).autoUpdateEnv ?? [];
+  assert.ok(presetCalls.length > 0);
+  assert.deepEqual(presetCalls.filter((call) => call.value !== "0"), []);
+});
