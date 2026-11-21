@@ -756,7 +756,7 @@ test("an invalid model or effort on review is rejected before any job exists", (
   assert.match(agyModel.stderr, /Model "no-such-model" is not in the Antigravity model list/);
   const agyEffort = run("node", [AGY, "review", "--effort", "max"], { cwd: ctx.repo, env: agy.env });
   assert.equal(agyEffort.status, 1, agyEffort.stdout);
-  assert.match(agyEffort.stderr, /agy does not support reasoning effort "max"/);
+  assert.match(agyEffort.stderr, /^Antigravity needs a model for --effort max\. Use --model <base> --effort max or --model <base>-max\.$/m);
   assert.deepEqual(jobFolderEntries(ctx.repo), []);
   assert.deepEqual(storeRows(ctx.repo), []);
   assert.equal(readFakeAgyState(agy.binDir).runs.length, 0);

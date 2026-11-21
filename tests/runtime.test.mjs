@@ -1998,8 +1998,26 @@ function codexCli(t, behavior = "review-ok") {
     const file = path.join(binDir, "fake-codex-state.json");
     return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
   };
-  const released = (jobId) =>
-    storeFixtures.waitFor(() => storeFixtures.jobRow(stateDir, jobId)?.exec_released_at !== null, { timeoutMs: 60000, describe: `the release of ${jobId}` });
+  // A release the worker left to reconciliation (on Windows its tree stop can find the wrapper's
+  // root already gone) is completed by the scan of the next command, so once the job has ended a
+  // status command runs every few seconds, as a user's next command would.
+  const released = (jobId) => {
+    let lastScan = Date.now();
+    return storeFixtures.waitFor(
+      () => {
+        const row = storeFixtures.jobRow(stateDir, jobId);
+        if (row?.exec_released_at !== null) {
+          return true;
+        }
+        if (row?.end_state !== null && Date.now() - lastScan > 3000) {
+          cli("status", "--json");
+          lastScan = Date.now();
+        }
+        return false;
+      },
+      { timeoutMs: 90000, describe: `the release of ${jobId}` }
+    );
+  };
   return { repo, stateDir, binDir, env, cli, rows, readFake, released };
 }
 

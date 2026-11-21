@@ -983,7 +983,8 @@ test("collect returns the stored close or a named wake", async (t) => {
     ]);
     assert.deepEqual([closedJson.json.wake, closedJson.json.quorum, closedJson.json.validSeats, closedJson.json.memberTurns], ["closed", true, 3, 3]);
   }
-  // A closed round without quorum, and a cleanup pass bounded by a 50 ms command budget.
+  // A closed round without quorum, and a cleanup pass bounded by a 2 s command budget. The store
+  // measures the same deadline on the real clock, so the budget leaves room for a slow machine.
   {
     clock.set(0);
     const { cwd, store, runDir, stateDir } = commandFixture(t);
@@ -997,7 +998,7 @@ test("collect returns the stored close or a named wake", async (t) => {
     // stop stays selectable, and a fake E18 that never selects it keeps the stop pending.
     setJob(store, job2, { end_state: "completed", end_at: EPOCH + 1011, result_json: answerText() });
     const time = fakeTime();
-    const closed = await council(["collect", "run-1", "--round", "1", "--disallow-substitute", "--budget-ms", "50", "--json"], {
+    const closed = await council(["collect", "run-1", "--round", "1", "--disallow-substitute", "--budget-ms", "2000", "--json"], {
       cwd,
       advance: { now: time.now, sleep: time.sleep, requestStop: () => ({ selection: [] }) }
     });
@@ -1005,11 +1006,12 @@ test("collect returns the stored close or a named wake", async (t) => {
     assert.equal(closed.json.wake, "closed");
     assert.equal(closed.json.cleanupPending, true);
     assert.equal(closed.json.quorum, false);
-    // The cleanup ended at the 50 ms command deadline, not after a fresh 30 seconds.
-    assert.ok(time.state.sleeps.reduce((a, b) => a + b, 0) <= 50);
-    const text = await council(["collect", "run-1", "--round", "1", "--disallow-substitute", "--budget-ms", "50"], {
+    // The cleanup ended at the 2 s command deadline, not after a fresh 30 seconds.
+    assert.ok(time.state.sleeps.reduce((a, b) => a + b, 0) <= 2000);
+    const textTime = fakeTime();
+    const text = await council(["collect", "run-1", "--round", "1", "--disallow-substitute", "--budget-ms", "2000"], {
       cwd,
-      advance: { now: time.now, sleep: time.sleep, requestStop: () => ({ selection: [] }) }
+      advance: { now: textTime.now, sleep: textTime.sleep, requestStop: () => ({ selection: [] }) }
     });
     assert.equal(text.stdout, "No quorum: 0 valid seats from 0 families. A council needs two valid seats from two families.\n");
   }

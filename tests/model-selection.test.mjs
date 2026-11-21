@@ -55,7 +55,13 @@ test("a family word missing from a readable debug catalog does not fall back to 
 test("listCatalogModels gives up after the catalog timeout", async () => {
   const client = { request: () => new Promise(() => {}) };
   const started = Date.now();
-  await assert.rejects(listCatalogModels(client, { timeoutMs: 200 }), /did not answer/);
+  // The catalog timer does not keep a process alive, so this timer keeps the test waiting for it.
+  const keepAlive = setTimeout(() => {}, 5000);
+  try {
+    await assert.rejects(listCatalogModels(client, { timeoutMs: 200 }), /did not answer/);
+  } finally {
+    clearTimeout(keepAlive);
+  }
   assert.ok(Date.now() - started < 1000, `took ${Date.now() - started} ms`);
 });
 

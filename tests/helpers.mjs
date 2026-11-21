@@ -8,8 +8,26 @@ import { pathToFileURL } from "node:url";
 
 const tempDirs = new Set();
 
-function removeDir(dir) {
-  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+const BUSY_CODES = new Set(["EBUSY", "EPERM", "ENOTEMPTY", "EMFILE", "ENFILE"]);
+
+/**
+ * Removes a folder and everything in it. A process that a test started can hold a folder for a
+ * moment after it was told to stop, and on the Node 22 line `fs.rmSync` does not retry a busy
+ * empty folder, so a busy folder is tried again here for up to `waitMs`.
+ */
+export function removeDir(dir, { waitMs = 15000 } = {}) {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      return;
+    } catch (error) {
+      if (!BUSY_CODES.has(error?.code) || Date.now() >= deadline) {
+        throw error;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+    }
+  }
 }
 
 // Removes every folder still registered when the test file ends and reports any it cannot

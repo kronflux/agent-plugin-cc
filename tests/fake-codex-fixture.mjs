@@ -146,7 +146,10 @@ function withStateLock(fn) {
       fs.writeFileSync(LOCK_PATH, String(process.pid), { flag: "wx" });
       break;
     } catch (error) {
-      if (error.code !== "EEXIST") {
+      // On Windows a lock file that its holder is removing refuses the open with EPERM, EBUSY or
+      // EACCES for a moment; that is a held lock, not a failure.
+      const BUSY = new Set(["EPERM", "EBUSY", "EACCES"]);
+      if (error.code !== "EEXIST" && !BUSY.has(error.code)) {
         throw error;
       }
       let holder = NaN;
@@ -156,7 +159,9 @@ function withStateLock(fn) {
         if (readError.code === "ENOENT") {
           continue;
         }
-        throw readError;
+        if (!BUSY.has(readError.code)) {
+          throw readError;
+        }
       }
       if (Number.isInteger(holder) && holder > 0 && !processAlive(holder)) {
         fs.rmSync(LOCK_PATH, { force: true });
@@ -1054,7 +1059,9 @@ function handleMessage(message) {
 	          break;
 	        }
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
-	        if (message.params.clientUserMessageId) {
+	        // history-pages reports no user message for a request, so only the thread history can
+	        // show that a message arrived; a receipt could reach the client before it stops.
+	        if (message.params.clientUserMessageId && BEHAVIOR !== "history-pages") {
 	          // The request's user message carries its client id, as Codex reports it.
 	          const userItem = { type: "userMessage", id: "user_" + turnId, clientId: message.params.clientUserMessageId, content: message.params.input || [] };
 	          send({ method: "item/started", params: { threadId: thread.id, turnId, item: userItem } });
