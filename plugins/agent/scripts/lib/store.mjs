@@ -59,7 +59,23 @@ function loadSqlite() {
   if (process.env.AGENT_PLUGIN_TEST_SQLITE_VERSION === "import-fail") {
     throw new Error("node:sqlite did not load");
   }
-  sqliteModule ??= require("node:sqlite");
+  if (!sqliteModule) {
+    // On the Node 22 line the first load prints an ExperimentalWarning. A command started without
+    // NODE_LAUNCH_FLAGS would carry it in its stderr, so it is dropped here, and only it.
+    const emitWarning = process.emitWarning;
+    process.emitWarning = function (warning, ...rest) {
+      const type = typeof rest[0] === "string" ? rest[0] : rest[0]?.type;
+      if (type === "ExperimentalWarning" && /sqlite/i.test(String(warning?.message ?? warning))) {
+        return;
+      }
+      return emitWarning.call(process, warning, ...rest);
+    };
+    try {
+      sqliteModule = require("node:sqlite");
+    } finally {
+      process.emitWarning = emitWarning;
+    }
+  }
   return sqliteModule;
 }
 
