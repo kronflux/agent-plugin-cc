@@ -94,6 +94,27 @@ test("setup shows the app server user agent when known", () => {
   assert.doesNotMatch(renderSetupReport({ ...report, appServer: null }), /app server/);
 });
 
+test("the Codex setup report names the write sandbox and its source", () => {
+  const report = {
+    ready: true,
+    node: { detail: "v22" },
+    npm: { detail: "10" },
+    codex: { detail: "codex-cli 0.160.0" },
+    auth: { detail: "logged in" },
+    appServer: null,
+    sessionRuntime: { label: "direct startup" },
+    reviewGateEnabled: false,
+    writeSandbox: "danger-full-access",
+    sources: { model: "provider-default", effort: "provider-default", writeSandbox: "user" },
+    delegation: { model: "m-default", effort: "low", modelSource: "catalog-default", effortSource: "catalog-default" },
+    actionsTaken: [],
+    nextSteps: []
+  };
+  assert.match(renderSetupReport(report), /^- write sandbox: danger-full-access \(user setting\)$/m);
+  const defaulted = { ...report, writeSandbox: "workspace-write", sources: { ...report.sources, writeSandbox: "provider-default" } };
+  assert.match(renderSetupReport(defaulted), /^- write sandbox: workspace-write \(provider-default\)$/m);
+});
+
 const REVIEW_META = { reviewLabel: "Review", targetLabel: "working tree diff" };
 
 test("severity labels sort regardless of case", () => {

@@ -255,6 +255,7 @@ test("codex setup --scope user stores the delegation model for every workspace",
   const text = companion(CODEX, other, ["setup"]);
   assert.match(text.stdout, /^- delegation model: gpt-5\.6-luna \(user setting\)$/m);
   assert.match(text.stdout, /^- delegation effort: high \(user setting\)$/m);
+  assert.match(text.stdout, /^- write sandbox: danger-full-access \(user setting\)$/m);
   assert.equal(configBytes(other.repo), null);
 });
 
