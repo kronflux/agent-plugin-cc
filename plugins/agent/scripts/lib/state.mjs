@@ -352,20 +352,11 @@ export function userConfigFile() {
   return settingsDir ? path.join(settingsDir, USER_CONFIG_FILE_NAME) : dataUserConfigFile();
 }
 
-// Moves a user config that an earlier version wrote into the plugin data folder to its place in
-// the profile, once, when no file is there yet.
-function adoptDataUserConfig(file) {
+// The file to read the user config from: its place in the profile, or, while that does not exist,
+// the file an earlier version wrote into the plugin data folder.
+function readableUserConfigFile(file) {
   const earlier = dataUserConfigFile();
-  if (earlier === file || fs.existsSync(file) || !fs.existsSync(earlier)) {
-    return;
-  }
-  try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.copyFileSync(earlier, file, fs.constants.COPYFILE_EXCL);
-    fs.rmSync(earlier, { force: true });
-  } catch {
-    // Another process adopted it first, or the folder cannot be written; the read decides.
-  }
+  return earlier !== file && !fs.existsSync(file) && fs.existsSync(earlier) ? earlier : file;
 }
 
 function defaultUserConfig() {
@@ -399,8 +390,7 @@ function readUserConfigFile(file) {
  * a file that cannot be read reads as the defaults with one warning per file and process.
  */
 export function getUserConfig() {
-  const file = userConfigFile();
-  adoptDataUserConfig(file);
+  const file = readableUserConfigFile(userConfigFile());
   const read = readUserConfigFile(file);
   if (read.error) {
     if (!warnedUserConfigFiles.has(file)) {
@@ -503,14 +493,16 @@ export function releaseUserConfigLock(lockFile, token) {
  */
 export function updateUserConfig(mutator, lockOptions = {}) {
   const file = userConfigFile();
-  adoptDataUserConfig(file);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const lockFile = `${file}.lock`;
   const token = acquireUserConfigLock(lockFile, lockOptions);
   try {
-    const read = readUserConfigFile(file);
+    // Under the lock, the file of an earlier version is the base of the first write to the
+    // profile; it is removed only after that write, so a failed write loses nothing.
+    const source = readableUserConfigFile(file);
+    const read = readUserConfigFile(source);
     if (read.error) {
-      throw new Error(`The user settings file ${file} cannot be used: ${read.error}. Fix or remove it, then run setup again.`);
+      throw new Error(`The user settings file ${source} cannot be used: ${read.error}. Fix or remove it, then run setup again.`);
     }
     const next = mutator(structuredClone(read.config)) ?? read.config;
     const written = { ...next, version: USER_CONFIG_VERSION, models: next.models ?? {} };
@@ -518,6 +510,9 @@ export function updateUserConfig(mutator, lockOptions = {}) {
       throw new Error(`The user settings lock ${lockFile} was taken by another setup; nothing was written. Run setup again.`);
     }
     writeJsonAtomic(file, written);
+    if (source !== file) {
+      fs.rmSync(source, { force: true });
+    }
     return written;
   } finally {
     releaseUserConfigLock(lockFile, token);

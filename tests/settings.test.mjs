@@ -363,13 +363,17 @@ test("user settings of a plugin data folder inside a Claude Code profile live in
     const file = path.join(profile, "agent-plugin", "user-config.json");
     assert.equal(state.userConfigFile(), file);
 
-    // A file an earlier version wrote into the data folder is adopted once.
-    fs.writeFileSync(path.join(dataDir, "user-config.json"), JSON.stringify({ version: 1, models: {}, writeSandbox: "danger-full-access" }));
+    // A file an earlier version wrote into the data folder is read where it is; a read moves nothing.
+    const earlier = path.join(dataDir, "user-config.json");
+    fs.writeFileSync(earlier, JSON.stringify({ version: 1, models: { codex: { model: "m", effort: null } }, writeSandbox: "danger-full-access" }));
     assert.equal(state.getUserConfig().writeSandbox, "danger-full-access");
-    assert.equal(fs.existsSync(file), true);
-    assert.equal(fs.existsSync(path.join(dataDir, "user-config.json")), false);
+    assert.equal(fs.existsSync(file), false);
+    assert.equal(fs.existsSync(earlier), true);
 
+    // The first update writes the profile file from it, keeps its other keys, then removes it.
     state.setUserConfig("writeSandbox", "workspace-write");
+    assert.equal(fs.existsSync(earlier), false);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { version: 1, models: { codex: { model: "m", effort: null } }, writeSandbox: "workspace-write" });
     fs.rmSync(dataDir, { recursive: true, force: true });
     assert.equal(state.getUserConfig().writeSandbox, "workspace-write");
   } finally {
