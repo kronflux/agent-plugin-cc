@@ -499,3 +499,29 @@ test("an agreement verdict is refused on a review or question council, on a stal
     assert.deepEqual([snap(fx).agreement.value, snap(fx).agreement.reason, snap(fx).run.verdict_rev], [value, `judged ${value}`, before + 1]);
   }
 });
+
+// ---------------------------------------------------------------------------------------------
+// The documents.
+
+test("the skill, the seat agent, the prompts and the README describe the four modes and call the panel a council", () => {
+  const root = path.resolve(import.meta.dirname, "..");
+  const read = (...parts) => fs.readFileSync(path.join(root, ...parts), "utf8");
+  const skill = read("plugins", "agent", "skills", "council", "SKILL.md");
+  for (const text of ["`review`", "`decision`", "`question`", "`open`", "`agree`", "council verdict <run-id> agreement agreed|partly|disagreed", "Agreement (leader judgement)", "a vote would mislead"]) {
+    assert.ok(skill.includes(text), `the council skill names ${text}`);
+  }
+  const readme = read("README.md");
+  const section = readme.slice(readme.indexOf("## Council"), readme.indexOf("## Job store"));
+  for (const text of ["**Four modes.**", "`question`", "`open`", "`sameAs`", "`agreesWith`", "council verdict <run-id> agreement agreed|partly|disagreed", "evidence, first principles and counterexamples", "`agree`"]) {
+    assert.ok(section.includes(text), `the README council section names ${text}`);
+  }
+  for (const file of [
+    ["plugins", "agent", "prompts", "council-round1.md"],
+    ["plugins", "agent", "prompts", "council-round2.md"],
+    ["plugins", "agent", "prompts", "council-followup.md"],
+    ["plugins", "agent", "prompts", "council-substitute.md"],
+    ["plugins", "agent", "agents", "council-member.md"]
+  ]) {
+    assert.doesNotMatch(read(...file), /review council/, file.join("/"));
+  }
+});

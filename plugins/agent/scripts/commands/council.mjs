@@ -3305,9 +3305,8 @@ export function renderFailedReport(runDir, snapshot) {
   return `${lines.join("\n").replace(/\n+$/, "")}\n`;
 }
 
-// The answers of a question or open council, each with the seats that linked it to their own
-// view: on a question, the seats whose vote went to its option; on an open council, the seats
-// that listed it in `agreesWith`. Then, on a question, the options of the vote.
+// The answers of a question or open council; on an open council each answer names the seats that
+// listed it in `agreesWith`. Then, on a question, the options of the vote.
 function answerSections(merge, input) {
   const answers = merge.answers ?? [];
   const labelOf = new Map(answers.map((entry) => [entry.seat, entry.label]));
