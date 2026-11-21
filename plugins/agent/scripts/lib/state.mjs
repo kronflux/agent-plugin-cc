@@ -372,42 +372,99 @@ export function getUserConfig() {
   return read.config;
 }
 
-function acquireUserConfigLock(lockFile) {
+function readLockToken(file) {
+  try {
+    return fs.readFileSync(file, "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Takes the user config lock `lockFile` and returns the random token it now holds. The lock is
+ * created exclusively. A lock older than `staleMs` was left by a process that ended inside its
+ * write; it is recovered only by renaming it to a unique name, which one process alone can do,
+ * and the renamed file is checked to still hold the token that was judged stale. A fresh lock
+ * taken by mistake is put back. Throws, naming the lock file, when the lock stays held past
+ * `retryMs`. `hooks.beforeStaleRename` (tests) runs between the stale check and the rename.
+ * Exported for tests.
+ */
+export function acquireUserConfigLock(lockFile, { retryMs = USER_CONFIG_LOCK_RETRY_MS, staleMs = USER_CONFIG_LOCK_STALE_MS, hooks = null } = {}) {
   ensurePrivateDir(path.dirname(lockFile));
-  const deadline = Date.now() + USER_CONFIG_LOCK_RETRY_MS;
+  const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
+  const deadline = Date.now() + retryMs;
   for (let delay = 10; ; delay = Math.min(delay * 2, 100)) {
     try {
-      fs.writeFileSync(lockFile, `${process.pid}\n`, { flag: "wx", mode: PRIVATE_FILE_MODE });
-      return;
+      fs.writeFileSync(lockFile, `${token}\n`, { flag: "wx", mode: PRIVATE_FILE_MODE });
+      return token;
     } catch (error) {
       if (error?.code !== "EEXIST") {
         throw error;
       }
+    }
+    let stale = null;
+    try {
+      if (Date.now() - fs.statSync(lockFile).mtimeMs > staleMs) {
+        stale = readLockToken(lockFile);
+      }
+    } catch {
+      continue;
+    }
+    if (stale !== null) {
+      hooks?.beforeStaleRename?.();
+      const moved = `${lockFile}.stale-${token}`;
+      let renamed = false;
       try {
-        if (Date.now() - fs.statSync(lockFile).mtimeMs > USER_CONFIG_LOCK_STALE_MS) {
-          fs.rmSync(lockFile, { force: true });
+        fs.renameSync(lockFile, moved);
+        renamed = true;
+      } catch {
+        // Another process moved or released it first.
+      }
+      if (renamed) {
+        if (readLockToken(moved) === stale) {
+          fs.rmSync(moved, { force: true });
           continue;
         }
-      } catch {
-        continue;
+        // The lock was replaced by a fresh one after the stale check: put it back, unless a third
+        // process has taken the free lock meanwhile; that holder and the owner of the moved lock
+        // then meet in `holdsUserConfigLock` before either writes.
+        try {
+          fs.linkSync(moved, lockFile);
+        } catch {
+          // The lock is held again; the owner of the moved one fails its check.
+        }
+        fs.rmSync(moved, { force: true });
       }
-      if (Date.now() >= deadline) {
-        throw new Error(`The user settings file is locked by another setup (${lockFile}); try again.`);
-      }
-      sleepSync(delay);
     }
+    if (Date.now() >= deadline) {
+      throw new Error(`The user settings file is locked by another setup (${lockFile}); try again.`);
+    }
+    sleepSync(delay);
+  }
+}
+
+/** True when `lockFile` still holds `token`. Exported for tests. */
+export function holdsUserConfigLock(lockFile, token) {
+  return readLockToken(lockFile) === token;
+}
+
+/** Removes `lockFile` only when it still holds `token`. Exported for tests. */
+export function releaseUserConfigLock(lockFile, token) {
+  if (holdsUserConfigLock(lockFile, token)) {
+    fs.rmSync(lockFile, { force: true });
   }
 }
 
 /**
  * Changes the user config under an exclusive lock: reads it, passes a copy to `mutator`, and
  * writes the result atomically. A file that exists but cannot be read, or has an unknown version,
- * is never overwritten; the call throws an error that names it. Returns the written config.
+ * is never overwritten; the call throws an error that names it. The lock is checked again just
+ * before the write, so a writer that lost it writes nothing. Returns the written config.
  */
-export function updateUserConfig(mutator) {
+export function updateUserConfig(mutator, lockOptions = {}) {
   const file = userConfigFile();
   const lockFile = `${file}.lock`;
-  acquireUserConfigLock(lockFile);
+  const token = acquireUserConfigLock(lockFile, lockOptions);
   try {
     const read = readUserConfigFile(file);
     if (read.error) {
@@ -415,10 +472,13 @@ export function updateUserConfig(mutator) {
     }
     const next = mutator(structuredClone(read.config)) ?? read.config;
     const written = { ...next, version: USER_CONFIG_VERSION, models: next.models ?? {} };
+    if (!holdsUserConfigLock(lockFile, token)) {
+      throw new Error(`The user settings lock ${lockFile} was taken by another setup; nothing was written. Run setup again.`);
+    }
     writeJsonAtomic(file, written);
     return written;
   } finally {
-    fs.rmSync(lockFile, { force: true });
+    releaseUserConfigLock(lockFile, token);
   }
 }
 

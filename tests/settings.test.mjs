@@ -269,3 +269,30 @@ test("without a plugin data folder the user config sits in the fallback state ro
   assert.equal(path.dirname(state.userConfigFile()), path.dirname(state.resolveStateDir(workspace)));
   assert.equal(path.basename(state.userConfigFile()), "user-config.json");
 });
+
+test("two writers racing on a stale user config lock never both hold it", (t) => {
+  const dir = usePluginData(t);
+  const lockFile = path.join(dir, "user-config.json.lock");
+  fs.writeFileSync(lockFile, "old-token\n");
+  const old = new Date(Date.now() - 120000);
+  fs.utimesSync(lockFile, old, old);
+  let second = null;
+  // Writer A judges the lock stale; before it moves the lock, writer B recovers the same stale
+  // lock and takes a fresh one. A must leave B's lock in place and give up within its deadline.
+  const hooks = {
+    beforeStaleRename() {
+      if (second === null) {
+        second = state.acquireUserConfigLock(lockFile);
+      }
+    }
+  };
+  assert.throws(() => state.acquireUserConfigLock(lockFile, { retryMs: 300, hooks }), (error) => error.message.includes(lockFile));
+  assert.ok(second);
+  assert.equal(state.holdsUserConfigLock(lockFile, second), true);
+  assert.deepEqual(fs.readdirSync(dir).filter((name) => name.includes(".stale-")), []);
+  // A release removes the lock only for its holder.
+  state.releaseUserConfigLock(lockFile, "someone-else");
+  assert.equal(fs.existsSync(lockFile), true);
+  state.releaseUserConfigLock(lockFile, second);
+  assert.equal(fs.existsSync(lockFile), false);
+});
