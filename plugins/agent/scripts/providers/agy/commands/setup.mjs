@@ -3,7 +3,6 @@ import { delegationLines, describeDelegation, planDelegationSetting } from "../.
 import { binaryAvailable } from "../../../lib/process.mjs";
 import {
   checkWriteSandbox,
-  delegationSetting,
   parseSetupArguments,
   resolveSetting,
   settingSources,
@@ -12,7 +11,15 @@ import {
 } from "../../../lib/settings.mjs";
 import { getConfig, setConfig, updateUserConfig } from "../../../lib/state.mjs";
 import { agyProvider } from "../index.mjs";
-import { getAgyAvailability, readAgyEfforts, readAgyModels, readAgySavedModel, resolveAgyDelegationModel } from "../runtime.mjs";
+import {
+  agyModelEfforts,
+  getAgyAvailability,
+  readAgyEfforts,
+  readAgyModels,
+  readAgySavedModel,
+  resolveAgyDelegationModel,
+  splitAgyModel
+} from "../runtime.mjs";
 
 export const usage = `setup [--scope project|user] [--model <id|family|default|configured>] [--effort <level>] [--write-sandbox <${WRITE_SANDBOXES.join("|")}>] [--json]`;
 
@@ -63,6 +70,13 @@ export async function handleSetup(argv) {
   const described = await describeDelegation(agyProvider, workspaceRoot, cwd);
   // Without a model agy uses the model saved in its settings.
   const delegation = { ...described, providerModel: described.model || described.error ? null : readAgySavedModel() };
+  // The efforts of the delegation model's base name, read from the ids `agy models` lists.
+  const efforts = agy.available ? readAgyEfforts(cwd) : [];
+  const modelIds = login.models.map((entry) => entry.id);
+  const split = delegation.model && login.ok ? splitAgyModel(delegation.model, { models: modelIds, efforts }) : null;
+  const delegationEfforts = delegation.model && login.ok
+    ? { base: split?.base ?? delegation.model, efforts: split ? agyModelEfforts(split.base, modelIds, efforts) : [] }
+    : null;
   const nextSteps = [];
   if (!agy.available) {
     nextSteps.push("Install the Antigravity CLI (agy), then rerun /agent:agy-setup.");
@@ -82,8 +96,9 @@ export async function handleSetup(argv) {
     version: agy.available ? installedVersion(agy.detail) : null,
     modelCount: login.models.length,
     // The model a delegation uses, by agy's display name (the saved default is one already).
-    delegationModel: resolveAgyDelegationModel(cwd, { setting: delegationSetting(agyProvider, workspaceRoot).setting?.model ?? null }),
-    efforts: agy.available ? readAgyEfforts(cwd) : [],
+    delegationModel: resolveAgyDelegationModel(cwd, { setting: delegation.model ?? null }),
+    efforts,
+    delegationEfforts,
     actionsTaken,
     nextSteps
   };
@@ -107,7 +122,9 @@ export async function handleSetup(argv) {
     `- version: ${report.version ?? "unknown"}`,
     `- models: ${report.modelCount}`,
     `- delegation model by display name: ${report.delegationModel.displayName ? `${report.delegationModel.displayName}, ${delegationSource}` : "unknown"}`,
-    `- efforts: ${report.efforts.length > 0 ? report.efforts.join(", ") : "unknown"}`
+    delegationEfforts
+      ? `- efforts of ${delegationEfforts.base}: ${delegationEfforts.efforts.length > 0 ? delegationEfforts.efforts.join(", ") : "none"}`
+      : `- efforts: ${report.efforts.length > 0 ? report.efforts.join(", ") : "unknown"}`
   );
   lines.push("", "Cleanup:", ...report.contracts.map((line) => `- ${line}`));
   if (actionsTaken.length > 0) {

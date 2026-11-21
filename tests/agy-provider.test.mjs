@@ -19,7 +19,7 @@ import * as readonlyGuard from "../plugins/agent/scripts/providers/agy/readonly-
 import { augmentSchemaForQuestions, QUESTION_INSTRUCTION } from "../plugins/agent/scripts/lib/task-launch.mjs";
 import { makeStoreDir, rawAll, rawExec } from "./store-fixtures.mjs";
 import { createHash } from "node:crypto";
-import { getConfig, resolveStateDir } from "../plugins/agent/scripts/lib/state.mjs";
+import { getConfig, resolveStateDir, setConfig } from "../plugins/agent/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const AGY = path.join(ROOT, "plugins", "agent", "scripts", "agy-companion.mjs");
@@ -253,15 +253,19 @@ test("a resumed agy task continues its conversation in a new process", async (t)
 
 test("a resumed agy task keeps its model and effort", async (t) => {
   const ctx = makeRepo(undefined, t);
-  const first = run("node", [AGY, "task", "--json", "--model", "fake-model-low", "--effort", "low", "first"], { cwd: ctx.repo, env: ctx.env });
+  const first = run("node", [AGY, "task", "--json", "--model", "fake-model", "--effort", "low", "first"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(first.status, 0, first.stderr);
 
   const resumed = run("node", [AGY, "task", "--json", "--resume-last", "more"], { cwd: ctx.repo, env: ctx.env });
 
   assert.equal(resumed.status, 0, resumed.stderr);
+  assert.doesNotMatch(resumed.stderr, /Effort/);
   const runs = readFakeAgyState(ctx.binDir).runs;
   assert.equal(runs.length, 2);
-  assert.match(runs[1].args.join(" "), /--model fake-model-low --effort low/);
+  for (const agyRun of runs) {
+    assert.match(agyRun.args.join(" "), /--model fake-model-low/);
+    assert.equal(agyRun.args.includes("--effort"), false, agyRun.args.join(" "));
+  }
   const successor = job(ctx.repo, JSON.parse(resumed.stdout).jobId);
   assert.equal(successor.model, "fake-model-low");
   assert.equal(requestOf(successor).effort, "low");
@@ -299,9 +303,11 @@ test("agy accepts the efforts its help lists and rejects others before starting"
   assert.match(rejected.stderr, /agy does not support reasoning effort "max"\. Use one of: low, medium, high, xhigh/);
   assert.equal(readFakeAgyState(ctx.binDir).runs.length, 0);
 
-  const accepted = run("node", [AGY, "task", "--effort", "xhigh", "do it"], { cwd: ctx.repo, env: ctx.env });
-  assert.equal(accepted.status, 0, accepted.stderr);
-  assert.match(readFakeAgyState(ctx.binDir).runs[0].args.join(" "), /--effort xhigh/);
+  // agy is never given --effort, so an effort needs a model whose id can carry it.
+  const withoutModel = run("node", [AGY, "task", "--effort", "xhigh", "do it"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(withoutModel.status, 1);
+  assert.match(withoutModel.stderr, /^Antigravity needs a model for --effort xhigh\. Use --model <base> --effort xhigh or --model <base>-xhigh\.$/m);
+  assert.equal(readFakeAgyState(ctx.binDir).runs.length, 0);
 });
 
 test("an agy that exits before reading its prompt fails the job with a message", async (t) => {
@@ -650,19 +656,18 @@ test("a resumed agy conversation names a changed saved model", (t) => {
   assert.equal(requestOf(latestAgyJob(ctx.repo)).providerModel, "Fake Model (Low)");
 });
 
-test("agy rejects a suffixed model with a different --effort", (t) => {
+test("agy rejects a suffixed model with any --effort, also the same one", (t) => {
   const ctx = makeRepo(undefined, t);
-  const rejected = run("node", [AGY, "task", "--model", "fake-model-high", "--effort", "low", "hi"], { cwd: ctx.repo, env: ctx.env });
-  assert.equal(rejected.status, 1);
-  assert.match(
-    rejected.stderr,
-    /Antigravity model fake-model-high already sets effort high; remove --effort low or choose a model without an effort suffix\./
-  );
+  for (const effort of ["low", "high"]) {
+    const rejected = run("node", [AGY, "task", "--model", "fake-model-high", "--effort", effort, "hi"], { cwd: ctx.repo, env: ctx.env });
+    assert.equal(rejected.status, 1);
+    assert.equal(
+      rejected.stderr,
+      "Antigravity model fake-model-high already includes effort high. Use either --model fake-model-high, or --model fake-model --effort <effort>.\n"
+    );
+  }
   assert.equal(readFakeAgyState(ctx.binDir).runs.length, 0);
-
-  const matching = run("node", [AGY, "task", "--model", "fake-model-high", "--effort", "high", "hi"], { cwd: ctx.repo, env: ctx.env });
-  assert.equal(matching.status, 0, matching.stderr);
-  assert.match(readFakeAgyState(ctx.binDir).runs[0].args.join(" "), /--model fake-model-high --effort high/);
+  assert.equal(storeJobs(ctx.repo).length, 0);
 });
 
 test("agy setup stores a model and accepts --write-sandbox", (t) => {
@@ -674,7 +679,8 @@ test("agy setup stores a model and accepts --write-sandbox", (t) => {
   assert.deepEqual(config.models, { agy: { model: "fake-model-low", effort: null } });
   assert.equal(config.writeSandbox, "danger-full-access");
   assert.equal(report.writeSandbox, "danger-full-access");
-  assert.deepEqual(report.delegation, { model: "fake-model-low", effort: null, modelSource: "setting", effortSource: "provider-default", providerModel: null });
+  // The reported effort is the one the model id carries.
+  assert.deepEqual(report.delegation, { model: "fake-model-low", effort: "low", modelSource: "setting", effortSource: "setting", providerModel: null });
 
   const cleared = run("node", [AGY, "setup", "--model", "default"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(cleared.status, 0, cleared.stderr);
@@ -703,7 +709,7 @@ test("an agy task uses the stored setting and returns to the provider default af
 
 test("a follow-up with a suffixed model drops an inherited effort that conflicts with the suffix", (t) => {
   const ctx = makeRepo(undefined, t);
-  const first = run("node", [AGY, "task", "--model", "fake-model-high", "--effort", "high", "first"], { cwd: ctx.repo, env: ctx.env });
+  const first = run("node", [AGY, "task", "--model", "fake-model-high", "first"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(first.status, 0, first.stderr);
 
   const resumed = run("node", [AGY, "task", "--resume-last", "--model", "fake-model-low", "more"], { cwd: ctx.repo, env: ctx.env });
@@ -713,19 +719,20 @@ test("a follow-up with a suffixed model drops an inherited effort that conflicts
   const args = readFakeAgyState(ctx.binDir).runs[1].args;
   assert.match(args.join(" "), /--model fake-model-low/);
   assert.equal(args.includes("--effort"), false, args.join(" "));
+  // The job reports the effort its model id carries.
   const record = latestAgyJob(ctx.repo);
-  assert.equal(requestOf(record).effort, null);
-  assert.equal(requestOf(record).effortSource, "provider-default");
+  assert.equal(requestOf(record).effort, "low");
+  assert.equal(requestOf(record).effortSource, "explicit");
 });
 
 test("agy setup warns that a model it could not check was stored unchecked", (t) => {
   const ctx = makeRepo("models-fail", t);
-  const result = run("node", [AGY, "setup", "--model", "custom-model"], { cwd: ctx.repo, env: ctx.env });
+  const result = run("node", [AGY, "setup", "--model", "custom-model-low"], { cwd: ctx.repo, env: ctx.env });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stderr, /^The Antigravity model list is unavailable, so "custom-model" was not checked\.$/m);
-  assert.doesNotMatch(result.stdout, /Delegations now use model custom-model/);
-  assert.match(result.stdout, /Stored model custom-model for delegations in .* without checking it\./);
-  assert.deepEqual(getConfig(ctx.repo).models, { agy: { model: "custom-model", effort: null } });
+  assert.match(result.stderr, /^The Antigravity model list is unavailable, so "custom-model-low" was not checked\.$/m);
+  assert.doesNotMatch(result.stdout, /Delegations now use model custom-model-low/);
+  assert.match(result.stdout, /Stored model custom-model-low for delegations in .* without checking it\./);
+  assert.deepEqual(getConfig(ctx.repo).models, { agy: { model: "custom-model-low", effort: null } });
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1988,4 +1995,106 @@ test("resolveAgyModel without a model list runs full ids and joined names unchec
     assert.match(resolveFake("y", null, status).error, /^Antigravity model y needs an effort\. Use --model y-<effort> or --model y --effort <effort>; /);
     assert.match(resolveFake("y-high", "high", status).error, /already includes effort high/);
   }
+});
+
+// Model and effort forms of a delegated task against the fake agy, which lists fake-model-high
+// and fake-model-low.
+
+test("an agy task with a base name and --effort runs the joined id without --effort", (t) => {
+  const ctx = makeRepo(undefined, t);
+  const result = run("node", [AGY, "task", "--model", "fake-model", "--effort", "low", "hi"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(result.status, 0, result.stderr);
+  const args = readFakeAgyState(ctx.binDir).runs[0].args;
+  assert.match(args.join(" "), /--model fake-model-low/);
+  assert.equal(args.includes("--effort"), false, args.join(" "));
+  const record = latestAgyJob(ctx.repo);
+  assert.equal(record.model, "fake-model-low");
+  assert.equal(requestOf(record).effort, "low");
+  assert.equal(requestOf(record).effortSource, "explicit");
+
+  const full = run("node", [AGY, "task", "--model", "fake-model-high", "hi"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(full.status, 0, full.stderr);
+  const fullArgs = readFakeAgyState(ctx.binDir).runs[1].args;
+  assert.match(fullArgs.join(" "), /--model fake-model-high/);
+  assert.equal(fullArgs.includes("--effort"), false, fullArgs.join(" "));
+});
+
+test("an agy base name with no effort anywhere exits 1 before any job", (t) => {
+  const ctx = makeRepo(undefined, t);
+  const result = run("node", [AGY, "task", "--model", "fake-model", "hi"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(result.status, 1);
+  assert.equal(
+    result.stderr,
+    "Antigravity model fake-model needs an effort. Use --model fake-model-<effort> or --model fake-model --effort <effort>; fake-model has: low, high.\n"
+  );
+  assert.equal(storeJobs(ctx.repo).length, 0);
+  assert.equal(readFakeAgyState(ctx.binDir).runs.length, 0);
+});
+
+test("a stored full id with a stored effort runs the id with the stored-effort warning", (t) => {
+  const ctx = makeRepo(undefined, t);
+  // As setup stored it before model ids carried the effort.
+  setConfig(ctx.repo, "models", { agy: { model: "fake-model-high", effort: "high" } });
+  const result = run("node", [AGY, "task", "hi"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /^The stored Antigravity effort is ignored because model fake-model-high includes one; run setup again\.$/m);
+  const args = readFakeAgyState(ctx.binDir).runs[0].args;
+  assert.match(args.join(" "), /--model fake-model-high/);
+  assert.equal(args.includes("--effort"), false, args.join(" "));
+});
+
+test("a stored base name and effort combine, and a full id on the command ignores the stored effort", (t) => {
+  const ctx = makeRepo(undefined, t);
+  const setup = run("node", [AGY, "setup", "--model", "fake-model", "--effort", "low"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(setup.status, 0, setup.stderr);
+  assert.deepEqual(getConfig(ctx.repo).models, { agy: { model: "fake-model", effort: "low" } });
+  assert.match(setup.stdout, /^- delegation model: fake-model-low \(project setting\)$/m);
+  assert.match(setup.stdout, /^- efforts of fake-model: low, high$/m);
+
+  const stored = run("node", [AGY, "task", "one"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(stored.status, 0, stored.stderr);
+  assert.match(readFakeAgyState(ctx.binDir).runs[0].args.join(" "), /--model fake-model-low/);
+
+  const explicit = run("node", [AGY, "task", "--model", "fake-model-high", "two"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(explicit.status, 0, explicit.stderr);
+  assert.match(explicit.stderr, /^The stored Antigravity effort is ignored because model fake-model-high includes one\.$/m);
+  const args = readFakeAgyState(ctx.binDir).runs[1].args;
+  assert.match(args.join(" "), /--model fake-model-high/);
+  assert.equal(args.includes("--effort"), false, args.join(" "));
+
+  const rejected = run("node", [AGY, "setup", "--model", "fake-model"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(rejected.status, 1);
+  assert.match(rejected.stderr, /^Antigravity model fake-model needs an effort\./m);
+  assert.deepEqual(getConfig(ctx.repo).models, { agy: { model: "fake-model", effort: "low" } });
+});
+
+test("without the agy model list a full id or a joined name runs unchecked, and a bare name needs an effort", (t) => {
+  const ctx = makeRepo("models-fail", t);
+  const joined = run("node", [AGY, "task", "--model", "other", "--effort", "medium", "hi"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(joined.status, 0, joined.stderr);
+  assert.match(joined.stderr, /^The Antigravity model list is unavailable, so "other-medium" was not checked\.$/m);
+  const args = readFakeAgyState(ctx.binDir).runs[0].args;
+  assert.match(args.join(" "), /--model other-medium/);
+  assert.equal(args.includes("--effort"), false, args.join(" "));
+
+  const bare = run("node", [AGY, "task", "--model", "other", "hi"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(bare.status, 1);
+  assert.match(bare.stderr, /^Antigravity model other needs an effort\. Use --model other-<effort> or --model other --effort <effort>; /m);
+  assert.equal(storeJobs(ctx.repo).length, 1);
+});
+
+test("a job recorded with an id and its effort resumes without --effort", (t) => {
+  const ctx = makeRepo(undefined, t);
+  const first = run("node", [AGY, "task", "--model", "fake-model-high", "first"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(first.status, 0, first.stderr);
+  const firstJob = latestAgyJob(ctx.repo);
+  // An earlier version recorded the effort it sent beside the id.
+  const request = { ...requestOf(firstJob), effort: "high", effortSource: "explicit" };
+  rawExec(resolveStateDir(ctx.repo), "UPDATE jobs SET request_json = ? WHERE id = ?", [JSON.stringify(request), firstJob.id]);
+  const resumed = run("node", [AGY, "task", "--resume-last", "more"], { cwd: ctx.repo, env: ctx.env });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.doesNotMatch(resumed.stderr, /Effort|effort/);
+  const args = readFakeAgyState(ctx.binDir).runs[1].args;
+  assert.match(args.join(" "), /--model fake-model-high/);
+  assert.equal(args.includes("--effort"), false, args.join(" "));
 });

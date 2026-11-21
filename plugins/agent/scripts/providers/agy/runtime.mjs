@@ -80,18 +80,7 @@ export function ensureAgyAvailable(cwd) {
   }
 }
 
-// agy refuses a model id that ends in an effort level together with a different --effort, so
-// the pair is refused before a job starts.
-function checkSuffixedModel(model, normalized, original, supported) {
-  const suffix = model ? supported.find((level) => String(model).endsWith(`-${level}`)) : undefined;
-  if (suffix && suffix !== normalized) {
-    throw new Error(
-      `Antigravity model ${model} already sets effort ${suffix}; remove --effort ${original} or choose a model without an effort suffix.`
-    );
-  }
-}
-
-function normalizeEffort(effort, efforts, cwd, model = null) {
+function normalizeEffort(effort, efforts, cwd) {
   if (effort == null || !String(effort).trim()) {
     return null;
   }
@@ -100,7 +89,6 @@ function normalizeEffort(effort, efforts, cwd, model = null) {
   if (!supported.includes(normalized)) {
     throw new Error(`agy does not support reasoning effort "${effort}". Use one of: ${supported.join(", ")}.`);
   }
-  checkSuffixedModel(model, normalized, String(effort).trim(), supported);
   return normalized;
 }
 
@@ -205,30 +193,77 @@ export function readAgySavedModel({ settingsPath = path.join(os.homedir(), ".gem
   }
 }
 
-// The model catalog of the Antigravity provider. A requested model is checked against the list
-// `agy models` prints when that list can be read, and passed unchecked with a warning when it
-// cannot. Without a requested model, agy uses its own saved default.
+// The model list and effort words of one resolution, read once per resolution.
+function readCatalogLists(cwd, cache = {}) {
+  if (!cache.agyLists) {
+    const listed = readAgyModels(cwd);
+    const catalogStatus = listed.ok ? "available" : listed.failed ? "unavailable" : "empty";
+    cache.agyLists = { models: listed.models.map((entry) => entry.id), efforts: readAgyEfforts(cwd), catalogStatus };
+  }
+  return cache.agyLists;
+}
+
+// The model catalog of the Antigravity provider. A model is named by its full id, which carries
+// the effort (`<base>-<effort>`), or by its base name plus an effort; `finishSelection` joins the
+// two through `resolveAgyModel`, checks them against `agy models`, and agy is never given
+// `--effort`. Without a requested model, agy uses its own saved default.
 // Efforts are checked against the list `agy --help` prints.
 export const agyModelCatalog = Object.freeze({
-  async resolveExplicit(value, { cwd } = {}) {
+  async resolveExplicit(value) {
     const model = value == null || !String(value).trim() ? null : String(value).trim();
-    const listed = model ? readAgyModels(cwd) : { ok: false, models: [] };
-    if (listed.ok && !listed.models.some((entry) => entry.id === model)) {
-      throw new Error(
-        `Model "${model}" is not in the Antigravity model list. Available: ${listed.models.map((entry) => entry.id).join(", ")}.`
-      );
-    }
-    // Without a list the value is passed to agy unchecked, and one warning line says so.
-    const warning = model && !listed.ok ? `The Antigravity model list is unavailable, so "${model}" was not checked.` : null;
-    return { model, defaultEffort: null, efforts: null, ...(warning ? { warning } : {}) };
+    return { model, defaultEffort: null, efforts: null };
   },
 
   async resolveDefault() {
     return { model: null, source: "provider-default", defaultEffort: null, efforts: null, warning: null, savedModel: readAgySavedModel() };
   },
 
-  checkEffort(effort, efforts, { cwd, model = null } = {}) {
-    return normalizeEffort(effort, efforts, cwd, model);
+  checkEffort(effort, efforts, { cwd } = {}) {
+    return normalizeEffort(effort, efforts, cwd);
+  },
+
+  /**
+   * Joins the model and effort of a resolved selection into the id agy runs. An effort from the
+   * command goes to `resolveAgyModel`, which refuses it beside an id that has one. An effort from
+   * a setting or a continued job joins a base name, and beneath a full id it is not used: a
+   * setting's effort with a warning, a continued job's with a warning when it differs. The
+   * selection reports the full id and its effort word; with no model no effort is used.
+   */
+  async finishSelection(selection, { cwd, cache, effortOrigin, modelOrigin }) {
+    const warnings = [...selection.warnings];
+    if (!selection.model) {
+      if (selection.effort && effortOrigin === "command") {
+        throw new Error(
+          `Antigravity needs a model for --effort ${selection.effort}. Use --model <base> --effort ${selection.effort} or --model <base>-${selection.effort}.`
+        );
+      }
+      if (selection.effort && effortOrigin === "setting") {
+        warnings.push(`The stored Antigravity effort ${selection.effort} is ignored because no model is stored; run setup again with --model.`);
+      }
+      return { ...selection, effort: null, effortSource: "provider-default", warnings };
+    }
+    const lists = readCatalogLists(cwd, cache);
+    let effort = effortOrigin === "command" ? selection.effort : null;
+    if (!effort && selection.effort && (effortOrigin === "setting" || effortOrigin === "inherited")) {
+      const split = splitAgyModel(selection.model, lists);
+      if (!split) {
+        effort = selection.effort;
+      } else if (effortOrigin === "setting") {
+        const again = modelOrigin === "setting" ? "; run setup again" : "";
+        warnings.push(`The stored Antigravity effort is ignored because model ${selection.model} includes one${again}.`);
+      } else if (split.effort !== selection.effort) {
+        warnings.push(`Effort ${selection.effort} of the continued job does not apply to model ${selection.model}, so it was not used.`);
+      }
+    }
+    const resolved = resolveAgyModel({ model: selection.model, effort, ...lists });
+    if (resolved.error) {
+      throw new Error(resolved.error);
+    }
+    if (resolved.warning) {
+      warnings.push(resolved.warning);
+    }
+    const effortSource = !resolved.effort ? "provider-default" : effort ? selection.effortSource : selection.modelSource;
+    return { ...selection, model: resolved.model, effort: resolved.effort, effortSource, warnings };
   }
 });
 
@@ -237,7 +272,7 @@ export function readAgyModels(cwd) {
   const result = runCommand("agy", ["models"], { cwd, timeout: 60000 });
   if (result.error || result.status !== 0) {
     const detail = String(result.stderr || result.stdout || result.error?.message || "").trim();
-    return { ok: false, models: [], detail: detail || `agy models exited with ${result.status}.` };
+    return { ok: false, failed: true, models: [], detail: detail || `agy models exited with ${result.status}.` };
   }
   const models = String(result.stdout)
     .split(/\r?\n/)
@@ -304,7 +339,7 @@ export function outsideFolders(workingFolder, paths) {
 }
 
 /** The arguments of one agy turn. The prompt is never among them; it goes to stdin. */
-export function buildAgyArgs({ conversationId = null, model = null, effort = null, sandboxMode = "read-only", jsonSchema = null, timeoutMs, addDirs = [] }) {
+export function buildAgyArgs({ conversationId = null, model = null, sandboxMode = "read-only", jsonSchema = null, timeoutMs, addDirs = [] }) {
   return [
     "--input-format",
     "stream-json",
@@ -315,7 +350,6 @@ export function buildAgyArgs({ conversationId = null, model = null, effort = nul
     `${Math.ceil(timeoutMs / 1000)}s`,
     ...(conversationId ? ["--conversation", conversationId] : []),
     ...(model ? ["--model", model] : []),
-    ...(effort ? ["--effort", effort] : []),
     ...sandboxArgs(sandboxMode),
     ...(addDirs ?? []).flatMap((folder) => ["--add-dir", folder]),
     ...(jsonSchema ? ["--json-schema", jsonSchema] : [])

@@ -143,27 +143,39 @@ export async function resolveModelSelection(provider, options = {}, catalog = pr
       inherited = null;
     }
   }
+  // Where the effort came from: the command, the continued job, a stored setting, the catalog.
+  let effortOrigin = "none";
   if (isGiven(options?.effort)) {
     effort = await catalog.checkEffort(options.effort, resolved.efforts ?? null, effortContext);
     effortSource = "explicit";
+    effortOrigin = "command";
   } else if (inherited) {
     effort = inherited.value;
     effortSource = inherited.source;
+    effortOrigin = "inherited";
   } else if (!stored?.effort && !forcedDefault && isGiven(setting?.effort)) {
     effort = await catalog.checkEffort(setting.effort, resolved.efforts ?? null, effortContext);
     effortSource = settingSource;
+    effortOrigin = "setting";
   } else if (resolved.defaultEffort) {
     effort = resolved.defaultEffort;
     effortSource = CATALOG_SOURCES.has(resolved.source) ? resolved.source : "catalog-default";
+    effortOrigin = "catalog";
   }
 
-  return {
+  const selection = {
     model: resolved.model ?? null,
     effort: effort ?? null,
     modelSource: resolved.source,
     effortSource,
     warnings
   };
+  // A catalog whose models carry their effort in the id joins the two here; it may refuse the pair.
+  if (typeof catalog.finishSelection === "function") {
+    const modelOrigin = requestedModel ? "command" : usesStoredModel ? "inherited" : isGiven(setting?.model) ? "setting" : "default";
+    return catalog.finishSelection(selection, { ...context, effortOrigin, modelOrigin });
+  }
+  return selection;
 }
 
 /**
