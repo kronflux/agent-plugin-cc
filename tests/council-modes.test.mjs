@@ -1,11 +1,21 @@
 // The question and open council modes: their answer schemas and label rules, the answer
 // bundles, the merge of answers into options and the vote, and whole runs in a folder that is not
 // a git repository, on real store transactions with the test wall clock and fake provider jobs.
+import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { handleCouncil } from "../plugins/agent/scripts/commands/council.mjs";
 import { answerBundle, selfLabel } from "../plugins/agent/scripts/lib/council/anonymise.mjs";
+import { readObject } from "../plugins/agent/scripts/lib/council/objects.mjs";
+import { readCouncil, recordAgreement } from "../plugins/agent/scripts/lib/council/state.mjs";
 import { roundSchemaName, validateAnswer, validateSchemaFile } from "../plugins/agent/scripts/lib/council/validate.mjs";
+import { ensureGitRepository } from "../plugins/agent/scripts/lib/git.mjs";
+import { readJobView, resolveStateDir } from "../plugins/agent/scripts/lib/state.mjs";
+import { openStore } from "../plugins/agent/scripts/lib/store.mjs";
+import { makeTempDir } from "./helpers.mjs";
+import { EPOCH, seatJobFields, setJob, useTestClock } from "./council-helpers.mjs";
 
 const finding = (id, claim = id) => ({ id, severity: "P2", claim, path: null, line: null, evidence: "seen in the code" });
 
@@ -128,4 +138,364 @@ test("each recipient sees the other answers under its own letters, scrubbed, and
   ]);
   // A fresh stand-in has no answer of its own.
   assert.deepEqual(answerBundle(seats, answers, { A: "s2" }, null), [{ label: "A", answer: "As [member] I say yes." }]);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Whole question and open runs through the council commands, in a folder that is not a git
+// repository.
+
+const T_LONG = 1000000;
+
+// A fake monotonic clock and wait clock: `sleep(ms)` moves `now` on; the wall clock stays.
+function fakeTime(start = Math.round(performance.now())) {
+  const state = { now: start };
+  return {
+    now: () => state.now,
+    sleep: (ms) => {
+      state.now += ms;
+      return new Promise((resolve) => setImmediate(resolve));
+    }
+  };
+}
+
+// Runs one council subcommand in this process at layer 2 with the shipped extensions, fake
+// provider checks and a job builder that records each job's prompt and schema file.
+async function council(argv, { cwd, built = [] }) {
+  const out = [];
+  const err = [];
+  const time = fakeTime();
+  const code = await handleCouncil([argv[0], "--cwd", cwd, ...argv.slice(1)], {
+    layer: 2,
+    io: { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+    readRequester: async () => ({ sessionId: "session-1", leaderPid: null, leaderStartToken: null }),
+    checkProviders: async (ids) => ids.map((id) => ({ id, ok: true })),
+    advance: {
+      reconcile: async () => {},
+      launch: async () => null,
+      readUsage: async () => null,
+      buildJob: async ({ family, label, prompt, schemaPath }) => {
+        built.push({ family, schemaPath });
+        return { fields: seatJobFields(family === "codex" ? "codex" : "agy", { prompt }), label };
+      },
+      now: time.now,
+      sleep: time.sleep
+    }
+  });
+  const stdout = out.join("");
+  let json = null;
+  try {
+    json = JSON.parse(stdout);
+  } catch {
+    json = null;
+  }
+  return { code, stdout, stderr: err.join(""), json };
+}
+
+const snap = (fx) => readCouncil(fx.store, fx.runId);
+const seatRow = (fx, seat, round = 1) => snap(fx).seatRounds.find((row) => row.round === round && row.seat === seat);
+const roundRow = (fx, round = 1) => snap(fx).rounds.find((row) => row.round === round);
+const currentOf = (fx, seat, round = 1) => snap(fx).attempts.find((row) => row.id === seatRow(fx, seat, round).current_id);
+const mapOf = (fx) => JSON.parse(readObject(fx.dir, roundRow(fx, 2).map_sha256, "json").toString("utf8"));
+const promptOf = (fx, attempt) => readObject(fx.dir, attempt.prompt_sha256, "md").toString("utf8");
+// The schema id a provider seat's Round 2 job was continued with.
+const round2Schema = (fx, seat) => JSON.parse(readJobView(fx.store, currentOf(fx, seat, 2).job_id).row.request_json).outputSchema.$id;
+
+function endJob(fx, jobId, at, columns) {
+  setJob(fx.store, jobId, { claimed_at: EPOCH + at - 5, started_at: EPOCH + at - 5, end_at: EPOCH + at, exec_released_at: EPOCH + at, release_kind: "confirmed", thread_id: `thread-${jobId}`, ...columns });
+}
+const completeJob = (fx, jobId, at, resultJson) => endJob(fx, jobId, at, { end_state: "completed", result_json: resultJson });
+const failJob = (fx, jobId, at) => endJob(fx, jobId, at, { end_state: "failed", error: "permission denied" });
+
+async function submit(fx, seat, intentId, text) {
+  const file = path.join(fx.cwd, `reply-${intentId}.json`);
+  fs.writeFileSync(file, text);
+  return council(["submit", fx.runId, seat, "--intent", intentId, "--file", file, "--json"], { cwd: fx.cwd });
+}
+
+function collect(fx, { round = 2, extra = [] } = {}) {
+  return council(["collect", fx.runId, "--round", String(round), "--budget-ms", "120000", ...extra, "--json"], { cwd: fx.cwd, built: fx.built });
+}
+
+// A council of `kind` started at wall 0 through `council start` in a fresh temporary folder that
+// is not a git repository: s1 Claude, s2 Codex, s3 Antigravity with the kind's default lenses.
+async function started(t, clock, kind) {
+  clock.set(0);
+  const cwd = makeTempDir(t);
+  assert.throws(() => ensureGitRepository(cwd));
+  const stateDir = resolveStateDir(cwd);
+  const store = openStore(stateDir);
+  t.after(() => store.close());
+  const brief = path.join(cwd, "brief.json");
+  fs.writeFileSync(brief, JSON.stringify({ question: "How should the cache be made safe under concurrent writes?", kind }));
+  const built = [];
+  const result = await council(["start", "--brief", brief, "--timeout-ms", String(T_LONG), "--json"], { cwd, built });
+  assert.equal(result.code, 0, result.stderr);
+  return { cwd, store, kind, built, runId: result.json.runId, dir: path.join(stateDir, "council", result.json.runId), started: result.json };
+}
+
+function answer1(text, claim) {
+  return JSON.stringify(round1(text, { findings: [finding("f1", claim)] }));
+}
+
+// Round 1 answered at 100 (each seat's answer text by `texts`, one supporting point each) and
+// closed with quorum.
+async function round1Closed(t, clock, kind, texts = { s1: "Use a lock.", s2: "Use a lock.", s3: "Use a queue." }) {
+  const fx = await started(t, clock, kind);
+  clock.set(100);
+  completeJob(fx, currentOf(fx, "s2").job_id, 100, answer1(texts.s2, "bravo"));
+  completeJob(fx, currentOf(fx, "s3").job_id, 100, answer1(texts.s3, "charlie"));
+  assert.equal((await submit(fx, "s1", currentOf(fx, "s1").id, answer1(texts.s1, "alpha"))).code, 0);
+  const closed = await collect(fx, { round: 1 });
+  assert.equal(closed.json.quorum, true, closed.stdout);
+  return fx;
+}
+
+// The label `seat` sees for the answer of `author` in Round 2: a letter of its map, or its own
+// label after them.
+function labelFor(map, seat, author) {
+  if (seat === author) {
+    return selfLabel(map[seat]);
+  }
+  return Object.keys(map[seat]).find((letter) => map[seat][letter] === author);
+}
+
+// A Round 2 answer that validates every finding of `seat`'s bundle (one finding f1 per author).
+function answer2(map, seat, { kind, stance = null, sameAs = [], agreesWith = [], response = "validate", added = [] }) {
+  const responses = Object.keys(map[seat])
+    .sort()
+    .map((letter) =>
+      response === "challenge"
+        ? { finding: `${letter}-f1`, response, disputes: "claim", sameAs: null, reason: "not so", evidence: "see the code" }
+        : { finding: `${letter}-f1`, response, disputes: null, sameAs: null, reason: null, evidence: null }
+    );
+  return JSON.stringify(kind === "question" ? { schema: 1, stance, sameAs, responses, added } : { schema: 1, stance, agreesWith, responses, added });
+}
+
+// Round 2 sent at 1000 and answered at 1100 by `answers2(seat, map)` (null leaves a seat's job
+// to the test), then collected.
+async function round2Answered(fx, clock, answers2, { collectExtra = [] } = {}) {
+  clock.set(1000);
+  const sent = await council(["crossexam", fx.runId, "--json"], { cwd: fx.cwd, built: fx.built });
+  assert.equal(sent.code, 0, sent.stderr);
+  const map = mapOf(fx);
+  clock.set(1100);
+  const s1 = answers2("s1", map);
+  assert.equal((await submit(fx, "s1", sent.json.deliveries.find((entry) => entry.seat === "s1").intentId, s1)).json.state, "valid");
+  for (const seat of ["s2", "s3"]) {
+    const text = answers2(seat, map);
+    if (text !== null) {
+      completeJob(fx, currentOf(fx, seat, 2).job_id, 1100, text);
+    }
+  }
+  return { map, collected: await collect(fx, { extra: collectExtra }) };
+}
+
+async function mergeRun(fx) {
+  const merged = await council(["merge", fx.runId, "--json"], { cwd: fx.cwd });
+  assert.equal(merged.code, 0, merged.stdout);
+  return merged.json;
+}
+
+test("a question council in a folder without git: answers linked as the same become one option, and three votes are unanimous", async (t) => {
+  const clock = useTestClock(t, 0);
+  const fx = await round1Closed(t, clock, "question");
+  assert.deepEqual(fx.started.seats.map((seat) => seat.lens), ["evidence", "first principles", "counterexamples"]);
+  assert.equal(snap(fx).run.kind, "question");
+  assert.equal(snap(fx).run.stored_kind, "decision");
+  // Every seat links s1's answer with s2's and with s3's, and endorses s1's answer.
+  const { map, collected } = await round2Answered(fx, clock, (seat, letters) =>
+    answer2(letters, seat, {
+      kind: "question",
+      stance: labelFor(letters, seat, "s1"),
+      sameAs: [
+        [labelFor(letters, seat, "s1"), labelFor(letters, seat, "s2")],
+        [labelFor(letters, seat, "s1"), labelFor(letters, seat, "s3")]
+      ]
+    })
+  );
+  assert.deepEqual([collected.code, collected.json.quorum], [0, true], collected.stdout);
+  const merged = await mergeRun(fx);
+  assert.deepEqual(merged.merge.answers, [
+    { label: "A", seat: "s1", text: "Use a lock." },
+    { label: "B", seat: "s2", text: "Use a lock." },
+    { label: "C", seat: "s3", text: "Use a queue." }
+  ]);
+  assert.deepEqual(merged.merge.options, [{ id: "A", labels: ["A", "B", "C"], text: "Use a lock." }]);
+  assert.deepEqual(merged.merge.decision, { choice: "A", tally: { A: 3 }, threshold: "2/3", confidence: "HIGH" });
+  assert.equal(merged.unanimous, true);
+  assert.equal((await council(["status", fx.runId, "--json"], { cwd: fx.cwd })).json.unanimous, true);
+  // The provider seats ran on the question schemas, and every Round 2 prompt shows the answers.
+  assert.deepEqual(
+    fx.built.map((job) => path.basename(job.schemaPath)),
+    ["council-round1-question.schema.json", "council-round1-question.schema.json"]
+  );
+  assert.deepEqual(
+    ["s2", "s3"].map((seat) => round2Schema(fx, seat)),
+    ["urn:agent-plugin:schema:council-round2-question:1", "urn:agent-plugin:schema:council-round2-question:1"]
+  );
+  const round2Prompt = promptOf(fx, currentOf(fx, "s2", 2));
+  assert.match(round2Prompt, /The members' answers to the question, each under a label/);
+  assert.match(round2Prompt, new RegExp(`Your own answer is labelled ${selfLabel(map.s2)}\\.`));
+  assert.match(round2Prompt, /"answer": "Use a queue\."/);
+  for (const attempt of snap(fx).attempts) {
+    assert.doesNotMatch(promptOf(fx, attempt), /review council/);
+  }
+});
+
+test("a question council without the link and with votes A, A, B has two options and chooses A by two of three", async (t) => {
+  const clock = useTestClock(t, 0);
+  const fx = await round1Closed(t, clock, "question");
+  // s1 and s2 link their own two answers; nobody links them with s3's. s3 votes for its own.
+  await round2Answered(fx, clock, (seat, letters) =>
+    answer2(letters, seat, {
+      kind: "question",
+      stance: labelFor(letters, seat, seat === "s3" ? "s3" : "s1"),
+      sameAs: seat === "s3" ? [] : [[labelFor(letters, seat, "s1"), labelFor(letters, seat, "s2")]]
+    })
+  );
+  const merged = await mergeRun(fx);
+  assert.deepEqual(merged.merge.options, [
+    { id: "A", labels: ["A", "B"], text: "Use a lock." },
+    { id: "C", labels: ["C"], text: "Use a queue." }
+  ]);
+  assert.deepEqual(merged.merge.decision, { choice: "A", tally: { A: 2, C: 1 }, threshold: "2/3", confidence: "MEDIUM" });
+  assert.equal(merged.unanimous, false);
+  for (const cluster of (await council(["status", fx.runId, "--json"], { cwd: fx.cwd })).json.clusters) {
+    assert.equal((await council(["verdict", fx.runId, cluster, "not-checked"], { cwd: fx.cwd })).code, 0);
+  }
+  const report = await council(["report", fx.runId], { cwd: fx.cwd });
+  assert.equal(report.code, 0, report.stderr);
+  assert.match(report.stdout, /## Verdict\n\nChoice: A \(A 2, C 1\), confidence MEDIUM\n/);
+  assert.match(report.stdout, /## Answers\n\n- A \(s1\): Use a lock\.\n- B \(s2\): Use a lock\.\n- C \(s3\): Use a queue\.\n/);
+  assert.match(report.stdout, /## Options\n\n- A \(answers A, B; 2 votes\): Use a lock\.\n- C \(answers C; 1 vote\): Use a queue\.\n/);
+  assert.match(report.stdout, /## Minority positions\n\n- s3: option C\n/);
+  assert.doesNotMatch(report.stdout, /Unanimous panel/);
+});
+
+test("a question vote with no two-thirds option, a missing Round 2 seat, a challenge or an added finding is not unanimous", async (t) => {
+  const clock = useTestClock(t, 0);
+  // 1-1-1: every seat votes for its own answer and links nothing.
+  const split = await round1Closed(t, clock, "question", { s1: "Use a lock.", s2: "Use a queue.", s3: "Use copy-on-write." });
+  await round2Answered(split, clock, (seat, letters) => answer2(letters, seat, { kind: "question", stance: labelFor(letters, seat, seat) }));
+  const none = await mergeRun(split);
+  assert.deepEqual(none.merge.decision, { choice: null, tally: { A: 1, B: 1, C: 1 }, threshold: "2/3", confidence: "no consensus" });
+  assert.equal(none.unanimous, false);
+  // s3 gives no Round 2 answer: it casts no vote, still counts in the denominator, and the panel is not unanimous.
+  const missing = await round1Closed(t, clock, "question");
+  const { collected } = await round2Answered(
+    missing,
+    clock,
+    (seat, letters) => (seat === "s3" ? null : answer2(letters, seat, { kind: "question", stance: labelFor(letters, seat, "s1") })),
+    { collectExtra: ["--disallow-substitute"] }
+  );
+  assert.equal(collected.json.wake, "budget", collected.stdout);
+  failJob(missing, currentOf(missing, "s3", 2).job_id, 1100);
+  clock.set(1200);
+  assert.equal((await collect(missing, { extra: ["--disallow-substitute"] })).json.quorum, true);
+  assert.equal(seatRow(missing, "s3", 2).state, "error");
+  const twoOfThree = await mergeRun(missing);
+  assert.deepEqual(twoOfThree.merge.decision, { choice: "A", tally: { A: 2 }, threshold: "2/3", confidence: "MEDIUM" });
+  assert.equal(twoOfThree.unanimous, false);
+  // One option for every vote, but one seat challenges a finding or adds one.
+  for (const change of [{ response: "challenge" }, { added: [finding("f2")] }]) {
+    const fx = await round1Closed(t, clock, "question");
+    await round2Answered(fx, clock, (seat, letters) =>
+      answer2(letters, seat, { kind: "question", stance: labelFor(letters, seat, "s1"), ...(seat === "s2" ? change : {}) })
+    );
+    const merged = await mergeRun(fx);
+    assert.equal(merged.merge.decision.choice, "A");
+    assert.equal(merged.unanimous, false, JSON.stringify(change));
+  }
+});
+
+test("a question Round 2 stance naming a label that does not exist is invalid and the seat is asked again", async (t) => {
+  const clock = useTestClock(t, 0);
+  const fx = await round1Closed(t, clock, "question");
+  const { map, collected } = await round2Answered(fx, clock, (seat, letters) =>
+    answer2(letters, seat, { kind: "question", stance: seat === "s2" ? "Z" : labelFor(letters, seat, "s1") })
+  );
+  assert.notEqual(collected.json.wake, "closed", collected.stdout);
+  const repair = currentOf(fx, "s2", 2);
+  assert.equal(repair.charge, "repair");
+  const prompt = promptOf(fx, repair);
+  assert.match(prompt, /stance: "Z" is not an answer label; the labels are A, B, C/);
+  assert.match(prompt, /"\$id": "urn:agent-plugin:schema:council-round2-question:1"/);
+  // The repaired answer is valid and the round closes.
+  clock.set(1200);
+  const issued = await collect(fx);
+  assert.equal(issued.code, 0, issued.stdout);
+  completeJob(fx, currentOf(fx, "s2", 2).job_id, 1300, answer2(map, "s2", { kind: "question", stance: labelFor(map, "s2", "s1") }));
+  clock.set(1400);
+  const closed = await collect(fx);
+  assert.deepEqual([closed.json.wake, closed.json.quorum], ["closed", true], closed.stdout);
+  assert.equal(seatRow(fx, "s2", 2).state, "valid");
+  assert.deepEqual((await mergeRun(fx)).merge.decision.tally, { A: 3 });
+});
+
+test("an open council lists every answer, waits for the leader's agreement verdict, and reports it", async (t) => {
+  const clock = useTestClock(t, 0);
+  const fx = await round1Closed(t, clock, "open", { s1: "Use a lock.", s2: "A lock or a queue.", s3: "Use a queue." });
+  assert.deepEqual([snap(fx).run.kind, snap(fx).run.stored_kind], ["open", "review"]);
+  // s1 and s2 agree with each other; s3 agrees with s2 only.
+  await round2Answered(fx, clock, (seat, letters) =>
+    answer2(letters, seat, {
+      kind: "open",
+      agreesWith: seat === "s3" ? [labelFor(letters, seat, "s2")] : [labelFor(letters, seat, seat === "s1" ? "s2" : "s1")]
+    })
+  );
+  assert.deepEqual(
+    ["s2", "s3"].map((seat) => round2Schema(fx, seat)),
+    ["urn:agent-plugin:schema:council-round2-open:1", "urn:agent-plugin:schema:council-round2-open:1"]
+  );
+  const merged = await mergeRun(fx);
+  assert.equal(merged.merge.decision, null);
+  assert.equal(merged.merge.options, undefined);
+  assert.deepEqual(merged.merge.answers.map((entry) => entry.text), ["Use a lock.", "A lock or a queue.", "Use a queue."]);
+  assert.equal(merged.unanimous, false);
+  const status = await council(["status", fx.runId, "--json"], { cwd: fx.cwd });
+  for (const cluster of status.json.clusters) {
+    assert.equal((await council(["verdict", fx.runId, cluster, "not-checked"], { cwd: fx.cwd })).code, 0);
+  }
+  const waiting = await council(["status", fx.runId], { cwd: fx.cwd });
+  assert.match(waiting.stdout, new RegExp(`Next: judge how far the answers agree and record council verdict ${fx.runId} agreement agreed\\|partly\\|disagreed -- <reason>\\.`));
+  const early = await council(["report", fx.runId, "--json"], { cwd: fx.cwd });
+  assert.deepEqual([early.code, early.json.error], [1, "verdict-required"]);
+  // Bad agreement verdicts are refused.
+  assert.equal((await council(["verdict", fx.runId, "agreement", "mostly", "--", "why"], { cwd: fx.cwd })).code, 1);
+  const unreasoned = await council(["verdict", fx.runId, "agreement", "agreed", "--json"], { cwd: fx.cwd });
+  assert.deepEqual([unreasoned.code, unreasoned.json.error], [1, "invalid-arguments"]);
+  const recorded = await council(["verdict", fx.runId, "agreement", "agreed", "--", "every", "answer", "uses", "mutual", "exclusion"], { cwd: fx.cwd });
+  assert.equal(recorded.code, 0, recorded.stderr);
+  assert.equal((await council(["status", fx.runId, "--json"], { cwd: fx.cwd })).json.action, "report");
+  const report = await council(["report", fx.runId], { cwd: fx.cwd });
+  assert.equal(report.code, 0, report.stderr);
+  assert.match(report.stdout, /## Verdict\n\nAgreement \(leader judgement\): agreed\nReason: every answer uses mutual exclusion\n/);
+  assert.match(report.stdout, /- A \(s1\): Use a lock\.\n {2}Agreed with by: s2\.\n- B \(s2\): A lock or a queue\.\n {2}Agreed with by: s1, s3\.\n- C \(s3\): Use a queue\.\n {2}Agreed with by: none\.\n/);
+  assert.doesNotMatch(report.stdout, /## Options/);
+});
+
+test("an agreement verdict is refused on a review or question council, on a stale merge and without a reason", async (t) => {
+  const clock = useTestClock(t, 0);
+  for (const kind of ["review", "question"]) {
+    const fx = await started(t, clock, kind);
+    const refused = await council(["verdict", fx.runId, "agreement", "agreed", "--json", "--", "looks", "fine"], { cwd: fx.cwd });
+    assert.deepEqual([refused.code, refused.json.error], [1, "not-open"], refused.stdout);
+    assert.deepEqual(await recordAgreement(fx.store, { runId: fx.runId, value: "agreed", reason: "fine", mergeSha256: "a".repeat(64), inputRev: 0 }), { ok: false, reason: "not-open" });
+  }
+  // An open council before its merge, then each of the three values on the current merge.
+  const fx = await round1Closed(t, clock, "open");
+  const premature = await council(["verdict", fx.runId, "agreement", "partly", "--json", "--", "too", "early"], { cwd: fx.cwd });
+  assert.deepEqual([premature.code, premature.json.error], [1, "stale-merge"]);
+  await round2Answered(fx, clock, (seat, letters) => answer2(letters, seat, { kind: "open" }));
+  await mergeRun(fx);
+  const run = snap(fx).run;
+  const fence = { runId: fx.runId, mergeSha256: run.merge_sha256, inputRev: run.input_rev };
+  assert.deepEqual(await recordAgreement(fx.store, { ...fence, value: "agreed", reason: "  " }), { ok: false, reason: "invalid-agreement" });
+  assert.deepEqual(await recordAgreement(fx.store, { ...fence, value: "agreed", reason: "old", mergeSha256: "b".repeat(64) }), { ok: false, reason: "stale-merge" });
+  assert.deepEqual(await recordAgreement(fx.store, { ...fence, value: "agreed", reason: "old", inputRev: run.input_rev + 1 }), { ok: false, reason: "stale-merge" });
+  for (const value of ["agreed", "partly", "disagreed"]) {
+    const before = snap(fx).run.verdict_rev;
+    assert.deepEqual(await recordAgreement(fx.store, { ...fence, value, reason: `judged ${value}` }), { ok: true });
+    assert.deepEqual([snap(fx).agreement.value, snap(fx).agreement.reason, snap(fx).run.verdict_rev], [value, `judged ${value}`, before + 1]);
+  }
 });

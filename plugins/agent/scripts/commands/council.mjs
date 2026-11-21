@@ -32,9 +32,9 @@ import { checkProviders, newRunId } from "../lib/runs.mjs";
 import { launchWorker } from "../lib/task-launch.mjs";
 import { buildSeatJob, readSeatUsage } from "../lib/council/jobs.mjs";
 import { installObject, ObjectDamagedError, publishExport, readObject } from "../lib/council/objects.mjs";
-import { buildBundles, bundleFromMap } from "../lib/council/anonymise.mjs";
+import { answerBundle, buildBundles, bundleFromMap, selfLabel } from "../lib/council/anonymise.mjs";
 import { depositExtensionReceipt, depositSubstitutionOptIn } from "../lib/council/extensions.mjs";
-import { mergeCouncil, serializeMerge, sortedTally, unanimousPanel } from "../lib/council/merge.mjs";
+import { canonicalAnswers, mergeCouncil, mergeQuestion, serializeMerge, sortedTally, unanimousPanel } from "../lib/council/merge.mjs";
 import {
   CUTOFF_NOTICE,
   FAMILIES,
@@ -62,6 +62,7 @@ import {
 import {
   acknowledgeStop,
   admitFollowup,
+  AGREEMENT_VALUES,
   BUDGET_MS,
   CLEANUP_BUDGET_MS,
   continueBindingHook,
@@ -82,6 +83,7 @@ import {
   POLL_MS,
   readCouncil,
   readFollowupCounts,
+  recordAgreement,
   recordMerge,
   recordRefusal,
   recordReport,
@@ -92,24 +94,32 @@ import {
   stopHook,
   USAGE_READ_MS
 } from "../lib/council/state.mjs";
-import { classifyFailure, classifyJob, validateAnswer, validateFollowupAnswer, validationContext } from "../lib/council/validate.mjs";
+import {
+  answersInOwnWords,
+  classifyFailure,
+  classifyJob,
+  roundSchemaName,
+  validateAnswer,
+  validateFollowupAnswer,
+  validationContext
+} from "../lib/council/validate.mjs";
 
 // `council`: a panel of read-only seats answers one brief in two rounds; this module runs the
 // executor (issuing attempts, exact stops, observing jobs) and the council subcommands.
 
 const SCHEMA_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "schemas");
 const RECONCILE_EVERY_MS = 10000;
-const ROUND_SCHEMA_FILES = { 1: "council-round1.schema.json", 2: "council-round2.schema.json" };
 const FOLLOWUP_SCHEMA_FILE = "council-followup.schema.json";
+const COUNCIL_KINDS = ["review", "decision", "question", "open"];
 
-/** The packaged schema file of a council round. */
-export function roundSchemaPath(round) {
-  return path.join(SCHEMA_DIR, ROUND_SCHEMA_FILES[round]);
+/** The packaged schema file of a council round for a run of `kind` (default `review`). */
+export function roundSchemaPath(round, kind = "review") {
+  return path.join(SCHEMA_DIR, `${roundSchemaName(round, kind)}.schema.json`);
 }
 
-function readRoundSchema(round) {
+function readRoundSchema(round, kind) {
   try {
-    return JSON.parse(fs.readFileSync(roundSchemaPath(round), "utf8"));
+    return JSON.parse(fs.readFileSync(roundSchemaPath(round, kind), "utf8"));
   } catch {
     return null;
   }
@@ -197,7 +207,7 @@ async function dispatchCreate(store, stateDir, runDir, attempt, ctx) {
     }
     throw error;
   }
-  if (!readRoundSchema(attempt.round)) {
+  if (!readRoundSchema(attempt.round, run.kind)) {
     await refuse(store, attempt, "invalid round schema", ctx);
     return { dispatched: false, diagnostics: [] };
   }
@@ -207,7 +217,7 @@ async function dispatchCreate(store, stateDir, runDir, attempt, ctx) {
       family: seat.family,
       model: seat.model,
       prompt,
-      schemaPath: roundSchemaPath(attempt.round),
+      schemaPath: roundSchemaPath(attempt.round, run.kind),
       label: seat.label,
       runId: run.id,
       cwd: run.cwd,
@@ -403,7 +413,7 @@ async function dispatchContinue(store, stateDir, runDir, attempt, ctx) {
     {
       predecessorId,
       promptSha256: attempt.prompt_sha256,
-      readSchema: () => readRoundSchema(attempt.round),
+      readSchema: () => readRoundSchema(attempt.round, ctx.run?.kind),
       schemaRefusal: "invalid round schema",
       refuse: (reason) => refuse(store, attempt, reason, ctx),
       hook: (force, reasons) => continueBindingHook({ attemptId: attempt.id, predecessorId, force, reasons, layer: ctx.layer }),
@@ -593,7 +603,11 @@ function withReplacement(runDir, snapshot, attempt, verdict, layer) {
   }
   if (verdict.outcome === "invalid") {
     const errors = verdict.errorsSha256 ? JSON.parse(readObject(runDir, verdict.errorsSha256, "json").toString("utf8")) : [verdict.reason];
-    const text = renderRepairPrompt({ basePrompt: basePromptOf(runDir, snapshot, attempt), errors, schemaText: fs.readFileSync(roundSchemaPath(attempt.round), "utf8") });
+    const text = renderRepairPrompt({
+      basePrompt: basePromptOf(runDir, snapshot, attempt),
+      errors,
+      schemaText: fs.readFileSync(roundSchemaPath(attempt.round, snapshot.run.kind), "utf8")
+    });
     return { ...verdict, replacementSha256: installObject(runDir, text, "md") };
   }
   if (verdict.outcome === "failure" && verdict.transient) {
@@ -1393,8 +1407,9 @@ export function prepareStandIns(runDir, snapshot, round, jobModels = () => []) {
       const lens = snapshot.seats.find((row) => row.seat === seat).lens;
       const brief = readObject(runDir, snapshot.run.brief_sha256, "md").toString("utf8");
       let basePrompt;
+      const kind = snapshot.run.kind;
       if (round === 1) {
-        basePrompt = renderRound1Prompt({ brief, lens, kind: snapshot.run.kind, schemaText: fs.readFileSync(roundSchemaPath(1), "utf8") });
+        basePrompt = renderRound1Prompt({ brief, lens, kind, schemaText: fs.readFileSync(roundSchemaPath(1, kind), "utf8") });
       } else {
         const mapping = readJsonObject(runDir, roundRow.map_sha256);
         const letterMap = mapping.$alternates?.[actorKey(seat, 2)];
@@ -1404,7 +1419,16 @@ export function prepareStandIns(runDir, snapshot, round, jobModels = () => []) {
         }
         const { answers, rows } = round1Actors(runDir, snapshot, jobModels);
         const bundle = bundleFromMap(rows, answers, letterMap, { runId: snapshot.run.id });
-        basePrompt = renderRound2Prompt({ brief, lens, ownFindings: [], bundle, schemaText: fs.readFileSync(roundSchemaPath(2), "utf8") });
+        // A fresh stand-in sees the other answers and has none of its own.
+        basePrompt = renderRound2Prompt({
+          brief,
+          lens,
+          ownFindings: [],
+          bundle,
+          schemaText: fs.readFileSync(roundSchemaPath(2, kind), "utf8"),
+          kind,
+          answers: answersInOwnWords(kind) ? answerBundle(rows, answers, letterMap, null, { runId: snapshot.run.id }) : []
+        });
       }
       prepared[seat] = installObject(runDir, renderSubstitutePrompt({ basePrompt }), "md");
     } catch (error) {
@@ -1450,12 +1474,13 @@ async function reduceIfNeeded(store, { runId, round, layer, deadline, extensions
 // The council subcommands.
 
 export const usage =
-  "council start --brief <file> [--kind review|decision] [--seat <family>:<lens>]... [--model <family>=<value>]... [--timeout-ms <ms>] [--json]" +
+  "council start --brief <file> [--kind review|decision|question|open] [--seat <family>:<lens>]... [--model <family>=<value>]... [--timeout-ms <ms>] [--json]" +
   " | collect <run-id> --round 1|2 [--disallow-substitute] [--budget-ms <ms>] [--json]" +
   " | submit <run-id> <seat> --intent <intent-id> [--round 1|2] --file <answer.json> [--json]" +
   " | crossexam <run-id> [--json] | merge <run-id> [--json]" +
   " | followup <run-id> <seat> --finding <cluster-id|stance> [--] <question> [--json]" +
   " | verdict <run-id> <cluster-id|claim-id> verified|rejected|not-checked [--strongest <n>] [--] [reason]" +
+  " | verdict <run-id> agreement agreed|partly|disagreed [--] <reason>" +
   " | export <run-id> brief|map|merge|report|followups [--json] | status <run-id> [--json] | report <run-id> [--json]";
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
@@ -1551,8 +1576,8 @@ export function readBrief(file, { kind: kindOverride } = {}) {
     fail('"targets" must be an array of non-empty strings.');
   }
   const kind = kindOverride ?? brief.kind ?? "review";
-  if (kind !== "review" && kind !== "decision") {
-    fail('"kind" must be "review" or "decision".');
+  if (!COUNCIL_KINDS.includes(kind)) {
+    fail('"kind" must be "review", "decision", "question" or "open".');
   }
   const options = brief.options ?? [];
   if (!Array.isArray(options) || options.some((option) => typeof option !== "string" || !option.trim())) {
@@ -1773,8 +1798,8 @@ async function startCouncil(options, repeated, ctx) {
   if (!options.brief) {
     throw new CouncilRefusal("invalid-arguments", "council start needs --brief <file>.");
   }
-  if (options.kind !== undefined && options.kind !== "review" && options.kind !== "decision") {
-    throw new CouncilRefusal("invalid-arguments", "--kind must be review or decision.");
+  if (options.kind !== undefined && !COUNCIL_KINDS.includes(options.kind)) {
+    throw new CouncilRefusal("invalid-arguments", "--kind must be review, decision, question or open.");
   }
   const cwd = resolveCommandCwd(options);
   const brief = readBrief(path.resolve(cwd, options.brief), { kind: options.kind });
@@ -1802,7 +1827,7 @@ async function startCouncil(options, repeated, ctx) {
   const runDir = runDirOf(stateDir, runId);
   const briefText = renderBriefText(brief);
   const briefSha256 = installObject(runDir, briefText, "md");
-  const schemaText = fs.readFileSync(roundSchemaPath(1), "utf8");
+  const schemaText = fs.readFileSync(roundSchemaPath(1, brief.kind), "utf8");
   const seats = planned.map((seat) => {
     const provider = familyProvider(seat.family);
     const missingCli = failed.has(provider);
@@ -2451,10 +2476,21 @@ export async function crossExamine(runDir, deps) {
   }
   const mapSha256 = installObject(runDir, `${JSON.stringify(mapping, null, 2)}\n`, "json");
   const briefText = readObject(runDir, snapshot.run.brief_sha256, "md").toString("utf8");
-  const schemaText = fs.readFileSync(roundSchemaPath(2), "utf8");
+  const kind = snapshot.run.kind;
+  const schemaText = fs.readFileSync(roundSchemaPath(2, kind), "utf8");
   const lenses = new Map(snapshot.seats.map((row) => [row.seat, row.lens]));
+  // A question or open seat also sees every answer: the others under its letters, its own last.
+  const answersOf = (entry) => (answersInOwnWords(kind) ? answerBundle(actorRows, answers, mapping[entry.actor], answers[entry.actor].answer, { runId }) : []);
   const promptOf = (entry) =>
-    renderRound2Prompt({ brief: briefText, lens: lenses.get(entry.seat), ownFindings: answers[entry.actor].findings, bundle: bundles[entry.actor], schemaText });
+    renderRound2Prompt({
+      brief: briefText,
+      lens: lenses.get(entry.seat),
+      ownFindings: answers[entry.actor].findings,
+      bundle: bundles[entry.actor],
+      schemaText,
+      kind,
+      answers: answersOf(entry)
+    });
   const entries = ordinary.map((entry) => {
     const prompt = promptOf(entry);
     return {
@@ -2522,9 +2558,20 @@ export function mergeInput(runDir, snapshot, { extensions = {} } = {}) {
   const map = round2?.map_sha256 ? readJsonObject(runDir, round2.map_sha256) : {};
   const logical = (actor) => String(actor).replace(/~r[12]$/, "");
   const anonymisation = {};
+  // A question or open responder's answer labels: its letters, then its own answer's label unless
+  // it is a fresh Round 2 stand-in, which has no answer of its own.
+  const answerMaps = {};
+  const ownWords = answersInOwnWords(snapshot.run.kind);
+  const round1Seats = new Set(panels[1].filter((item) => item.valid).map((item) => item.seat));
   for (const entry of panels[2].filter((item) => item.valid)) {
     const letterMap = (entry.kind === "substitute" ? map.$alternates?.[entry.actor] : map[entry.actor]) ?? {};
     anonymisation[entry.seat] = Object.fromEntries(Object.entries(letterMap).map(([letter, author]) => [letter, logical(author)]));
+    if (ownWords) {
+      answerMaps[entry.seat] = { ...anonymisation[entry.seat] };
+      if (entry.kind !== "substitute" && round1Seats.has(entry.seat)) {
+        answerMaps[entry.seat][selfLabel(letterMap)] = entry.seat;
+      }
+    }
   }
   const charges = snapshot.charges.total;
   const standIns = substitutionEntries(snapshot);
@@ -2547,6 +2594,7 @@ export function mergeInput(runDir, snapshot, { extensions = {} } = {}) {
     round1: answersOf(1),
     round2: answersOf(2),
     anonymisation,
+    ...(ownWords ? { answerMaps } : {}),
     turns: { used: charges.turn + (snapshot.ext?.issued.total ?? 0), repairs: charges.repair, retries: charges.retry },
     ...(standIns.length > 0 ? { substitutions: standIns } : {}),
     ...followupInput(runDir, snapshot, extensions)
@@ -2770,10 +2818,51 @@ export function currentMerge(runDir, snapshot) {
   return readJsonObject(runDir, run.merge_sha256);
 }
 
-// `council verdict <run-id> <cluster-id|claim-id> verified|rejected|not-checked [--strongest <n>] [--] [reason]`.
+// `council verdict <run-id> agreement agreed|partly|disagreed [--] <reason>`: the leader's judgement
+// of how far the answers of an open council agree, on its current merge.
+async function agreementCouncil(options, { runId, value, reasonWords }, ctx) {
+  const deadline = performance.now() + BUDGET_MS.submit;
+  const usageText = "verdict <run-id> agreement agreed|partly|disagreed [--] <reason>";
+  if (!AGREEMENT_VALUES.includes(value)) {
+    throw new CouncilRefusal("invalid-arguments", `Usage: council ${usageText}`);
+  }
+  if (options.strongest !== undefined) {
+    throw new CouncilRefusal("invalid-arguments", "--strongest applies only to a disputed cluster.");
+  }
+  const reason = reasonWords.join(" ").trim();
+  if (!reason) {
+    throw new CouncilRefusal("invalid-arguments", `An agreement verdict needs a reason. Usage: council ${usageText}`);
+  }
+  const stateDir = resolveStateDir(resolveCommandCwd(options));
+  const runDir = runDirOf(stateDir, runId);
+  const store = await commandStore(stateDir, deadline);
+  try {
+    const snapshot = requireRun(store, runId);
+    if (snapshot.run.kind !== "open") {
+      throw new CouncilRefusal("not-open", `Council ${runId} is a ${snapshot.run.kind} council; an agreement verdict is recorded only on an open council.`);
+    }
+    if (!currentMerge(runDir, snapshot)) {
+      throw new CouncilRefusal("stale-merge", "Run council merge first.");
+    }
+    const recorded = await recordAgreement(store, { runId, value, reason, mergeSha256: snapshot.run.merge_sha256, inputRev: snapshot.run.input_rev, deadline });
+    if (!recorded.ok) {
+      throw new CouncilRefusal(recorded.reason, recorded.reason === "stale-merge" ? "The council changed since its merge; run council merge again." : `The agreement was not recorded: ${recorded.reason}.`);
+    }
+    emit(ctx.io, options.json, { runId, target: "agreement", verdict: value, reason }, `Recorded agreement ${value}.`);
+    return 0;
+  } finally {
+    store.close();
+  }
+}
+
+// `council verdict <run-id> <cluster-id|claim-id> verified|rejected|not-checked [--strongest <n>] [--] [reason]`,
+// or the agreement form above.
 async function verdictCouncil(options, positionals, ctx) {
   const deadline = performance.now() + BUDGET_MS.submit;
   const [runId, targetId, verdict, ...reasonWords] = positionals;
+  if (runId && targetId === "agreement") {
+    return agreementCouncil(options, { runId, value: verdict, reasonWords }, ctx);
+  }
   const usageText = "verdict <run-id> <cluster-id|claim-id> verified|rejected|not-checked [--strongest <n>] [--] [reason]";
   if (!runId || !targetId || !["verified", "rejected", "not-checked"].includes(verdict)) {
     throw new CouncilRefusal("invalid-arguments", `Usage: council ${usageText}`);
@@ -2989,6 +3078,7 @@ export function checkObjects(runDir, snapshot) {
  * for a pending stop (its oldest round; a follow-up stop is owned by round 2), `report-failure`
  * and `done` for a failed run, `collect` for an open round, `crossexam`, `collect` round 2 for
  * an open follow-up, `merge`, `verify` (with the clusters needing a verdict at the
+ * current input revision), `agree` (an open council without the leader's agreement verdict at the
  * current input revision), `report`, else `done`. Pure: `t` is the status clock and `objects` the
  * digest check made after the snapshot. Returns `{ action, round, deliveries, clusters, damaged }`.
  */
@@ -3029,6 +3119,9 @@ export function nextAction(snapshot, { t, objects, runDir = "" }) {
   if (unverified.length > 0) {
     return result("verify", 2, unverified.map((cluster) => cluster.id));
   }
+  if (run.kind === "open" && snapshot.agreement?.input_rev !== run.input_rev) {
+    return result("agree", 2);
+  }
   if (!reportCurrent || run.report_outcome !== "council" || !objects.reportExport) {
     return result("report", 2);
   }
@@ -3057,6 +3150,7 @@ const ACTION_TEXT = {
   crossexam: (_next, runId) => `Next: run council crossexam ${runId}.`,
   merge: (_next, runId) => `Next: run council merge ${runId}.`,
   verify: (next, runId) => `Next: check ${next.clusters.join(", ")} and record council verdict ${runId} <cluster-id> verified|rejected|not-checked.`,
+  agree: (_next, runId) => `Next: judge how far the answers agree and record council verdict ${runId} agreement agreed|partly|disagreed -- <reason>.`,
   report: (_next, runId) => `Next: run council report ${runId}.`,
   "report-failure": (_next, runId) => `Next: run council report ${runId} (the council failed).`,
   done: () => "Done."
@@ -3211,16 +3305,59 @@ export function renderFailedReport(runDir, snapshot) {
   return `${lines.join("\n").replace(/\n+$/, "")}\n`;
 }
 
+// The answers of a question or open council, each with the seats that linked it to their own
+// view: on a question, the seats whose vote went to its option; on an open council, the seats
+// that listed it in `agreesWith`. Then, on a question, the options of the vote.
+function answerSections(merge, input) {
+  const answers = merge.answers ?? [];
+  const labelOf = new Map(answers.map((entry) => [entry.seat, entry.label]));
+  const canonical = (responder, label) => labelOf.get(input.answerMaps?.[responder]?.[label]) ?? null;
+  const lines = ["", "## Answers", ""];
+  if (answers.length === 0) {
+    lines.push("None.");
+  }
+  for (const entry of answers) {
+    lines.push(`- ${entry.label} (${entry.seat}): ${cellText(entry.text)}`);
+    if (!merge.options) {
+      const agreeing = Object.keys(input.round2)
+        .filter((responder) => (input.round2[responder].agreesWith ?? []).some((label) => canonical(responder, label) === entry.label))
+        .sort();
+      lines.push(`  Agreed with by: ${agreeing.length > 0 ? agreeing.join(", ") : "none"}.`);
+    }
+  }
+  if (merge.options) {
+    lines.push("", "## Options", "");
+    for (const option of merge.options) {
+      const votes = merge.decision?.tally?.[option.id] ?? 0;
+      lines.push(`- ${option.id} (answers ${option.labels.join(", ")}; ${votes} ${votes === 1 ? "vote" : "votes"}): ${cellText(option.text)}`);
+    }
+  }
+  return lines;
+}
+
 /** The Markdown report of a council with its current merge and verdicts. */
 export function renderCouncilReport(runDir, snapshot, merge) {
   const verdictOf = (cluster) => verdictFor(snapshot, cluster);
-  const lines = ["# Council report", "", runLine(snapshot), "", ...seatTable(snapshot), "", notValidLine(snapshot), "", ...lateDeposits(snapshot), "", "## Verdict", "", confidenceLine(merge)];
-  if (unanimousPanel(mergeInput(runDir, snapshot))) {
+  const input = mergeInput(runDir, snapshot);
+  const lines = ["# Council report", "", runLine(snapshot), "", ...seatTable(snapshot), "", notValidLine(snapshot), "", ...lateDeposits(snapshot), "", "## Verdict", ""];
+  if (snapshot.run.kind === "open") {
+    const agreement = snapshot.agreement?.input_rev === snapshot.run.input_rev ? snapshot.agreement : null;
+    lines.push(`Agreement (leader judgement): ${agreement?.value ?? "not recorded"}`);
+    if (agreement) {
+      lines.push(`Reason: ${cellText(agreement.reason)}`);
+    }
+    lines.push("");
+  }
+  lines.push(confidenceLine(merge));
+  if (unanimousPanel(input)) {
     lines.push("", "Unanimous panel: the leader adds a counterargument.");
   }
   const unresolved = merge.clusters.filter((cluster) => cluster.severity === "P1" && !["verified", "rejected"].includes(verdictOf(cluster)?.verdict));
   if (unresolved.length > 0) {
     lines.push("", `Unresolved P1 findings: ${unresolved.map((cluster) => `${cluster.id} (${verdictOf(cluster)?.verdict ?? "no verdict"})`).join(", ")}.`);
+  }
+  if (merge.answers) {
+    lines.push(...answerSections(merge, input));
   }
   lines.push("", "## Findings", "", "| Cluster | Severity | Label | Location | Claim | Reported by | Validated by | Challenged by | Leader verdict |");
   lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
@@ -3272,7 +3409,15 @@ export function renderCouncilReport(runDir, snapshot, merge) {
   }
   lines.push("", "## Minority positions", "");
   const minority = [];
-  if (merge.decision) {
+  if (merge.options) {
+    // A question seat's vote is the option of the answer it endorsed.
+    const { stances } = mergeQuestion({ answers: canonicalAnswers(input.seats, input.round1), round2: input.round2, answerMaps: input.answerMaps });
+    for (const [seat, option] of Object.entries(stances)) {
+      if (!merge.decision.choice || option !== merge.decision.choice) {
+        minority.push(`- ${seat}: ${option ? `option ${option}` : "no valid vote"}`);
+      }
+    }
+  } else if (merge.decision) {
     const eligible = effectivePanel(snapshot, 2).filter((entry) => entry.valid);
     // A valid follow-up stance replaces the seat's Round 2 stance.
     const overrides = new Map((merge.followups ?? []).filter((entry) => entry.state === "valid" && entry.stance !== null).map((entry) => [entry.seat, entry.stance]));
@@ -3328,6 +3473,9 @@ async function reportCouncil(options, positionals, ctx) {
       const missing = needed.filter((cluster) => !verdictFor(snapshot, cluster));
       if (missing.length > 0) {
         throw new CouncilRefusal("verdict-required", `Record a verdict (verified, rejected or not-checked) for ${missing.map((cluster) => cluster.id).join(", ")} first.`);
+      }
+      if (snapshot.run.kind === "open" && snapshot.agreement?.input_rev !== snapshot.run.input_rev) {
+        throw new CouncilRefusal("verdict-required", `Record council verdict ${runId} agreement agreed|partly|disagreed -- <reason> first.`);
       }
       requiredTargets = needed.map(clusterTarget);
       text = renderCouncilReport(runDir, snapshot, merge);
