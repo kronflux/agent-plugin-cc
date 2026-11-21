@@ -670,3 +670,9 @@ test("a reply that omits a nullable required property, or wraps its JSON, is nor
   assert.equal(validateSchemaFile("council-round2-question", JSON.parse(normalizeAnswerBytes("council-round2-question", Buffer.from(JSON.stringify(noStance))).toString("utf8"))).ok, false);
   assert.equal(normalizeAnswerBytes("council-round2-question", Buffer.from("no json here")).toString("utf8"), "no json here");
 });
+
+test("a reply with a number that JSON cannot hold is left as it came and stays invalid", async () => {
+  const { normalizeAnswerBytes } = await import("../plugins/agent/scripts/lib/council/validate.mjs");
+  const text = '{"schema":1,"stance":"A","sameAs":[],"responses":[],"added":[{"id":"f9","severity":"P3","claim":"c","path":"a.txt","line":1e400,"evidence":"e"}]}';
+  assert.equal(normalizeAnswerBytes("council-round2-question", Buffer.from(text)).toString("utf8"), text);
+});

@@ -536,6 +536,15 @@ function parseReplyObject(text) {
   }
 }
 
+// Whether a parsed reply holds a number that JSON text cannot carry (such as 1e400, read as
+// Infinity). Writing it out again would turn it into null, so such a reply is left as it came.
+function hasNonFiniteNumber(value) {
+  if (typeof value === "number") {
+    return !Number.isFinite(value);
+  }
+  return value !== null && typeof value === "object" && Object.values(value).some(hasNonFiniteNumber);
+}
+
 /**
  * The bytes of a reply in the form the council stores and validates: the JSON object of the reply
  * with omitted nullable required properties set to null. A reply that holds no JSON object is
@@ -543,7 +552,7 @@ function parseReplyObject(text) {
  */
 export function normalizeAnswerBytes(schemaName, bytes) {
   const parsed = parseReplyObject(Buffer.from(bytes).toString("utf8"));
-  if (parsed === undefined || parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+  if (parsed === undefined || parsed === null || typeof parsed !== "object" || Array.isArray(parsed) || hasNonFiniteNumber(parsed)) {
     return Buffer.from(bytes);
   }
   return Buffer.from(JSON.stringify(fillNullable(loadCouncilSchema(schemaName), parsed)), "utf8");
