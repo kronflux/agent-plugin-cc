@@ -613,7 +613,7 @@ The plugin keeps one `config.json` per repository in its state folder (under `CL
 - `models` holds the delegation setting of each agent, described under [Models and effort](#models-and-effort). A `null` value means the agent default applies.
 - `writeSandbox` is the sandbox of write-capable tasks of both agents.
 
-`setup --scope user` writes `user-config.json` in the plugin data folder (`CLAUDE_PLUGIN_DATA`), or, without that folder, in the plugin's temp state folder beside the per-repository folders. It holds the settings for every repository:
+`setup --scope user` writes `user-config.json` to the folder `agent-plugin` of your Claude Code profile (beside its `plugins` folder), so the settings outlive an uninstall of the plugin, which deletes the plugin data folder. A `user-config.json` that an earlier version wrote into the plugin data folder is read from there and moved on the next `setup --scope user`. For a plugin data folder outside a profile the file stays in that folder, and without `CLAUDE_PLUGIN_DATA` it is in the plugin's temp state folder beside the per-repository folders. It holds the settings for every repository:
 
 ```json
 {
@@ -909,10 +909,17 @@ jobs. The commands are [`/agent:agy-setup`](#agentagy-setup),
 [`/agent:agy-usage`](#agentagy-usage), [`/agent:agy-delegate`](#agentagy-delegate), and
 [`/agent:agy-review`](#agentagy-review).
 
-Each turn runs its own `agy` process. Write runs use agy's `--sandbox`, and
-`/agent:codex-setup --write-sandbox danger-full-access` lifts it for both agents. Read-only runs
-use `--sandbox` together with settings that deny agy's file-writing and command tools. Paths
-outside the working folder that a turn must read are passed with `--add-dir`. An agy process
+Each turn runs its own `agy` process in print mode. In print mode agy cannot ask for a
+permission, so it refuses every tool call that needs one; the plugin therefore passes
+session-only settings (`--settings`) that say what a turn may do, and never changes agy's own
+settings files. A write-capable run may use every tool: it can edit files, run commands, read
+URLs and call MCP tools. Under `workspace-write` it also runs with agy's `--sandbox`, and
+`--write-sandbox danger-full-access` (for both agents) drops that flag; on a host where agy has
+no terminal sandbox, such as Windows, `--sandbox` restricts nothing. A read-only run gets
+`--sandbox` and settings that deny agy's file-writing and command tools and allow reading files
+and URLs. A read-only run that was refused a command and still answers counts as completed,
+because agy lists and searches files through commands; a write-capable run that was refused
+fails. Paths outside the working folder that a turn must read are passed with `--add-dir`. An agy process
 is stopped after 30 minutes; set `AGY_COMPANION_TURN_TIMEOUT_MS` to change the limit.
 
 Every agy process the plugin starts runs with `AGY_CLI_DISABLE_AUTO_UPDATE=1`, because agy's
