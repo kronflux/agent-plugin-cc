@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 
-import { makeTempDir, run } from "./helpers.mjs";
+import { makeTempDir, run, SLOW_RUNNER_SKIP } from "./helpers.mjs";
 import { readStdinIfPiped } from "../plugins/agent/scripts/lib/fs.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -514,7 +514,7 @@ const CONTENTION_RUNS = [
   { name: "a stop transaction that cannot commit", writerAt: "before", holdMs: 3500, noCommit: true }
 ];
 
-test("the session-end hook fits its budget under contention", { timeout: 900000 }, async (t) => {
+test("the session-end hook fits its budget under contention", { timeout: 900000, skip: SLOW_RUNNER_SKIP }, async (t) => {
   for (const variant of CONTENTION_RUNS) {
     await t.test(variant.name, { timeout: 180000 }, async (st) => {
       const ws = storeWorkspace(st, { maxParallel: { codex: 10, agy: 10 } });

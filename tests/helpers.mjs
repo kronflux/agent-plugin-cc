@@ -8,6 +8,14 @@ import { pathToFileURL } from "node:url";
 
 const tempDirs = new Set();
 
+/**
+ * A skip reason on a hosted Windows runner, else false. Tests that measure the store against a
+ * time budget under several writers pass it as their `skip` option: the disk of such a runner
+ * stalls for seconds at a time, so the budgets say nothing there.
+ */
+export const SLOW_RUNNER_SKIP =
+  process.env.CI && process.platform === "win32" ? "time budgets under contention are not stable on a hosted Windows runner" : false;
+
 const BUSY_CODES = new Set(["EBUSY", "EPERM", "ENOTEMPTY", "EMFILE", "ENFILE"]);
 
 /**

@@ -388,7 +388,9 @@ function materialize(value, stores, openStore) {
   }
   if (value && typeof value === "object") {
     if (typeof value.$store === "string" && Object.keys(value).length <= 2) {
-      const store = openStore(value.$store, value.options ?? {});
+      // Several children open one store at the same instant. The 2 s default of one attempt is
+      // too short for the last of them on a slow disk, and these calls have no retry around them.
+      const store = openStore(value.$store, { busyTimeoutMs: 15000, ...(value.options ?? {}) });
       stores.push(store);
       return store;
     }

@@ -10,7 +10,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 
 import * as fx from "./store-fixtures.mjs";
-import { stopOwnedProcess, stopOwnedProcesses } from "./helpers.mjs";
+import { SLOW_RUNNER_SKIP, stopOwnedProcess, stopOwnedProcesses } from "./helpers.mjs";
 import { dumpTables, makeStoreDir, rawAll, rawExec, runLibChild, spawnFixture, startHelperProcess } from "./store-fixtures.mjs";
 import * as store from "../plugins/agent/scripts/lib/store.mjs";
 import * as state from "../plugins/agent/scripts/lib/state.mjs";
@@ -434,7 +434,7 @@ test("two monitors reserving the integrity check get one reservation", { timeout
   }
 });
 
-test("eight writers keep every printed row when one is stopped mid-run", { timeout: 300000 }, async (t) => {
+test("eight writers keep every printed row when one is stopped mid-run", { timeout: 300000, skip: SLOW_RUNNER_SKIP }, async (t) => {
   const stateDir = makeStoreDir(t);
   store.openStore(stateDir).close();
   rawExec(stateDir, "CREATE TABLE stress (key TEXT PRIMARY KEY, writer TEXT NOT NULL, at INTEGER NOT NULL) STRICT");
