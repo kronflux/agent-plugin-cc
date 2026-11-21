@@ -199,6 +199,40 @@ export function resolveAgyModel({ model, effort = null, models = [], efforts = [
 }
 
 /**
+ * The model one agy turn runs with for a stored request `{ model, effort }`. agy is never given
+ * `--effort`, but a request written before model ids carried their effort may hold a model
+ * without an effort word beside a separate effort. Such a pair runs as `<model>-<effort>` when
+ * the model list holds that id, or unchecked, with a warning, when the list cannot be read; when
+ * the list lacks it, the model runs alone and a warning says the effort was not used. A recorded
+ * effort without a model is not used, with a warning. `readLists()` returns what
+ * `readCatalogLists` returns; it is called only when the model has no effort word.
+ * Returns `{ model, warning }`, warning null when there is nothing to say.
+ */
+export function agyTurnModel({ model = null, effort = null } = {}, { readLists }) {
+  if (!effort) {
+    return { model: model ?? null, warning: null };
+  }
+  if (!model) {
+    return { model: null, warning: `The recorded Antigravity effort ${effort} was not used, because the job names no model.` };
+  }
+  if (splitAgyModel(model, { efforts: [], catalogStatus: "unavailable" })) {
+    return { model, warning: null };
+  }
+  const lists = readLists();
+  if (splitAgyModel(model, lists)) {
+    return { model, warning: null };
+  }
+  const composed = `${model}-${effort}`;
+  if (lists.catalogStatus !== "available") {
+    return { model: composed, warning: `The Antigravity model list is unavailable, so "${composed}" was not checked.` };
+  }
+  if (lists.models.includes(composed)) {
+    return { model: composed, warning: null };
+  }
+  return { model, warning: `The recorded Antigravity effort ${effort} was not used, because agy does not list model ${composed}.` };
+}
+
+/**
  * Reads the model agy saved as its default from the Antigravity settings file, as agy names it
  * there (a display name such as "Model Name (Medium)"). Returns null when the file cannot be read
  * or names no model.
@@ -213,7 +247,7 @@ export function readAgySavedModel({ settingsPath = path.join(os.homedir(), ".gem
 }
 
 // The model list and effort words of one resolution, read once per resolution.
-function readCatalogLists(cwd, cache = {}) {
+export function readCatalogLists(cwd, cache = {}) {
   if (!cache.agyLists) {
     const listed = readAgyModels(cwd);
     const catalogStatus = listed.ok ? "available" : listed.failed ? "unavailable" : "empty";

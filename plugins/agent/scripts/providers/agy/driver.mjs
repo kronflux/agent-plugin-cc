@@ -9,6 +9,8 @@ import { CONTINUE_LINE } from "../../lib/mailbox.mjs";
 import { resolveCommand, runCommand } from "../../lib/process.mjs";
 import {
   agyEnv,
+  agyTurnModel,
+  readCatalogLists,
   AGY_DELEGATE_LINE,
   AGY_READ_ONLY_LINE,
   buildAgyArgs,
@@ -217,10 +219,15 @@ export function createAgyDriver(job = null, { env = process.env } = {}) {
       const request = parseRequest(row);
       schema = writeSchemaFile(request.outputSchema ?? null);
       const timeoutMs = readAgyTurnTimeoutMs(ctx.env ?? env);
+      // A continuation copies its job's stored request; one recorded before model ids carried
+      // their effort is joined into the id here, as agy is never given --effort.
+      const turnModel = agyTurnModel(request, { readLists: () => readCatalogLists(ctx.cwd ?? row.cwd) });
+      if (turnModel.warning) {
+        ctx.log?.(turnModel.warning);
+      }
       const args = buildAgyArgs({
         conversationId: row.thread_id ?? null,
-        model: request.model ?? null,
-        effort: request.effort ?? null,
+        model: turnModel.model,
         sandboxMode: sandboxModeOf(request),
         jsonSchema: schema?.file ?? null,
         timeoutMs,

@@ -2147,3 +2147,61 @@ test("resolveAgyModel parses the documented effort words when agy's help gives o
     warning: 'The Antigravity model list is unavailable, so "w-xhigh" was not checked.'
   });
 });
+
+test("agyTurnModel joins a legacy model and effort, and drops an effort without a model", () => {
+  const lists = { models: ["x-low", "x-medium", "plain"], efforts: ["low", "medium", "high"], catalogStatus: "available" };
+  let reads = 0;
+  const readLists = () => {
+    reads += 1;
+    return lists;
+  };
+  assert.deepEqual(agyRuntime.agyTurnModel({ model: "x-low", effort: "low" }, { readLists }), { model: "x-low", warning: null });
+  assert.equal(reads, 0);
+  assert.deepEqual(agyRuntime.agyTurnModel({ model: "x", effort: "medium" }, { readLists }), { model: "x-medium", warning: null });
+  assert.deepEqual(agyRuntime.agyTurnModel({ model: "plain", effort: "high" }, { readLists }), {
+    model: "plain",
+    warning: "The recorded Antigravity effort high was not used, because agy does not list model plain-high."
+  });
+  assert.deepEqual(agyRuntime.agyTurnModel({ model: null, effort: "high" }, { readLists }), {
+    model: null,
+    warning: "The recorded Antigravity effort high was not used, because the job names no model."
+  });
+  assert.deepEqual(agyRuntime.agyTurnModel({ model: "y", effort: "low" }, { readLists: () => ({ ...lists, models: [], catalogStatus: "unavailable" }) }), {
+    model: "y-low",
+    warning: 'The Antigravity model list is unavailable, so "y-low" was not checked.'
+  });
+});
+
+test("a resumed job whose request holds a model and a separate effort runs the joined id", async (t) => {
+  const ctx = makeRepo(undefined, t);
+  const first = run("node", [AGY, "task", "--json", "--model", "fake-model-low", "first"], { cwd: ctx.repo, env: ctx.env, timeout: 60000 });
+  assert.equal(first.status, 0, first.stderr);
+  const firstId = JSON.parse(first.stdout).jobId;
+  // As an earlier version recorded it: the base name and a separate effort.
+  const request = { ...requestOf(job(ctx.repo, firstId)), model: "fake-model", effort: "high" };
+  rawExec(resolveStateDir(ctx.repo), "UPDATE jobs SET model = ?, request_json = ? WHERE id = ?", ["fake-model", JSON.stringify(request), firstId]);
+
+  const resumed = run("node", [NEUTRAL, "resume", firstId, "--json", "--", "more"], { cwd: ctx.repo, env: ctx.env, timeout: 60000 });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  await waitUntil(() => storeJobs(ctx.repo).find((row) => row.continues === firstId && row.end_state !== null), { timeoutMs: 30000, describe: "the continuation ending" });
+  const args = readFakeAgyState(ctx.binDir).runs[1].args;
+  assert.match(args.join(" "), /--model fake-model-high/);
+  assert.equal(args.includes("--effort"), false, args.join(" "));
+});
+
+test("a resumed job with a recorded effort and no model logs that the effort was not used", async (t) => {
+  const ctx = makeRepo(undefined, t);
+  const first = run("node", [AGY, "task", "--json", "first"], { cwd: ctx.repo, env: ctx.env, timeout: 60000 });
+  assert.equal(first.status, 0, first.stderr);
+  const firstId = JSON.parse(first.stdout).jobId;
+  const request = { ...requestOf(job(ctx.repo, firstId)), effort: "high" };
+  rawExec(resolveStateDir(ctx.repo), "UPDATE jobs SET request_json = ? WHERE id = ?", [JSON.stringify(request), firstId]);
+
+  const resumed = run("node", [NEUTRAL, "resume", firstId, "--json", "--", "more"], { cwd: ctx.repo, env: ctx.env, timeout: 60000 });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  const successor = await waitUntil(() => storeJobs(ctx.repo).find((row) => row.continues === firstId && row.end_state !== null), { timeoutMs: 30000, describe: "the continuation ending" });
+  const args = readFakeAgyState(ctx.binDir).runs[1].args;
+  assert.equal(args.includes("--effort"), false, args.join(" "));
+  const log = fs.readFileSync(path.join(resolveStateDir(ctx.repo), "store", "artifacts", `${successor.id}.log`), "utf8");
+  assert.match(log, /The recorded Antigravity effort high was not used, because the job names no model\./);
+});
