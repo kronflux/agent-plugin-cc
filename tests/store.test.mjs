@@ -91,6 +91,7 @@ test("package.json engines.node is the measured floor", () => {
 
 const SCHEMA_TABLES = [
   "chains",
+  "council_agreements",
   "council_attempts",
   "council_ext_decisions",
   "council_ext_events",
@@ -98,6 +99,7 @@ const SCHEMA_TABLES = [
   "council_ext_turns",
   "council_observations",
   "council_rounds",
+  "council_run_modes",
   "council_runs",
   "council_seat_rounds",
   "council_seats",
@@ -229,6 +231,8 @@ const COLUMNS_AFTER_V1 = ["provider_group_id", "provider_exit_seen_at"];
 
 // The council tables a later version added, children before the tables they reference.
 const COUNCIL_TABLES_AFTER_V1 = [
+  "council_agreements",
+  "council_run_modes",
   "council_ext_decisions",
   "council_ext_events",
   "council_ext_turns",
@@ -266,10 +270,10 @@ test("a version-1 store migrates to the current columns with old rows null", (t)
   db.close();
   rawExec(stateDir, `UPDATE jobs SET exec_gen = 1, claimed_at = 1, worker_pid = 11, worker_group_id = 11, provider_pid = 12 WHERE id = '${jobId}'`);
   asVersion1Store(stateDir);
-  assert.equal(store.SCHEMA_VERSION, 5);
+  assert.equal(store.SCHEMA_VERSION, 6);
   const migrated = store.openStore(stateDir);
   migrated.close();
-  assert.equal(rawAll(stateDir, "PRAGMA user_version")[0].user_version, 5);
+  assert.equal(rawAll(stateDir, "PRAGMA user_version")[0].user_version, 6);
   const columns = rawAll(stateDir, "PRAGMA table_info(jobs)").map((column) => column.name);
   for (const name of COLUMNS_AFTER_V1) {
     assert.ok(columns.includes(name), `the ${name} column was not added`);

@@ -1094,6 +1094,59 @@ BEGIN
 END;
 `;
 
+// The council modes beyond review and decision, added beside the existing tables (no rebuild):
+// the mode of a question or open run, set once at creation over the stored kind (`decision` for
+// a question run, `review` for an open run), and the leader's agreement verdict on an open run,
+// fenced to the current merge. An agreement is replaced by an update at a later input revision;
+// neither table's rows can be deleted.
+const SCHEMA_COUNCIL_MODES = `
+CREATE TABLE council_run_modes (
+  run_id TEXT PRIMARY KEY NOT NULL REFERENCES council_runs(id),
+  mode TEXT NOT NULL CHECK (mode IN ('question','open'))
+) STRICT;
+
+CREATE TABLE council_agreements (
+  run_id TEXT PRIMARY KEY NOT NULL REFERENCES council_runs(id),
+  value TEXT NOT NULL CHECK (value IN ('agreed','partly','disagreed')),
+  reason TEXT NOT NULL CHECK (reason<>''),
+  merge_sha256 TEXT NOT NULL CHECK
+    (length(merge_sha256)=64 AND merge_sha256 NOT GLOB '*[^0-9a-f]*'),
+  input_rev INTEGER NOT NULL CHECK (input_rev>=0),
+  recorded_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TRIGGER council_run_mode_insert BEFORE INSERT ON council_run_modes
+WHEN EXISTS (SELECT 1 FROM council_run_modes WHERE run_id=NEW.run_id)
+  OR EXISTS (SELECT 1 FROM council_rounds WHERE run_id=NEW.run_id)
+  OR NOT EXISTS (
+    SELECT 1 FROM council_runs WHERE id=NEW.run_id
+      AND kind=CASE NEW.mode WHEN 'question' THEN 'decision' ELSE 'review' END
+  )
+BEGIN SELECT RAISE(ABORT,'council run mode is set once, at creation, over its stored kind'); END;
+CREATE TRIGGER council_run_mode_update BEFORE UPDATE ON council_run_modes
+BEGIN SELECT RAISE(ABORT,'council run mode is immutable'); END;
+CREATE TRIGGER council_run_mode_delete BEFORE DELETE ON council_run_modes
+BEGIN SELECT RAISE(ABORT,'council run mode cannot be deleted'); END;
+
+CREATE TRIGGER council_agreement_insert BEFORE INSERT ON council_agreements
+WHEN EXISTS (SELECT 1 FROM council_agreements WHERE run_id=NEW.run_id)
+  OR NOT EXISTS (SELECT 1 FROM council_run_modes WHERE run_id=NEW.run_id AND mode='open')
+  OR NOT EXISTS (
+    SELECT 1 FROM council_runs WHERE id=NEW.run_id AND merge_sha256=NEW.merge_sha256
+      AND merge_rev=NEW.input_rev AND input_rev=NEW.input_rev
+  )
+BEGIN SELECT RAISE(ABORT,'council agreement needs an open run, its current merge and no earlier row'); END;
+CREATE TRIGGER council_agreement_update BEFORE UPDATE ON council_agreements
+WHEN NEW.run_id IS NOT OLD.run_id OR NEW.input_rev<OLD.input_rev OR NEW.recorded_at<OLD.recorded_at
+  OR NOT EXISTS (
+    SELECT 1 FROM council_runs WHERE id=NEW.run_id AND merge_sha256=NEW.merge_sha256
+      AND merge_rev=NEW.input_rev AND input_rev=NEW.input_rev
+  )
+BEGIN SELECT RAISE(ABORT,'council agreement run is fixed and needs the current merge'); END;
+CREATE TRIGGER council_agreement_delete BEFORE DELETE ON council_agreements
+BEGIN SELECT RAISE(ABORT,'council agreement cannot be deleted'); END;
+`;
+
 /**
  * The schema migrations in order, one entry per schema version. `openStore` applies every entry
  * above the stored `user_version` in one transaction. A new version appends an entry.
@@ -1136,6 +1189,13 @@ export const MIGRATIONS = Object.freeze([
     apply(db) {
       // Additive: the council extension tables; no earlier council table, row or trigger changes.
       db.exec(SCHEMA_COUNCIL_EXTENSIONS);
+    }
+  }),
+  Object.freeze({
+    version: 6,
+    apply(db) {
+      // Additive: the question and open council modes; no earlier council table, row or trigger changes.
+      db.exec(SCHEMA_COUNCIL_MODES);
     }
   })
 ]);

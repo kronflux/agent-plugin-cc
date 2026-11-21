@@ -631,15 +631,43 @@ delete that file and run the command again.
 
 ## Council
 
-`/agent:council <question or brief>` asks a council to review work or weigh a decision. The
-`council` skill runs it; it is also available to Claude without the command. A council is a panel
+`/agent:council <question or brief>` asks a council to review work, weigh a decision or answer a
+question. The `council` skill runs it; it is also available to Claude without the command. A council is a panel
 of read-only seats from different families: by default one Claude subagent (the
 `agent:council-member` agent, read-only with `Read`, `Grep` and `Glob`), one Codex job and one
 Antigravity job. You, the leader, deliver the prompts, check the findings and record verdicts, but
 you have no vote.
 
+**Four modes.** The brief's `kind` (or `council start --kind`) picks one per run:
+
+- `review`: the seats report findings about files or a document.
+- `decision`: the seats vote among two or more `options` you write.
+- `question`: each seat answers in its own words (`answer`, at most 500 characters), with its
+  findings as supporting points. In Round 2 each seat sees every answer under a label (`A`, `B`,
+  ..., its own marked), sets `sameAs` to the pairs of labels that say the same thing, and sets
+  `stance` to the label it endorses. The merge joins answers that any seat linked into `options`
+  and tallies the stances per option: the choice is the option with at least two thirds of the
+  seats that answered Round 1, and a seat without a valid Round 2 answer casts no vote. The panel
+  is `unanimous` when every seat's stance falls in one option and no seat challenged or added a
+  finding.
+- `open`: each seat answers in its own words. In Round 2 it lists the answers it agrees with in
+  `agreesWith`, and validates, challenges (with a reason) or skips every other answer in
+  `answerResponses`, as it does each finding. The merge holds each seat's marks under `marks`, in
+  the canonical answer labels, so you can judge before the report. There is no vote. You judge how far the answers agree and record
+  `council verdict <run-id> agreement agreed|partly|disagreed [--merge <sha256>] [--] <reason>`
+  (`--merge` names the merge you read, as `council merge --json` reports it in `mergeSha256`; a
+  different current merge is refused with `stale-merge`); the report shows
+  `Agreement (leader judgement): <value>` and lists every answer with the seats that agreed with
+  it and the seats that challenged it.
+  An agreement verdict on any other kind of council exits 1.
+
+Pick `question` when the question has a best answer but you cannot list the choices, and `open`
+when it is a matter of judgement where a vote would mislead. The prompts call the panel a council,
+whatever the mode.
+
 **Seats and lenses.** Each seat answers through a lens. A review uses correctness, security and
-maintainability; a decision uses what could fail, first principles, and the cost of carrying it out.
+maintainability; a decision uses what could fail, first principles, and the cost of carrying it out;
+a question or open council uses evidence, first principles and counterexamples.
 `--seat <family>:<lens>` (families `claude`, `codex`, `agy`) names the seats instead: at most five,
 at most one Claude seat, and opposing lenses go to different families. `--model <family>=<value>`
 picks a seat's model. A council needs at least two seats from two families; `council start` refuses
@@ -713,7 +741,8 @@ included), `families` (original families only), `substitutions`, `substitutionDe
 as `substitute (same family as leader)`. The member-turn cap stays two turns per seat plus six.
 
 **The status loop.** The skill repeats `council status <run-id>`, which names one next action:
-`collect`, `crossexam`, `merge`, `verify`, `report`, `report-failure`, `damaged` or `done`, with
+`collect`, `crossexam`, `merge`, `verify`, `agree` (an open council waiting for your agreement
+verdict), `report`, `report-failure`, `damaged` or `done`, with
 the prompts to deliver (`deliveries`, each with its prompt file and intent id) and any cutoff notice
 for the Claude seat (a delivery with `kind` `notice`, the seat and the text), which is handed once.
 Claude's replies go back with `council submit <run-id> <seat> --intent <intent-id> [--round N]
@@ -726,8 +755,11 @@ pending stop requests; `cleanupPending` says whether some are still outstanding.
 **Merge, verdicts and report.** `council merge` groups the findings into clusters labelled
 `consensus`, `cross-validated`, `disputed` or `solo` by explicit links only. `council verdict
 <run-id> <cluster-id|claim-id> verified|rejected|not-checked [--strongest <n>] [--] [reason]`
-records your check; the report needs a verdict on every P1, consensus and cross-validated cluster.
-`council report` writes `report.md`. At most three councils run in a row on one subject.
+records your check; the report needs a verdict on every P1, consensus and cross-validated cluster,
+and on an open council the agreement verdict at the current merge. On a question or open council the
+merge also lists every answer under `answers` (`{ label, seat, text }`, labelled in seat order), and
+a question council lists its `options` (`{ id, labels, text }`) and the vote in `decision`; the
+report adds `## Answers` and, for a question, `## Options`. `council report` writes `report.md`. At most three councils run in a row on one subject.
 
 **Follow-up questions.** After Round 2 closed with a quorum and the merge is current, `council
 followup <run-id> <seat> --finding <cluster-id|stance> [--] <question>` asks one seat one question
@@ -748,7 +780,9 @@ again, and run `council report` again. While a follow-up is open, `council repor
 
 **Counterargument.** `council status` and `council merge` show `unanimous: true` when every seat
 agreed: every seat validated every other seat's findings, no seat challenged, skipped or added a
-finding, and on a decision every seat chose the same option. The skill then writes the strongest
+finding, and on a decision every seat chose the same option (on a question council: every seat's
+vote falls in one option and no seat challenged or added a finding; an open council is never
+unanimous). The skill then writes the strongest
 counterargument itself, checks it against the code, and states it with its assessment under
 `Counterargument (leader)` when it presents the report; the report says `Unanimous panel: the
 leader adds a counterargument.` The counterargument is not a finding and is not merged.

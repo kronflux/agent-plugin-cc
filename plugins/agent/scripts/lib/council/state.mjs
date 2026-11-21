@@ -62,6 +62,11 @@ const DIGEST = /^[0-9a-f]{64}$/;
 const LABEL = /^[a-z0-9-]{1,40}$/;
 const RECEIPT_OUTCOMES = new Set(["valid", "invalid"]);
 const OBSERVATION_OUTCOMES = new Set(["valid", "invalid", "late", "cancelled", "quota", "failure", "missing"]);
+const COUNCIL_KINDS = new Set(["review", "decision", "question", "open"]);
+// The stored kind of a run of each mode: `council_runs.kind` keeps its two values, and a question
+// or open run records its mode in `council_run_modes`.
+const STORED_KIND = Object.freeze({ question: "decision", open: "review" });
+export const AGREEMENT_VALUES = Object.freeze(["agreed", "partly", "disagreed"]);
 
 /**
  * A council predicate that failed inside a job store hook, thrown so the store rolls the job
@@ -215,7 +220,7 @@ function seatProblem(seat, index) {
 
 // The reason a run request is refused before any store access, or null.
 function runInputProblem({ runId, kind, cwd, briefSha256, options, timeoutMs, seats }) {
-  if (typeof runId !== "string" || runId === "" || (kind !== "review" && kind !== "decision") || typeof cwd !== "string" || cwd === "") {
+  if (typeof runId !== "string" || runId === "" || !COUNCIL_KINDS.has(kind) || typeof cwd !== "string" || cwd === "") {
     return "invalid-run";
   }
   if (!isDigest(briefSha256) || !Number.isInteger(timeoutMs) || timeoutMs <= 0) {
@@ -258,8 +263,10 @@ function runInputProblem({ runId, kind, cwd, briefSha256, options, timeoutMs, se
  * seat round with its attempt (a Claude seat `running` with a prompt issued at creation, a
  * provider seat `issuing` with a create attempt, a `missing-cli` seat with no attempt). Seats are
  * `{ seat, family, provider, model, lens, label, attemptId, promptSha256, retryPromptSha256,
- * missingCli }` in planned order `s1`, `s2`, ...; `options` are the decision options. Resolves to
- * `{ ok: true }` or `{ ok: false, reason }` with nothing written.
+ * missingCli }` in planned order `s1`, `s2`, ...; `options` are the decision options. `kind` is
+ * `review`, `decision`, `question` or `open`; a question run is stored as `decision` and an open
+ * run as `review`, each with its mode row inserted before the round. Resolves to `{ ok: true }` or
+ * `{ ok: false, reason }` with nothing written.
  */
 export async function createCouncilRun(store, { runId, kind, sessionId = null, cwd, briefSha256, options = [], timeoutMs, seats, layer = 0, deadline } = {}) {
   void layer;
@@ -280,7 +287,10 @@ export async function createCouncilRun(store, { runId, kind, sessionId = null, c
     db.prepare(
       `INSERT INTO council_runs (id, kind, session_id, cwd, brief_sha256, options_json, timeout_ms, seat_count, turn_cap, created_at, clock)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(runId, kind, sessionId, cwd, briefSha256, JSON.stringify(options), timeoutMs, seats.length, 2 * seats.length + 6, w, w);
+    ).run(runId, STORED_KIND[kind] ?? kind, sessionId, cwd, briefSha256, JSON.stringify(options), timeoutMs, seats.length, 2 * seats.length + 6, w, w);
+    if (Object.hasOwn(STORED_KIND, kind)) {
+      db.prepare("INSERT INTO council_run_modes (run_id, mode) VALUES (?, ?)").run(runId, kind);
+    }
     db.prepare("INSERT INTO council_rounds (run_id, round, started_at) VALUES (?, 1, ?)").run(runId, w);
     const insertSeat = db.prepare(
       "INSERT INTO council_seats (run_id, seat, family, provider, model, lens, label, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
@@ -362,8 +372,19 @@ function actorAnswers(ext) {
   return answers;
 }
 
-function readSnapshot(db, runId) {
+// The run row with its effective kind: the mode of a question or open run, else the stored
+// kind, which stays under `stored_kind`.
+function readRun(db, runId) {
   const run = plain(db.prepare("SELECT * FROM council_runs WHERE id = ?").get(runId));
+  if (!run) {
+    return null;
+  }
+  const mode = db.prepare("SELECT mode FROM council_run_modes WHERE run_id = ?").get(runId)?.mode ?? null;
+  return { ...run, stored_kind: run.kind, kind: mode ?? run.kind };
+}
+
+function readSnapshot(db, runId) {
+  const run = readRun(db, runId);
   if (!run) {
     return null;
   }
@@ -400,14 +421,16 @@ function readSnapshot(db, runId) {
        WHERE a.run_id = ? ORDER BY c.committed_at, c.job_id`
     ),
     charges,
-    verdicts: all("SELECT * FROM council_verdicts WHERE run_id = ? ORDER BY target_kind, target")
+    verdicts: all("SELECT * FROM council_verdicts WHERE run_id = ? ORDER BY target_kind, target"),
+    agreement: plain(db.prepare("SELECT * FROM council_agreements WHERE run_id = ?").get(runId) ?? null)
   };
 }
 
 /**
  * One read snapshot of a council run: run, rounds, seats, seat rounds, attempts, observations,
- * stops, stop cancellations, issued charges (`{ total, rounds: { [round]: { turn, repair, retry } } }`)
- * and verdicts; null for an unknown run.
+ * stops, stop cancellations, issued charges (`{ total, rounds: { [round]: { turn, repair, retry } } }`),
+ * verdicts and the agreement row of an open run (or null); null for an unknown run. `run.kind` is
+ * the effective kind (`review`, `decision`, `question` or `open`), `run.stored_kind` the column.
  */
 export function readCouncil(store, runId, opts = {}) {
   return store.read((db) => readSnapshot(db, runId), opts);
@@ -1410,10 +1433,60 @@ export async function recordVerdict(
 }
 
 /**
+ * Records the leader's agreement verdict on an open run: `value` agreed, partly or disagreed with
+ * a nonblank `reason`, valid only while `merge_sha256 = mergeSha256` and `merge_rev = input_rev =
+ * inputRev`; a later call at a later input revision replaces it. Raises `verdict_rev`, in one
+ * transaction. Resolves to `{ ok: true }` or `{ ok: false, reason }` (`invalid-agreement` for an
+ * unknown value or a blank reason, `unknown-run`, `not-open` for a run of another kind,
+ * `stale-merge`).
+ */
+export async function recordAgreement(store, { runId, value, reason, mergeSha256, inputRev, deadline } = {}) {
+  if (!AGREEMENT_VALUES.includes(value) || typeof reason !== "string" || !reason.trim()) {
+    return { ok: false, reason: "invalid-agreement" };
+  }
+  return transact(store, deadline, (db) => {
+    const run = readRun(db, runId);
+    if (!run) {
+      return { ok: false, reason: "unknown-run" };
+    }
+    if (run.kind !== "open") {
+      return { ok: false, reason: "not-open" };
+    }
+    if (!run.merge_sha256 || run.merge_sha256 !== mergeSha256 || run.merge_rev !== inputRev || run.input_rev !== inputRev) {
+      return { ok: false, reason: "stale-merge" };
+    }
+    const { t } = sampleTimes(run.clock);
+    const text = reason.trim();
+    if (db.prepare("SELECT 1 FROM council_agreements WHERE run_id = ?").get(runId)) {
+      db.prepare("UPDATE council_agreements SET value = ?, reason = ?, merge_sha256 = ?, input_rev = ?, recorded_at = ? WHERE run_id = ?").run(
+        value,
+        text,
+        mergeSha256,
+        inputRev,
+        t,
+        runId
+      );
+    } else {
+      db.prepare("INSERT INTO council_agreements (run_id, value, reason, merge_sha256, input_rev, recorded_at) VALUES (?, ?, ?, ?, ?, ?)").run(
+        runId,
+        value,
+        text,
+        mergeSha256,
+        inputRev,
+        t
+      );
+    }
+    db.prepare("UPDATE council_runs SET verdict_rev = verdict_rev + 1 WHERE id = ?").run(runId);
+    writeClock(db, runId, t);
+    return { ok: true };
+  });
+}
+
+/**
  * Records the report object `reportSha256` rendered at `inputRev` and `verdictRev`, while both
  * revisions are current: outcome `failed` needs a failed run; outcome `council` needs the merge at
- * `inputRev` and a verdict at `inputRev` for every cluster target in `requiredTargets`; no
- * follow-up may be open. Resolves to `{ ok: true }` or `{ ok: false, reason }` (`unknown-run`,
+ * `inputRev`, a verdict at `inputRev` for every cluster target in `requiredTargets` and, on an
+ * open run, the agreement at `inputRev`; no follow-up may be open. Resolves to `{ ok: true }` or `{ ok: false, reason }` (`unknown-run`,
  * `stale`, `followup-open`, `not-reportable`).
  */
 export async function recordReport(store, { runId, reportSha256, outcome, inputRev, verdictRev, requiredTargets = [], deadline } = {}) {
@@ -1443,6 +1516,10 @@ export async function recordReport(store, { runId, reportSha256, outcome, inputR
     if (outcome === "council") {
       const verdictAt = db.prepare("SELECT 1 FROM council_verdicts WHERE run_id = ? AND target_kind = 'cluster' AND target = ? AND input_rev = ?");
       if (requiredTargets.some((target) => !verdictAt.get(runId, target, inputRev))) {
+        return { ok: false, reason: "not-reportable" };
+      }
+      const open = db.prepare("SELECT 1 FROM council_run_modes WHERE run_id = ? AND mode = 'open'").get(runId);
+      if (open && !db.prepare("SELECT 1 FROM council_agreements WHERE run_id = ? AND input_rev = ?").get(runId, inputRev)) {
         return { ok: false, reason: "not-reportable" };
       }
     }

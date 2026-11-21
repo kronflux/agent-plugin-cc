@@ -1,12 +1,12 @@
 ---
 name: council
-description: 'Ask a read-only council (a Codex seat, an Antigravity seat and a Claude subagent) to review work or weigh a decision in two rounds, and report the merged findings'
+description: 'Ask a read-only council (a Codex seat, an Antigravity seat and a Claude subagent) to review work, weigh a decision, or answer a question in two rounds, and report the merged result'
 argument-hint: '<question, or a brief file>'
 ---
 
 # Council
 
-A council is a panel of read-only seats from different families: by default one Claude subagent (the `agent:council-member` agent), one Codex job and one Antigravity job. Each seat answers the same brief through its own lens; in a second round each seat sees the other seats' findings without their names and validates, challenges or skips each one. A script merges the answers. You lead: you deliver prompts, check the findings and write the verdicts, but **the leader has no vote**.
+A council is a panel of read-only seats from different families: by default one Claude subagent (the `agent:council-member` agent), one Codex job and one Antigravity job. Each seat answers the same brief through its own lens; in a second round each seat sees the other seats' findings (and, on a question or open council, their answers) without their names and validates, challenges or skips each finding. A script merges the answers. You lead: you deliver prompts, check the findings and write the verdicts, but **the leader has no vote**.
 
 All commands below are `node --disable-warning=ExperimentalWarning "${CLAUDE_PLUGIN_ROOT}/scripts/agent-companion.mjs" council <subcommand> ...`. Run each with `--json` and read its JSON.
 
@@ -18,7 +18,12 @@ Write a JSON file with exactly these keys:
 { "question": "...", "targets": ["src/cache.mjs"], "kind": "review", "options": [], "claims": [ { "text": "...", "status": "observed" } ] }
 ```
 
-- `kind` is `review` (findings about code or a document) or `decision` (a choice between `options`, two or more).
+- `kind` picks the mode. Choose it from what the user needs:
+  - `review`: there are files or a document to judge. The seats report findings.
+  - `decision`: you can write the choices yourself. Put two or more in `options`; each seat votes for one.
+  - `question`: the question has a best answer, but you cannot list the choices. Each seat answers in its own words (at most 500 characters); in Round 2 each seat marks which answers say the same thing and endorses one. Answers marked as the same become one option, and the seats' endorsements are the vote. Leave `options` empty.
+  - `open`: a matter of judgement, where a vote would mislead. Each seat answers in its own words and, in Round 2, says which answers it agrees with. There is no vote: you judge how far the answers agree. Leave `options` empty.
+- `targets` is optional; a question or open council often has none. Every mode works in a folder that is not a git repository.
 - `claims` are the premises you want checked, each `observed` or `assumed`.
 - With no `--seat`, the council has the three default seats and lenses. To name seats, pass `--seat <family>:<lens>` for each (families `claude`, `codex`, `agy`; at most five seats, at most one Claude seat), and give opposing lenses to different families.
 
@@ -39,6 +44,7 @@ Repeat until the action is `done`:
    - `crossexam`: run `council crossexam <run-id> --json`. Claude's Round 2 prompt goes to the same seat agent.
    - `merge`: run `council merge <run-id> --json`.
    - `verify`: check each listed cluster yourself against the code or the source, then record `council verdict <run-id> <cluster-id> verified|rejected|not-checked [--strongest <n>] -- <reason>`. A rejected verdict needs a reason. On a verified disputed cluster, `--strongest <n>` names the strongest objection you rejected. Claims of the brief take a verdict the same way, by claim id (`a1`, `a2`, ...).
+   - `agree` (open councils only): read every answer in the merge (`answers`) and each seat's entry under `marks` there: the answers it agrees with (`agreesWith`) and its `validate`, `challenge` or `skip` of every other answer, with reasons (`answerResponses`). Then judge how far the answers agree, and record `council verdict <run-id> agreement agreed|partly|disagreed --merge <mergeSha256> -- <reason>`, where `<mergeSha256>` is the digest that `council merge --json` reported for the merge you read. If the merge changed since, the verdict is refused with `stale-merge`: run `council merge` again, read it again and judge again. The reason is required; say what the answers share and where they differ. The report shows it as `Agreement (leader judgement): <value>`.
    - `report`: if `unanimous` in the status is `true`, first write the counterargument ("Counterargument when every seat agreed" below). Then run `council report <run-id>` and present `report.md` to the user.
    - `report-failure`: run `council report <run-id>` and present `report.md` to the user.
    - `damaged`: tell the user which object is damaged (the digest in the status) and stop.
@@ -48,7 +54,7 @@ If a command reports that the job store is busy or unavailable, wait 5 seconds a
 
 ## Counterargument when every seat agreed
 
-`council status` (and `council merge`) shows `unanimous: true` when every seat agreed: every seat validated every other seat's findings, no seat challenged, skipped or added a finding, and on a decision every seat chose the same option. Then, before you present the report:
+`council status` (and `council merge`) shows `unanimous: true` when every seat agreed: every seat validated every other seat's findings, no seat challenged, skipped or added a finding, and on a decision every seat chose the same option. On a question council it is `true` when every seat's vote falls in one option and no seat challenged or added a finding. An open council is never `unanimous`; your agreement verdict takes its place. Then, before you present the report:
 
 1. Write the strongest counterargument to the agreed result yourself.
 2. Check it against the code or the source.
@@ -65,7 +71,11 @@ After Round 2 closed with a quorum and the merge is current, you can ask one sea
 3. For the Claude seat or a seat a stand-in answered, the output's `deliveries` holds a delivery with `kind` `followup`. Send its `promptFile` with `SendMessage` to the agent that gave the Round 2 answer of its `actor` (the Claude seat's agent, or the stand-in's agent); after a restart, give it to a new `council-member` agent, because the prompt is complete. Write the agent's reply to a file and run `council submit <run-id> <seat> --intent <intentId> --file <reply> --json`.
 4. An answer changes the council's inputs. Run `council merge <run-id>` again, record the verdicts again, and run `council report <run-id>` again. While a follow-up is open, `council report` refuses with `followup-open-report`, and `council status` names `collect` for round 2.
 
-The report lists each question under `## Follow-ups` with the seat, the finding and the answer, or the reason it has none. On a decision, a valid `stance` in the answer replaces that seat's vote.
+The report lists each question under `## Follow-ups` with the seat, the finding and the answer, or the reason it has none. On a decision, a valid `stance` in the answer replaces that seat's vote. `--finding stance` is for a decision only; on a question or open council, ask about a merged finding.
+
+## Answers and options
+
+On a question or open council the merge lists every seat's answer under `answers`, labelled `A`, `B`, ... in seat order; the report shows them under `## Answers`. On a question council the merge also lists `options` (answers the seats marked as the same, each named after its first answer) and the vote in `decision`: the choice is the option with at least two thirds of the seats, and a seat without a valid Round 2 answer counts against it. The report shows the options under `## Options`. On an open council each answer lists the seats that agreed with it.
 
 ## Rules
 

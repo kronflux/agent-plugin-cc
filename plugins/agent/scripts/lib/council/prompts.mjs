@@ -24,8 +24,38 @@ const FAMILY_PROVIDERS = { claude: null, codex: "codex", agy: "agy" };
 
 export const DEFAULT_LENSES = {
   review: ["correctness", "security", "maintainability"],
-  decision: ["what could fail", "first principles", "cost of carrying it out"]
+  decision: ["what could fail", "first principles", "cost of carrying it out"],
+  question: ["evidence", "first principles", "counterexamples"],
+  open: ["evidence", "first principles", "counterexamples"]
 };
+
+// What a seat writes in its first answer, by kind: findings and a stance for a review or a
+// decision; a statement of its own answer, with findings as its supporting points, for a question
+// or an open council.
+const ROUND1_RULES = {
+  findings:
+    "Give each finding an id `f1`, `f2` and so on, a severity from `P1` (most severe) to `P3`, the claim, the file path and line (or null when the finding has none), and the evidence that supports it. State what you assumed under `assumptions`, and say under `wouldChangeMind` what would change your view. For a decision, set `stance` to one of the options the brief names; for a review, set `stance` to null.",
+  ownWords:
+    "Answer the question in `answer`: one statement in your own words, at most 500 characters. Give the points that support it as findings: each with an id `f1`, `f2` and so on, a weight from `P1` (most important) to `P3` in `severity`, the claim, the file path and line (or null when the point has none), and the evidence. State what you assumed under `assumptions`, and say under `wouldChangeMind` what would change your answer. Set `stance` to null."
+};
+
+function round1Rules(kind) {
+  return kind === "question" || kind === "open" ? ROUND1_RULES.ownWords : ROUND1_RULES.findings;
+}
+
+// The Round 2 instruction on the stance, by kind; for a question or open council it also says how
+// to name the members' answers by label, and which label is the seat's own (null for a fresh
+// stand-in, which has no answer of its own).
+function round2StanceRule(kind, ownLabel) {
+  const own = ownLabel ? ` Your own answer is labelled ${ownLabel}.` : "";
+  if (kind === "question") {
+    return `Separately, set the top-level \`sameAs\` to the pairs of answer labels that say the same thing in substance, for example \`[["A", "C"]]\`, or to \`[]\` when no two do; answers linked this way become one option of the vote. Set \`stance\` to the label of the answer you endorse, which may be your own.${own}`;
+  }
+  if (kind === "open") {
+    return `Answer \`validate\`, \`challenge\` or \`skip\` for every other member's answer in \`answerResponses\`, once each, with its label in \`answer\`; give a reason for every challenge (elsewhere \`reason\` may be a short note or null), and do not respond to your own answer. Set \`agreesWith\` to the labels of the answers you agree with in substance, or to \`[]\`; there is no vote, and the leader judges how far the members agree. Set \`stance\` to null.${own}`;
+  }
+  return "For a decision, set `stance` to your final choice among the options the brief names; for a review, set `stance` to null.";
+}
 
 // The provider id that runs a family's seats, or null for the host family and unknown names.
 export function familyProvider(family) {
@@ -97,16 +127,28 @@ export function renderRound1Prompt({ brief, lens, kind, schemaText }) {
     BRIEF: trimEnd(brief),
     KIND: kind,
     LENS: lens,
+    KIND_RULES: round1Rules(kind),
     SCHEMA: trimEnd(schemaText)
   });
 }
 
-export function renderRound2Prompt({ brief, lens, ownFindings, bundle, schemaText }) {
+/**
+ * The cross-examination prompt. `kind` defaults to `review`; for a question or open council,
+ * `answers` is the recipient's answer bundle (answerBundle: `{ label, answer, yours? }`), shown
+ * before the findings rules, and the stance rule names the recipient's own label.
+ */
+export function renderRound2Prompt({ brief, lens, ownFindings, bundle, schemaText, kind = "review", answers = [] }) {
+  const ownWords = kind === "question" || kind === "open";
+  const ownLabel = answers.find((entry) => entry.yours)?.label ?? null;
   return render("council-round2", {
     BRIEF: trimEnd(brief),
     LENS: lens,
     OWN_FINDINGS: jsonBlock(ownFindings ?? []),
     BUNDLE: jsonBlock(bundle ?? []),
+    ANSWERS: ownWords
+      ? `The members' answers to the question, each under a label${ownLabel ? ' (yours is marked `"yours": true`)' : ""}:\n\n${jsonBlock(answers)}\n\n`
+      : "",
+    STANCE_RULE: round2StanceRule(kind, ownLabel),
     SCHEMA: trimEnd(schemaText)
   });
 }

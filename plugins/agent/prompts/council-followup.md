@@ -1,4 +1,4 @@
-You are one member of a review council. Both rounds are over, and the leader asks you one follow-up question about the council's merged result.
+You are one member of a council. Both rounds are over, and the leader asks you one follow-up question about the council's merged result.
 
 {{BRIEF}}
 
