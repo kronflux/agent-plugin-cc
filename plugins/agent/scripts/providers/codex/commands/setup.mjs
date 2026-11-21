@@ -1,10 +1,10 @@
 import process from "node:process";
 
 import { outputResult, parseCommandInput, resolveCommandCwd, resolveCommandWorkspace } from "../../../lib/companion-cli.mjs";
-import { describeDelegation, planDelegationSetting } from "../../../lib/model-selection.mjs";
+import { describeDelegation, planDelegationSetting, storeUserSetup } from "../../../lib/model-selection.mjs";
 import { binaryAvailable } from "../../../lib/process.mjs";
 import { checkWriteSandbox, parseSetupArguments, resolveSetting, settingSources, WRITE_SANDBOXES } from "../../../lib/settings.mjs";
-import { getConfig, setConfig, updateUserConfig } from "../../../lib/state.mjs";
+import { getConfig, setConfig } from "../../../lib/state.mjs";
 import { resolveWorkspaceRoot } from "../../../lib/workspace.mjs";
 import { codexProvider } from "../index.mjs";
 import { renderSetupReport } from "../render.mjs";
@@ -70,20 +70,16 @@ export async function handleSetup(argv) {
   const actionsTaken = [];
   const sandbox = options["write-sandbox"] !== undefined ? checkWriteSandbox(options["write-sandbox"]) : null;
 
-  const planned = await planDelegationSetting(codexProvider, workspaceRoot, cwd, options, { scope: options.scope });
+  // At user scope every change of this call is written in one locked update of the user config;
+  // the review gate always belongs to the workspace.
+  const userScope = options.scope === "user";
+  const planned = userScope
+    ? await storeUserSetup(codexProvider, workspaceRoot, cwd, options, { writeSandbox: sandbox })
+    : await planDelegationSetting(codexProvider, workspaceRoot, cwd, options);
   for (const warning of planned?.warnings ?? []) {
     process.stderr.write(`${warning}\n`);
   }
-  // At user scope every change of this call is written in one update of the user config; the
-  // review gate always belongs to the workspace.
-  const userScope = options.scope === "user";
-  if (userScope && (planned || sandbox)) {
-    updateUserConfig((config) => ({
-      ...config,
-      ...(planned ? { models: { ...config.models, [codexProvider.id]: planned.value } } : {}),
-      ...(sandbox ? { writeSandbox: sandbox } : {})
-    }));
-  } else if (!userScope && planned) {
+  if (!userScope && planned) {
     setConfig(workspaceRoot, "models", { ...(getConfig(workspaceRoot).models ?? {}), [codexProvider.id]: planned.value });
   }
   if (planned) {

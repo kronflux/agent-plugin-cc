@@ -1,5 +1,5 @@
 import { outputCommandResult, parseCommandInput, resolveCommandCwd, resolveCommandWorkspace } from "../../../lib/companion-cli.mjs";
-import { delegationLines, describeDelegation, planDelegationSetting } from "../../../lib/model-selection.mjs";
+import { delegationLines, describeDelegation, planDelegationSetting, storeUserSetup } from "../../../lib/model-selection.mjs";
 import { binaryAvailable } from "../../../lib/process.mjs";
 import {
   checkWriteSandbox,
@@ -9,7 +9,7 @@ import {
   sourceLabel,
   WRITE_SANDBOXES
 } from "../../../lib/settings.mjs";
-import { getConfig, setConfig, updateUserConfig } from "../../../lib/state.mjs";
+import { getConfig, setConfig } from "../../../lib/state.mjs";
 import { agyProvider } from "../index.mjs";
 import {
   agyModelEfforts,
@@ -35,20 +35,17 @@ export async function handleSetup(argv) {
   const actionsTaken = [];
 
   const sandbox = options["write-sandbox"] !== undefined ? checkWriteSandbox(options["write-sandbox"]) : null;
-  const planned = await planDelegationSetting(agyProvider, workspaceRoot, cwd, options, { scope: options.scope });
+  // The write sandbox setting is shared with the Codex provider. At user scope every change of
+  // this call is written in one locked update of the user config.
+  const userScope = options.scope === "user";
+  const planned = userScope
+    ? await storeUserSetup(agyProvider, workspaceRoot, cwd, options, { writeSandbox: sandbox })
+    : await planDelegationSetting(agyProvider, workspaceRoot, cwd, options);
   for (const warning of planned?.warnings ?? []) {
     process.stderr.write(`${warning}\n`);
   }
-  // The write sandbox setting is shared with the Codex provider. At user scope every change of
-  // this call is written in one update of the user config.
-  const where = options.scope === "user" ? "in every workspace without its own setting" : `in ${workspaceRoot}`;
-  if (options.scope === "user" && (planned || sandbox)) {
-    updateUserConfig((config) => ({
-      ...config,
-      ...(planned ? { models: { ...config.models, [agyProvider.id]: planned.value } } : {}),
-      ...(sandbox ? { writeSandbox: sandbox } : {})
-    }));
-  } else if (options.scope !== "user") {
+  const where = userScope ? "in every workspace without its own setting" : `in ${workspaceRoot}`;
+  if (!userScope) {
     if (planned) {
       setConfig(workspaceRoot, "models", { ...(getConfig(workspaceRoot).models ?? {}), [agyProvider.id]: planned.value });
     }

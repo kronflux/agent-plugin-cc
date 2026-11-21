@@ -4,7 +4,7 @@
 // provider default.
 
 import { delegationSetting } from "./settings.mjs";
-import { getConfig, getUserConfig, setConfig } from "./state.mjs";
+import { getConfig, getUserConfig, setConfig, updateUserConfig } from "./state.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 // Sources whose catalog entry also names the effort used when none is given.
@@ -202,7 +202,7 @@ export async function planDelegationSetting(provider, workspaceRoot, cwd, option
   const where = scope === "user" ? "in every workspace without its own setting" : `in ${workspaceRoot}`;
   if (hasModel && String(options.model).trim().toLowerCase() === "default") {
     const ignored = hasEffort ? " --effort was not stored, because --model default clears the setting." : "";
-    return { value: null, action: `Delegations now use the default model ${where}.${ignored}`, warnings: [] };
+    return { value: null, base: current, dependsOnCurrent: false, action: `Delegations now use the default model ${where}.${ignored}`, warnings: [] };
   }
   const model = hasModel ? String(options.model).trim() : current?.model ?? null;
   const effort = hasEffort ? String(options.effort).trim() : hasModel ? null : current?.effort ?? null;
@@ -223,7 +223,49 @@ export async function planDelegationSetting(provider, workspaceRoot, cwd, option
         : `model ${stored.model}`;
     action = `Delegations now use ${modelText}${withEffort} ${where}.`;
   }
-  return { value: stored, action, warnings: checked.warnings };
+  // Without --model the stored model is kept, so the result holds only while that entry does.
+  return { value: stored, base: current, dependsOnCurrent: !hasModel, action, warnings: checked.warnings };
+}
+
+class UserSettingChanged extends Error {}
+const USER_SETUP_ATTEMPTS = 3;
+
+/**
+ * Plans the user-scope delegation default of `provider` and writes it, with `writeSandbox` when
+ * given, in one locked update of the user config. A plan that keeps the stored model is written
+ * only when the locked config still holds the entry it was planned from; otherwise it is planned
+ * again, at most three times. `hooks.beforeStore` (tests) runs between a plan and its write.
+ * Returns what `planDelegationSetting` returned, or null when nothing was given.
+ */
+export async function storeUserSetup(provider, workspaceRoot, cwd, options, { writeSandbox = null, hooks = null } = {}) {
+  for (let attempt = 1; ; attempt += 1) {
+    const planned = await planDelegationSetting(provider, workspaceRoot, cwd, options, { scope: "user" });
+    if (!planned && !writeSandbox) {
+      return null;
+    }
+    hooks?.beforeStore?.(attempt);
+    try {
+      updateUserConfig((config) => {
+        const now = JSON.stringify(config.models?.[provider.id] ?? null);
+        if (planned?.dependsOnCurrent && now !== JSON.stringify(planned.base ?? null)) {
+          throw new UserSettingChanged();
+        }
+        return {
+          ...config,
+          ...(planned ? { models: { ...config.models, [provider.id]: planned.value } } : {}),
+          ...(writeSandbox ? { writeSandbox } : {})
+        };
+      });
+      return planned;
+    } catch (error) {
+      if (!(error instanceof UserSettingChanged)) {
+        throw error;
+      }
+      if (attempt >= USER_SETUP_ATTEMPTS) {
+        throw new Error("The user delegation setting kept changing during setup; nothing was written. Run setup again.");
+      }
+    }
+  }
 }
 
 /**

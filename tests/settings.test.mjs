@@ -11,6 +11,7 @@ import { installFakeCodex } from "./fake-codex-fixture.mjs";
 import { makeCommittedRepo, makeTempDir } from "./helpers.mjs";
 import * as state from "../plugins/agent/scripts/lib/state.mjs";
 import { delegationSetting, resolveSetting, writeSandboxFor } from "../plugins/agent/scripts/lib/settings.mjs";
+import { storeUserSetup } from "../plugins/agent/scripts/lib/model-selection.mjs";
 
 // Gives the test its own plugin data folder, so the user config of one test never reaches another.
 function usePluginData(t) {
@@ -295,4 +296,40 @@ test("two writers racing on a stale user config lock never both hold it", (t) =>
   assert.equal(fs.existsSync(lockFile), true);
   state.releaseUserConfigLock(lockFile, second);
   assert.equal(fs.existsSync(lockFile), false);
+});
+
+// A provider whose catalog accepts every model and effort, for in-process setup tests.
+const PLAIN_PROVIDER = {
+  id: "plain",
+  label: "Plain",
+  modelCatalog: {
+    async resolveExplicit(value) {
+      return { model: value, efforts: null, defaultEffort: null };
+    },
+    async resolveDefault() {
+      return { model: null, source: "provider-default", efforts: null, defaultEffort: null };
+    },
+    checkEffort(effort) {
+      return effort;
+    }
+  }
+};
+
+test("an effort-only user setup never restores a model another setup replaced meanwhile", async (t) => {
+  usePluginData(t);
+  const workspaceRoot = makeTempDir(t);
+  state.setUserConfig("models", { plain: { model: "a", effort: "low" } });
+  const attempts = [];
+  // Between the plan (which keeps model a) and its write, another setup stores model b.
+  const hooks = {
+    beforeStore(attempt) {
+      attempts.push(attempt);
+      if (attempt === 1) {
+        state.setUserConfig("models", { plain: { model: "b", effort: null } });
+      }
+    }
+  };
+  await storeUserSetup(PLAIN_PROVIDER, workspaceRoot, workspaceRoot, { effort: "high" }, { hooks });
+  assert.deepEqual(state.getUserConfig().models, { plain: { model: "b", effort: "high" } });
+  assert.deepEqual(attempts, [1, 2]);
 });
