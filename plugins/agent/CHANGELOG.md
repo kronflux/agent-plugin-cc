@@ -1,5 +1,9 @@
 # Changelog
 
+## 3.0.2
+
+- A question council accepts a top-level `sameAs` group of three or more answer labels, such as `[["A", "B", "C"]]`, and stores it as its pairs. Before, the reply was refused and the seat needed a repair turn.
+
 ## 3.0.1
 
 - A command started without `--disable-warning=ExperimentalWarning` no longer prints the `node:sqlite` warning into its stderr on Node 22.
