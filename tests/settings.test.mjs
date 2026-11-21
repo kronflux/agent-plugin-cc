@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import test from "node:test";
@@ -350,3 +351,29 @@ for (const [name, script] of [["agy", AGY], ["codex", CODEX]]) {
     assert.equal(fs.existsSync(state.userConfigFile()), false);
   });
 }
+
+test("user settings of a plugin data folder inside a Claude Code profile live in the profile and outlive that folder", async () => {
+  const state = await import("../plugins/agent/scripts/lib/state.mjs");
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "agent-profile-"));
+  const dataDir = path.join(profile, "plugins", "data", "agent-agent-plugin-cc");
+  fs.mkdirSync(dataDir, { recursive: true });
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = dataDir;
+  try {
+    const file = path.join(profile, "agent-plugin", "user-config.json");
+    assert.equal(state.userConfigFile(), file);
+
+    // A file an earlier version wrote into the data folder is adopted once.
+    fs.writeFileSync(path.join(dataDir, "user-config.json"), JSON.stringify({ version: 1, models: {}, writeSandbox: "danger-full-access" }));
+    assert.equal(state.getUserConfig().writeSandbox, "danger-full-access");
+    assert.equal(fs.existsSync(file), true);
+    assert.equal(fs.existsSync(path.join(dataDir, "user-config.json")), false);
+
+    state.setUserConfig("writeSandbox", "workspace-write");
+    fs.rmSync(dataDir, { recursive: true, force: true });
+    assert.equal(state.getUserConfig().writeSandbox, "workspace-write");
+  } finally {
+    process.env.CLAUDE_PLUGIN_DATA = previous;
+    fs.rmSync(profile, { recursive: true, force: true });
+  }
+});

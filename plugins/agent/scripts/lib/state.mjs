@@ -323,10 +323,49 @@ const USER_CONFIG_LOCK_RETRY_MS = 5000;
 const USER_CONFIG_LOCK_STALE_MS = 30000;
 const warnedUserConfigFiles = new Set();
 
-/** The user config file: in the plugin data folder, else in the fallback state root. */
+// Claude Code keeps a plugin's data in <profile>/plugins/data/<plugin> and deletes that folder
+// when the plugin is uninstalled. User settings must outlive a reinstall, so for such a data
+// folder they live in <profile>/agent-plugin instead; `profileSettingsDir` is that folder, or null
+// for a data folder of any other shape.
+function profileSettingsDir(pluginDataDir) {
+  const dataRoot = path.dirname(pluginDataDir);
+  const pluginsDir = path.dirname(dataRoot);
+  if (path.basename(dataRoot) !== "data" || path.basename(pluginsDir) !== "plugins") {
+    return null;
+  }
+  return path.join(path.dirname(pluginsDir), "agent-plugin");
+}
+
+// The user config file inside the plugin data folder (or the fallback state root), where earlier
+// versions kept it.
+function dataUserConfigFile() {
+  return path.join(getPluginDataDir() || FALLBACK_STATE_ROOT_DIR, USER_CONFIG_FILE_NAME);
+}
+
+/**
+ * The user config file: <profile>/agent-plugin/user-config.json for a plugin data folder inside
+ * a Claude Code profile, else in the plugin data folder, else in the fallback state root.
+ */
 export function userConfigFile() {
   const pluginDataDir = getPluginDataDir();
-  return path.join(pluginDataDir || FALLBACK_STATE_ROOT_DIR, USER_CONFIG_FILE_NAME);
+  const settingsDir = pluginDataDir ? profileSettingsDir(path.resolve(pluginDataDir)) : null;
+  return settingsDir ? path.join(settingsDir, USER_CONFIG_FILE_NAME) : dataUserConfigFile();
+}
+
+// Moves a user config that an earlier version wrote into the plugin data folder to its place in
+// the profile, once, when no file is there yet.
+function adoptDataUserConfig(file) {
+  const earlier = dataUserConfigFile();
+  if (earlier === file || fs.existsSync(file) || !fs.existsSync(earlier)) {
+    return;
+  }
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.copyFileSync(earlier, file, fs.constants.COPYFILE_EXCL);
+    fs.rmSync(earlier, { force: true });
+  } catch {
+    // Another process adopted it first, or the folder cannot be written; the read decides.
+  }
 }
 
 function defaultUserConfig() {
@@ -361,6 +400,7 @@ function readUserConfigFile(file) {
  */
 export function getUserConfig() {
   const file = userConfigFile();
+  adoptDataUserConfig(file);
   const read = readUserConfigFile(file);
   if (read.error) {
     if (!warnedUserConfigFiles.has(file)) {
@@ -463,6 +503,8 @@ export function releaseUserConfigLock(lockFile, token) {
  */
 export function updateUserConfig(mutator, lockOptions = {}) {
   const file = userConfigFile();
+  adoptDataUserConfig(file);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
   const lockFile = `${file}.lock`;
   const token = acquireUserConfigLock(lockFile, lockOptions);
   try {
