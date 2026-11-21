@@ -52,7 +52,7 @@ function round2StanceRule(kind, ownLabel) {
     return `Separately, set the top-level \`sameAs\` to the pairs of answer labels that say the same thing in substance, for example \`[["A", "C"]]\`, or to \`[]\` when no two do; answers linked this way become one option of the vote. Set \`stance\` to the label of the answer you endorse, which may be your own.${own}`;
   }
   if (kind === "open") {
-    return `Set \`agreesWith\` to the labels of the answers you agree with in substance, or to \`[]\`; there is no vote, and the leader judges how far the members agree. Set \`stance\` to null.${own}`;
+    return `Answer \`validate\`, \`challenge\` or \`skip\` for every other member's answer in \`answerResponses\`, once each, with its label in \`answer\`; give a reason for every challenge (elsewhere \`reason\` may be a short note or null), and do not respond to your own answer. Set \`agreesWith\` to the labels of the answers you agree with in substance, or to \`[]\`; there is no vote, and the leader judges how far the members agree. Set \`stance\` to null.${own}`;
   }
   return "For a decision, set `stance` to your final choice among the options the brief names; for a review, set `stance` to null.";
 }

@@ -216,10 +216,35 @@ export function mergeQuestion({ answers, round2 = {}, answerMaps = {} }) {
   return { options, decision: { choice, tally, threshold: "2/3", confidence }, stances };
 }
 
+/**
+ * The Round 2 marks of an open council under canonical labels, one entry per seat with a valid
+ * Round 2 answer in seat order: `{ seat, agreesWith, answerResponses }`, with `agreesWith` the
+ * sorted labels the seat agreed with and `answerResponses` its `{ answer, response, reason }` per
+ * other answer in label order. A label the seat's answer map does not name is left out.
+ */
+export function openMarks({ seats, answers, round2 = {}, answerMaps = {} }) {
+  const labelOf = new Map(answers.map((entry) => [entry.seat, entry.label]));
+  const marks = [];
+  for (const { seat } of seats) {
+    const answer = round2[seat];
+    if (!answer) {
+      continue;
+    }
+    const agreesWith = [...new Set((answer.agreesWith ?? []).map((label) => canonicalLabel(answerMaps, seat, label, labelOf)).filter(Boolean))].sort();
+    const answerResponses = (answer.answerResponses ?? [])
+      .map((entry) => ({ answer: canonicalLabel(answerMaps, seat, entry.answer, labelOf), response: entry.response, reason: entry.reason ?? null }))
+      .filter((entry) => entry.answer !== null)
+      .sort((a, b) => compareText(a.answer, b.answer));
+    marks.push({ seat, agreesWith, answerResponses });
+  }
+  return marks;
+}
+
 // Inputs: seats in seat order ({ seat, family }); round1 and round2 map a seat to its valid
 // answer; anonymisation maps a responder to its letter map; turns is { used, repairs, retries }.
 // A question or open council also passes `answerMaps` (a responder's answer labels, its own
-// included) and gets `answers`; a question council gets `options` and its vote as `decision`.
+// included) and gets `answers`; a question council gets `options` and its vote as `decision`, and
+// an open council gets each seat's `marks` (openMarks).
 // A seat answered by a stand-in in a round adds `round1Family` / `round2Family` (the stand-in's
 // family, which authors, validates and challenges for it), `quorumFamily` (null when its Round 2
 // answer is a stand-in's) and `round2Key` (the actor key of a fresh Round 2 stand-in, which keys
@@ -316,6 +341,7 @@ export function mergeCouncil({ runId, kind, options = [], seats, round1 = {}, ro
 
   const answers = kind === "question" || kind === "open" ? canonicalAnswers(seats, round1) : null;
   const question = kind === "question" ? mergeQuestion({ answers, round2, answerMaps }) : null;
+  const marks = kind === "open" ? openMarks({ seats, answers, round2, answerMaps }) : null;
 
   return {
     schema: 1,
@@ -327,6 +353,7 @@ export function mergeCouncil({ runId, kind, options = [], seats, round1 = {}, ro
     decision: question ? question.decision : decide(kind, options, eligible, round2, stances),
     ...(answers ? { answers } : {}),
     ...(question ? { options: question.options } : {}),
+    ...(marks ? { marks } : {}),
     clusters: clusters.map((entry) => entry.cluster),
     memberTurns: {
       used: turns.used ?? 0,
@@ -391,7 +418,7 @@ export function unanimousPanel({ kind, seats: seatRows = null, round1 = {}, roun
 }
 
 const KEY_ORDER = {
-  merge: ["schema", "runId", "quorum", "decision", "answers", "options", "clusters", "memberTurns", "substitutions", "followups"],
+  merge: ["schema", "runId", "quorum", "decision", "answers", "options", "marks", "clusters", "memberTurns", "substitutions", "followups"],
   quorum: ["validSeats", "families"],
   decision: ["choice", "tally", "threshold", "confidence"],
   cluster: ["id", "severity", "severityRange", "label", "path", "line", "claim", "findings", "reportedBy", "validatedBy", "challenges"],

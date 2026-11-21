@@ -187,8 +187,9 @@ function labelsText(labels) {
 }
 
 // The answer labels of a question or open seat's Round 2: `sameAs` pairs of two different known
-// labels and a `stance` naming one (question), or `agreesWith` known labels, each once, and a null
-// stance (open). Every message names the labels the seat was given.
+// labels and a `stance` naming one (question), or `agreesWith` known labels, each once, a null
+// stance and one `answerResponses` entry per other member's answer (open; `ownAnswerLabel` is the
+// seat's own label, or null). Every message names the labels the seat was given.
 function checkAnswerLabels(answer, context, errors) {
   const labels = context?.answerLabels ?? [];
   const known = new Set(labels);
@@ -225,6 +226,27 @@ function checkAnswerLabels(answer, context, errors) {
   });
   if (answer.stance !== null) {
     errors.push(`stance: must be null in an open council, got ${describe(answer.stance)}`);
+  }
+  // One response to every other member's answer: validate, challenge (with a reason) or skip.
+  const others = labels.filter((item) => item !== context.ownAnswerLabel);
+  const expected = new Set(others);
+  const responded = new Set();
+  answer.answerResponses.forEach((entry, index) => {
+    const where = `answerResponses[${index}]`;
+    if (!expected.has(entry.answer)) {
+      errors.push(`${where}.answer: ${describe(entry.answer)} is not another member's answer label; respond to ${labelsText(others)}`);
+    } else if (responded.has(entry.answer)) {
+      errors.push(`${where}.answer: ${entry.answer} has more than one response`);
+    }
+    responded.add(entry.answer);
+    if (entry.response === "challenge" && (entry.reason === null || !entry.reason.trim())) {
+      errors.push(`${where}.reason: required for a challenge`);
+    }
+  });
+  for (const item of others) {
+    if (!responded.has(item)) {
+      errors.push(`answerResponses: no response to answer ${item}`);
+    }
   }
 }
 
@@ -422,7 +444,7 @@ function readJsonObject(readObject, runDir, sha256) {
 /**
  * The context validateAnswer needs for `seat`'s answer in `round`, from the committed rows of the
  * snapshot `view` (readCouncil) and their verified objects only: `{ schema, kind, options,
- * bundleRefs, ownFindingIds, answerLabels }`. `answerLabels` (Round 2 of a question or open run)
+ * bundleRefs, ownFindingIds, answerLabels, ownAnswerLabel }`. `answerLabels` (Round 2 of a question or open run)
  * are the letters of the actor's letter map, then its own answer's label (selfLabel); a fresh Round
  * 2 stand-in, which has no answer of its own, uses the letters of its answer map (standInAnswerMap). Round 2 reads the seat's accepted Round 1 answer, the committed
  * map and the other lettered seats' Round 1 answers, each through the digest-checked reader.
@@ -463,7 +485,8 @@ export function validationContext(runDir, view, seat, round, { readObject = read
   // A fresh stand-in names the answers by its own answer map, which covers every Round 1 answer.
   const answerLetters = fresh ? Object.keys(standInAnswerMap(mapping, actor) ?? {}).sort() : letters;
   const answerLabels = answersInOwnWords(kind) ? [...answerLetters, ...(own ? [selfLabel(letterMap)] : [])] : [];
-  return { schema: roundSchemaName(2, kind), kind, options, bundleRefs, ownFindingIds, answerLabels };
+  const ownAnswerLabel = answersInOwnWords(kind) && own ? selfLabel(letterMap) : null;
+  return { schema: roundSchemaName(2, kind), kind, options, bundleRefs, ownFindingIds, answerLabels, ownAnswerLabel };
 }
 
 // round: 1 or 2. context: { kind, options, bundleRefs, ownFindingIds, answerLabels }; bundleRefs,

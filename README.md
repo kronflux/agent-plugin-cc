@@ -650,12 +650,15 @@ you have no vote.
   seats that answered Round 1, and a seat without a valid Round 2 answer casts no vote. The panel
   is `unanimous` when every seat's stance falls in one option and no seat challenged or added a
   finding.
-- `open`: each seat answers in its own words, and in Round 2 lists the answers it agrees with in
-  `agreesWith`. There is no vote. You judge how far the answers agree and record
+- `open`: each seat answers in its own words. In Round 2 it lists the answers it agrees with in
+  `agreesWith`, and validates, challenges (with a reason) or skips every other answer in
+  `answerResponses`, as it does each finding. The merge holds each seat's marks under `marks`, in
+  the canonical answer labels, so you can judge before the report. There is no vote. You judge how far the answers agree and record
   `council verdict <run-id> agreement agreed|partly|disagreed [--merge <sha256>] [--] <reason>`
   (`--merge` names the merge you read, as `council merge --json` reports it in `mergeSha256`; a
   different current merge is refused with `stale-merge`); the report shows
-  `Agreement (leader judgement): <value>` and lists every answer with the seats that agreed with it.
+  `Agreement (leader judgement): <value>` and lists every answer with the seats that agreed with
+  it and the seats that challenged it.
   An agreement verdict on any other kind of council exits 1.
 
 Pick `question` when the question has a best answer but you cannot list the choices, and `open`

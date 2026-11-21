@@ -29,13 +29,15 @@ function round2Question({ stance = "A", sameAs = [], responses = [validation("A-
   return { schema: 1, stance, sameAs, responses, added };
 }
 
-function round2Open({ agreesWith = ["A"], stance = null, responses = [validation("A-f1"), validation("B-f1")], added = [] } = {}) {
-  return { schema: 1, stance, agreesWith, responses, added };
+const answerValidation = (label) => ({ answer: label, response: "validate", reason: null });
+
+function round2Open({ agreesWith = ["A"], stance = null, answerResponses = [answerValidation("A"), answerValidation("B")], responses = [validation("A-f1"), validation("B-f1")], added = [] } = {}) {
+  return { schema: 1, stance, agreesWith, answerResponses, responses, added };
 }
 
 // The Round 2 context of a seat that sees two other seats as A and B and its own answer as C.
 const QUESTION_CONTEXT = { kind: "question", options: [], bundleRefs: ["A-f1", "B-f1"], ownFindingIds: ["f1"], answerLabels: ["A", "B", "C"] };
-const OPEN_CONTEXT = { ...QUESTION_CONTEXT, kind: "open" };
+const OPEN_CONTEXT = { ...QUESTION_CONTEXT, kind: "open", ownAnswerLabel: "C" };
 
 // ---------------------------------------------------------------------------------------------
 // Schemas and the label rules.
@@ -102,7 +104,34 @@ test("an open Round 2 agrees with known answer labels, each once, and gives no s
   const { agreesWith: _agrees, ...withoutAgreement } = round2Open();
   assert.deepEqual(validateAnswer(2, withoutAgreement, OPEN_CONTEXT), { ok: false, errors: ["agreesWith: required property is missing"] });
   // A question answer is not an open answer.
-  assert.deepEqual(validateAnswer(2, round2Question(), OPEN_CONTEXT).errors, ["agreesWith: required property is missing", "sameAs: unexpected property"]);
+  assert.deepEqual(validateAnswer(2, round2Question(), OPEN_CONTEXT).errors, [
+    "agreesWith: required property is missing",
+    "answerResponses: required property is missing",
+    "sameAs: unexpected property"
+  ]);
+});
+
+test("an open Round 2 validates, challenges with a reason or skips every other answer once, and not its own", () => {
+  const challenge = (label, reason) => ({ answer: label, response: "challenge", reason });
+  assert.deepEqual(validateAnswer(2, round2Open({ answerResponses: [challenge("A", "it ignores readers"), { answer: "B", response: "skip", reason: null }] }), OPEN_CONTEXT), {
+    ok: true,
+    errors: []
+  });
+  assert.deepEqual(validateAnswer(2, round2Open({ answerResponses: [answerValidation("A")] }), OPEN_CONTEXT), { ok: false, errors: ["answerResponses: no response to answer B"] });
+  assert.deepEqual(
+    validateAnswer(2, round2Open({ answerResponses: [answerValidation("A"), answerValidation("A"), answerValidation("C"), challenge("B", " ")] }), OPEN_CONTEXT),
+    {
+      ok: false,
+      errors: [
+        "answerResponses[1].answer: A has more than one response",
+        `answerResponses[2].answer: "C" is not another member's answer label; respond to A, B`,
+        "answerResponses[3].reason: required for a challenge"
+      ]
+    }
+  );
+  assert.deepEqual(validateAnswer(2, round2Open({ answerResponses: [answerValidation("A"), { answer: "B", response: "agree", reason: null }] }), OPEN_CONTEXT).errors, [
+    'answerResponses[1].response: must be one of "validate", "challenge", "skip", got "agree"'
+  ]);
 });
 
 test("the merge schema takes the answers and the options of a question council", () => {
@@ -260,7 +289,7 @@ function labelFor(map, seat, author) {
 }
 
 // A Round 2 answer that validates every finding of `seat`'s bundle (one finding f1 per author).
-function answer2(map, seat, { kind, stance = null, sameAs = [], agreesWith = [], response = "validate", added = [] }) {
+function answer2(map, seat, { kind, stance = null, sameAs = [], agreesWith = [], answerResponses = null, response = "validate", added = [] }) {
   const responses = Object.keys(map[seat])
     .sort()
     .map((letter) =>
@@ -268,7 +297,12 @@ function answer2(map, seat, { kind, stance = null, sameAs = [], agreesWith = [],
         ? { finding: `${letter}-f1`, response, disputes: "claim", sameAs: null, reason: "not so", evidence: "see the code" }
         : { finding: `${letter}-f1`, response, disputes: null, sameAs: null, reason: null, evidence: null }
     );
-  return JSON.stringify(kind === "question" ? { schema: 1, stance, sameAs, responses, added } : { schema: 1, stance, agreesWith, responses, added });
+  if (kind === "question") {
+    return JSON.stringify({ schema: 1, stance, sameAs, responses, added });
+  }
+  // By default an open seat validates every other answer, each under its letter.
+  const marks = answerResponses ?? Object.keys(map[seat]).sort().map((letter) => ({ answer: letter, response: "validate", reason: null }));
+  return JSON.stringify({ schema: 1, stance, agreesWith, answerResponses: marks, responses, added });
 }
 
 // Round 2 sent at 1000 and answered at 1100 by `answers2(seat, map)` (null leaves a seat's job
@@ -436,11 +470,16 @@ test("an open council lists every answer, waits for the leader's agreement verdi
   const clock = useTestClock(t, 0);
   const fx = await round1Closed(t, clock, "open", { s1: "Use a lock.", s2: "A lock or a queue.", s3: "Use a queue." });
   assert.deepEqual([snap(fx).run.kind, snap(fx).run.stored_kind], ["open", "review"]);
-  // s1 and s2 agree with each other; s3 agrees with s2 only.
+  // s1 and s2 agree with each other; s3 agrees with s2 only and challenges s1's answer.
+  const s3Responses = (letters) =>
+    Object.keys(letters.s3)
+      .sort()
+      .map((letter) => (letters.s3[letter] === "s1" ? { answer: letter, response: "challenge", reason: "readers wait on the lock" } : { answer: letter, response: "validate", reason: null }));
   await round2Answered(fx, clock, (seat, letters) =>
     answer2(letters, seat, {
       kind: "open",
-      agreesWith: seat === "s3" ? [labelFor(letters, seat, "s2")] : [labelFor(letters, seat, seat === "s1" ? "s2" : "s1")]
+      agreesWith: seat === "s3" ? [labelFor(letters, seat, "s2")] : [labelFor(letters, seat, seat === "s1" ? "s2" : "s1")],
+      answerResponses: seat === "s3" ? s3Responses(letters) : null
     })
   );
   assert.deepEqual(
@@ -451,6 +490,14 @@ test("an open council lists every answer, waits for the leader's agreement verdi
   assert.equal(merged.merge.decision, null);
   assert.equal(merged.merge.options, undefined);
   assert.deepEqual(merged.merge.answers.map((entry) => entry.text), ["Use a lock.", "A lock or a queue.", "Use a queue."]);
+  // The merge carries each seat's marks under the canonical labels, before any verdict.
+  const validated = (label) => ({ answer: label, response: "validate", reason: null });
+  assert.deepEqual(merged.merge.marks, [
+    { seat: "s1", agreesWith: ["B"], answerResponses: [validated("B"), validated("C")] },
+    { seat: "s2", agreesWith: ["A"], answerResponses: [validated("A"), validated("C")] },
+    { seat: "s3", agreesWith: ["B"], answerResponses: [{ answer: "A", response: "challenge", reason: "readers wait on the lock" }, validated("B")] }
+  ]);
+  assert.deepEqual(validateSchemaFile("council-merge", merged.merge), { ok: true, errors: [] });
   assert.equal(merged.unanimous, false);
   const status = await council(["status", fx.runId, "--json"], { cwd: fx.cwd });
   for (const cluster of status.json.clusters) {
@@ -470,7 +517,10 @@ test("an open council lists every answer, waits for the leader's agreement verdi
   const report = await council(["report", fx.runId], { cwd: fx.cwd });
   assert.equal(report.code, 0, report.stderr);
   assert.match(report.stdout, /## Verdict\n\nAgreement \(leader judgement\): agreed\nReason: every answer uses mutual exclusion\n/);
-  assert.match(report.stdout, /- A \(s1\): Use a lock\.\n {2}Agreed with by: s2\.\n- B \(s2\): A lock or a queue\.\n {2}Agreed with by: s1, s3\.\n- C \(s3\): Use a queue\.\n {2}Agreed with by: none\.\n/);
+  assert.match(
+    report.stdout,
+    /- A \(s1\): Use a lock\.\n {2}Agreed with by: s2\.\n {2}Challenged by: s3 \(readers wait on the lock\)\.\n- B \(s2\): A lock or a queue\.\n {2}Agreed with by: s1, s3\.\n {2}Challenged by: none\.\n- C \(s3\): Use a queue\.\n {2}Agreed with by: none\.\n {2}Challenged by: none\.\n/
+  );
   assert.doesNotMatch(report.stdout, /## Options/);
 });
 
@@ -536,6 +586,23 @@ test("a fresh Round 2 stand-in on a question council sees every answer, the repl
   assert.deepEqual([closed.json.wake, closed.json.quorum], ["closed", true], closed.stdout);
   const merged = await mergeRun(fx);
   assert.deepEqual(merged.merge.decision.tally, { A: 2, C: 1 });
+});
+
+test("an open seat that leaves an answer without a response is asked again with the error", async (t) => {
+  const clock = useTestClock(t, 0);
+  const fx = await round1Closed(t, clock, "open");
+  const { map, collected } = await round2Answered(fx, clock, (seat, letters) => answer2(letters, seat, { kind: "open", answerResponses: seat === "s2" ? [] : null }));
+  assert.notEqual(collected.json.wake, "closed", collected.stdout);
+  const repair = currentOf(fx, "s2", 2);
+  assert.equal(repair.charge, "repair");
+  const prompt = promptOf(fx, repair);
+  assert.match(prompt, /answerResponses: no response to answer A/);
+  assert.match(prompt, /"\$id": "urn:agent-plugin:schema:council-round2-open:1"/);
+  completeJob(fx, currentOf(fx, "s2", 2).job_id, 1300, answer2(map, "s2", { kind: "open" }));
+  clock.set(1400);
+  const closed = await collect(fx);
+  assert.deepEqual([closed.json.wake, closed.json.quorum], ["closed", true], closed.stdout);
+  assert.equal((await mergeRun(fx)).merge.marks.find((mark) => mark.seat === "s2").answerResponses.length, 2);
 });
 
 test("an agreement verdict with --merge binds to the merge the leader read and refuses another", async (t) => {

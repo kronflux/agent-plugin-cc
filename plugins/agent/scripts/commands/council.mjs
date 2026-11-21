@@ -3321,23 +3321,24 @@ export function renderFailedReport(runDir, snapshot) {
   return `${lines.join("\n").replace(/\n+$/, "")}\n`;
 }
 
-// The answers of a question or open council; on an open council each answer names the seats that
-// listed it in `agreesWith`. Then, on a question, the options of the vote.
-function answerSections(merge, input) {
+// The answers of a question or open council; on an open council each answer names, from the
+// merge's `marks`, the seats that agreed with it and the seats that challenged it, with their
+// reasons. Then, on a question, the options of the vote.
+function answerSections(merge) {
   const answers = merge.answers ?? [];
-  const labelOf = new Map(answers.map((entry) => [entry.seat, entry.label]));
-  const canonical = (responder, label) => labelOf.get(input.answerMaps?.[responder]?.[label]) ?? null;
   const lines = ["", "## Answers", ""];
   if (answers.length === 0) {
     lines.push("None.");
   }
   for (const entry of answers) {
     lines.push(`- ${entry.label} (${entry.seat}): ${cellText(entry.text)}`);
-    if (!merge.options) {
-      const agreeing = Object.keys(input.round2)
-        .filter((responder) => (input.round2[responder].agreesWith ?? []).some((label) => canonical(responder, label) === entry.label))
-        .sort();
+    if (merge.marks) {
+      const agreeing = merge.marks.filter((mark) => mark.agreesWith.includes(entry.label)).map((mark) => mark.seat);
+      const challenges = merge.marks.flatMap((mark) =>
+        mark.answerResponses.filter((item) => item.answer === entry.label && item.response === "challenge").map((item) => `${mark.seat} (${cellText(item.reason)})`)
+      );
       lines.push(`  Agreed with by: ${agreeing.length > 0 ? agreeing.join(", ") : "none"}.`);
+      lines.push(`  Challenged by: ${challenges.length > 0 ? challenges.join("; ") : "none"}.`);
     }
   }
   if (merge.options) {
@@ -3372,7 +3373,7 @@ export function renderCouncilReport(runDir, snapshot, merge) {
     lines.push("", `Unresolved P1 findings: ${unresolved.map((cluster) => `${cluster.id} (${verdictOf(cluster)?.verdict ?? "no verdict"})`).join(", ")}.`);
   }
   if (merge.answers) {
-    lines.push(...answerSections(merge, input));
+    lines.push(...answerSections(merge));
   }
   lines.push("", "## Findings", "", "| Cluster | Severity | Label | Location | Claim | Reported by | Validated by | Challenged by | Leader verdict |");
   lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");

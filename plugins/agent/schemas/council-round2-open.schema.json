@@ -7,6 +7,7 @@
     "schema",
     "stance",
     "agreesWith",
+    "answerResponses",
     "responses",
     "added"
   ],
@@ -26,6 +27,38 @@
       "items": {
         "type": "string",
         "minLength": 1
+      }
+    },
+    "answerResponses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "answer",
+          "response",
+          "reason"
+        ],
+        "properties": {
+          "answer": {
+            "type": "string",
+            "minLength": 1
+          },
+          "response": {
+            "type": "string",
+            "enum": [
+              "validate",
+              "challenge",
+              "skip"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
       }
     },
     "responses": {
