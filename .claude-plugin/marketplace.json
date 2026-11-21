@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Delegate work and code review from Claude Code to external agent CLIs.",
-    "version": "2.0.0"
+    "version": "3.0.0"
   },
   "plugins": [
     {
       "name": "agent",
       "description": "Delegate work and code review from Claude Code to Codex and other agent CLIs.",
-      "version": "2.0.0",
+      "version": "3.0.0",
       "author": {
         "name": "kronflux"
       },

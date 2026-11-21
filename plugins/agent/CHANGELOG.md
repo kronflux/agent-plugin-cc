@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 3.0.0
 
 - Names change, with no aliases. `/agent:codex-rescue` is `/agent:codex-delegate`, `/agent:agy-rescue` is `/agent:agy-delegate`, and `/agent:codex-fanout` is `/agent:fleet`. The subagents are `agent:codex-delegate` and `agent:agy-delegate`, and the prompting skill is `codex-prompting`, rewritten without a model version. `/agent:codex-adversarial-review` is removed: use `/agent:codex-review --stance critical`.
 - Reviews take a target and a stance. `--target auto|changes|project` reviews a diff or the current files of a folder, and a project review also works outside a git repository. `--path <path>` can be repeated to narrow either target. `--stance peer` (the default for both agents) asks for an independent second opinion, and `--stance critical` challenges the design. `--background` starts a tracked background review and prints its job ID. A review that returns structured findings runs on a thread you can continue, findings may carry no file or line, and an unknown `--base` ref exits with code 1 before a job exists. `/agent:agy-review` takes the same flags.
