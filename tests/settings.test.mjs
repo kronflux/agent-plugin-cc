@@ -333,3 +333,20 @@ test("an effort-only user setup never restores a model another setup replaced me
   assert.deepEqual(state.getUserConfig().models, { plain: { model: "b", effort: "high" } });
   assert.deepEqual(attempts, [1, 2]);
 });
+
+for (const [name, script] of [["agy", AGY], ["codex", CODEX]]) {
+  test(`${name} setup refuses an option-shaped value and a repeated option before storing anything`, (t) => {
+    usePluginData(t);
+    const ctx = makeWorkspace(t);
+    const typo = companion(script, ctx, ["setup", "--write-sandbox", "--typo", "--write-sandbox", "danger-full-access"]);
+    assert.equal(typo.status, 1, typo.stderr);
+    assert.equal(typo.stderr, `Missing value for --write-sandbox\n${SANDBOX_HINT}\n`);
+    for (const args of [["--model", "default", "--model", "default"], ["--json", "--json"], ["--scope", "user", "--write-sandbox=danger-full-access", "--write-sandbox", "workspace-write"]]) {
+      const repeated = companion(script, ctx, ["setup", ...args]);
+      assert.equal(repeated.status, 1, repeated.stderr);
+      assert.match(repeated.stderr, /^Option --[a-z-]+ is given more than once for setup\. Usage: setup \[--scope project\|user\]/);
+    }
+    assert.equal(configBytes(ctx.repo), null);
+    assert.equal(fs.existsSync(state.userConfigFile()), false);
+  });
+}

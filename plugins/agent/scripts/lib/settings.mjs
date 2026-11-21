@@ -3,6 +3,7 @@
 // that is present but null, as `setup --model default` writes it, stops the chain at the
 // provider default, so a repository can always choose the default over the user's setting.
 
+import { normalizeArgv } from "./companion-cli.mjs";
 import { getConfig, getUserConfig } from "./state.mjs";
 
 const DEFAULT_WRITE_SANDBOX = "workspace-write";
@@ -91,10 +92,43 @@ function missingValueError(option) {
  * Parses the arguments of a setup command with `parse` (the command parser) and refuses what
  * setup does not know: a positional or an unknown option exits with
  * `Unknown argument "<word>" for setup. Usage: <usage>`. A value option without a value, or with
- * the next option taken as its value, is refused as missing. Returns the options, with `scope`
- * checked and defaulted to `project`.
+ * the next option taken as its value, is refused as missing, and an option given twice is refused,
+ * before anything is parsed or stored. Returns the options, with `scope` checked and defaulted to
+ * `project`.
  */
 export function parseSetupArguments(argv, { parse, usage, valueOptions, booleanOptions }) {
+  // The tokens are checked first, because the parser lets a later value replace an earlier one:
+  // `--write-sandbox --typo --write-sandbox danger-full-access` would otherwise store the sandbox.
+  const takesValue = new Set([...valueOptions, "scope"]);
+  const known = new Set([...takesValue, ...booleanOptions]);
+  const seen = new Set();
+  const tokens = normalizeArgv(argv);
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === "--") {
+      break;
+    }
+    if (!token.startsWith("--")) {
+      continue;
+    }
+    const body = token.slice(2);
+    const equalsAt = body.indexOf("=");
+    const key = equalsAt === -1 ? body : body.slice(0, equalsAt);
+    if (!known.has(key)) {
+      continue;
+    }
+    if (seen.has(key)) {
+      throw new Error(`Option --${key} is given more than once for setup. Usage: ${usage}`);
+    }
+    seen.add(key);
+    if (takesValue.has(key) && equalsAt === -1) {
+      const next = tokens[index + 1];
+      if (next === undefined || next.startsWith("--")) {
+        throw missingValueError(key);
+      }
+      index += 1;
+    }
+  }
   let parsed;
   try {
     parsed = parse(argv, { valueOptions: [...valueOptions, "scope"], booleanOptions });
