@@ -1,5 +1,7 @@
 import { parseCommandInput, resolveCommandCwd, resolveCommandWorkspace } from "../../../lib/companion-cli.mjs";
+import { describeDelegation } from "../../../lib/model-selection.mjs";
 import { delegationSetting } from "../../../lib/settings.mjs";
+import { agyProvider } from "../index.mjs";
 import { readAgyEfforts, resolveAgyDelegationModel } from "../runtime.mjs";
 import {
   markDefaultGroup,
@@ -30,7 +32,12 @@ export async function handleUsage(argv) {
     return;
   }
   const workspaceRoot = resolveCommandWorkspace(options);
-  const delegation = resolveAgyDelegationModel(cwd, { setting: delegationSetting("agy", workspaceRoot).setting?.model ?? null });
+  // The stored setting may name a base name and an effort; the delegation resolves them into
+  // the model id (through resolveAgyModel) before the id is looked up in agy models. A setting
+  // that does not resolve is looked up as stored.
+  const described = await describeDelegation(agyProvider, workspaceRoot, cwd);
+  const stored = delegationSetting(agyProvider, workspaceRoot).setting?.model ?? null;
+  const delegation = resolveAgyDelegationModel(cwd, { setting: described.error ? stored : described.model ?? null });
   const name = delegation.displayName ? stripEffortSuffix(delegation.displayName, readAgyEfforts(cwd)) : null;
   const normalized = normalizeAgyUsage({ groups: markDefaultGroup(parsed.groups, name) });
   const notes = name ? [] : [UNKNOWN_DELEGATION_MODEL_LINE];
