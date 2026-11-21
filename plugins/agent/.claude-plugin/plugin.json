@@ -1,6 +1,6 @@
 {
   "name": "agent",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "Delegate work and code review from Claude Code to Codex and other agent CLIs.",
   "author": {
     "name": "kronflux"

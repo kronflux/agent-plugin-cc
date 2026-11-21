@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.0.1
+
+- A command started without `--disable-warning=ExperimentalWarning` no longer prints the `node:sqlite` warning into its stderr on Node 22.
+- Text files are checked out with LF line ends on every system (`.gitattributes`). With `core.autocrlf` on, a Windows checkout gave prompts and command files CRLF line ends, and the plugin read the carriage returns as part of the text.
+- The council skill says to start a seat's agent without a name. A named agent can become a teammate whose reply reaches the leader only after the leader's turn ends, so the seat missed its deadline and a stand-in answered for it.
+- The test suite passes on Node 22, on Linux and on Windows runners. CI runs the test files one at a time, in four shards per system.
+
 ## 3.0.0
 
 - Names change, with no aliases. `/agent:codex-rescue` is `/agent:codex-delegate`, `/agent:agy-rescue` is `/agent:agy-delegate`, and `/agent:codex-fanout` is `/agent:fleet`. The subagents are `agent:codex-delegate` and `agent:agy-delegate`, and the prompting skill is `codex-prompting`, rewritten without a model version. `/agent:codex-adversarial-review` is removed: use `/agent:codex-review --stance critical`.
