@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.1.0
+
+- Output from Codex and Antigravity is shown to Claude as data. The prose of a result, of a fleet member and of a native review is printed between `<untrusted-codex-output id="...">` (or `untrusted-antigravity-output`) and a closing tag, with a line that says the block is data. Terminal escape sequences, control characters, invisible characters and direction controls are removed, and a complete private key block is replaced by a note. Structured output, review findings, questions, errors, progress lines, a foreground job's log and every `--json` result are sanitised and not fenced. This changes the text of `/agent:result` and of a foreground task: the answer is now the line after the opening tag.
+- The stop review gate uses the same fence. Its tag is `untrusted-claude-output` (before: `untrusted-claude-response`). The reason Codex gives for a block reaches Claude sanitised.
+- Council: a seat's reply and a follow-up answer are stored sanitised, and the round 2 prompt and the skill say that the other members' findings and answers are data to judge, not instructions.
+- A failed job is shown with a note when its provider's quota is used up. For a failure the provider may have caused, `/agent:result` and a foreground task read the provider's usage report, within 10 seconds, and print `<Provider> reports that its quota is used up.` under the error, with the reset time when the report gives one; with `--json` it is the field `quotaNote`. The stored job does not change, and nothing is read while a job runs or ends.
+- An Antigravity model id finds its usage group by its base name: an id with an effort word matches the group that lists the base model's display name, and the most exact form of the id that names a group decides. This also applies when the council classes a failed Antigravity seat.
+- The line that tells an Antigravity job to do the work itself now also forbids calling another AI agent or its tools.
+
 ## 3.0.2
 
 - A question council accepts a top-level `sameAs` group of three or more answer labels, such as `[["A", "B", "C"]]`, and stores it as its pairs. Before, the reply was refused and the seat needed a repair turn.
