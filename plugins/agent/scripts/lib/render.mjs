@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 
 import { getProvider } from "./providers.mjs";
 import { NODE_LAUNCH_FLAGS } from "./store.mjs";
+import { fenceAgentText, sanitizeAgentText, sanitizeAgentValue } from "./untrusted.mjs";
 
 // The neutral companion, whose `worktree remove` a worktree note names.
 const AGENT_COMPANION = fileURLToPath(new URL("../agent-companion.mjs", import.meta.url));
@@ -10,6 +11,11 @@ const AGENT_COMPANION = fileURLToPath(new URL("../agent-companion.mjs", import.m
 // Results name the provider that produced them; callers pass its label.
 function labelFor(meta) {
   return meta?.providerLabel ?? getProvider().label;
+}
+
+// Prose another agent wrote, as a fenced block named after the provider (lib/untrusted.mjs).
+function agentBlock(label, text) {
+  return fenceAgentText(label, text, { label });
 }
 
 function severityRank(severity) {
@@ -133,7 +139,7 @@ function appendReasoningSection(lines, reasoningSummary) {
 
   lines.push("", "Reasoning:");
   for (const section of reasoningSummary) {
-    lines.push(`- ${section}`);
+    lines.push(`- ${sanitizeAgentText(section)}`);
   }
 }
 
@@ -142,6 +148,13 @@ function appendReasoningSection(lines, reasoningSummary) {
  * which wins over the one the result names. A finding without a file is shown without a location.
  */
 export function renderReviewResult(parsedResult, meta) {
+  // The findings are the agent's words in the plugin's layout: every string is sanitised.
+  parsedResult = {
+    ...parsedResult,
+    parseError: typeof parsedResult.parseError === "string" ? sanitizeAgentText(parsedResult.parseError) : parsedResult.parseError,
+    parsed: sanitizeAgentValue(parsedResult.parsed),
+    rawOutput: typeof parsedResult.rawOutput === "string" ? sanitizeAgentText(parsedResult.rawOutput) : parsedResult.rawOutput
+  };
   if (!parsedResult.parsed) {
     const lines = [
       reviewHeading(meta),
@@ -219,7 +232,7 @@ export function renderReviewResult(parsedResult, meta) {
 
 export function renderNativeReviewResult(result, meta) {
   const stdout = result.stdout.trim();
-  const stderr = result.stderr.trim();
+  const stderr = sanitizeAgentText(result.stderr).trim();
   const lines = [
     `# ${labelFor(meta)} ${meta.reviewLabel}`,
     "",
@@ -228,7 +241,7 @@ export function renderNativeReviewResult(result, meta) {
   ];
 
   if (stdout) {
-    lines.push(stdout);
+    lines.push(agentBlock(labelFor(meta), stdout));
   } else if (result.status === 0) {
     lines.push(`${labelFor(meta)} review completed without any stdout output.`);
   } else {
@@ -256,14 +269,15 @@ function renderWorktreeNote(meta) {
 export function renderTaskResult(parsedResult, meta) {
   const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
   const structured = renderStructuredOutput(parsedResult?.structuredOutput, { tooLarge: parsedResult?.structuredResultTooLarge });
-  const failure = String(parsedResult?.failureMessage ?? "").trim();
+  const failure = sanitizeAgentText(parsedResult?.failureMessage ?? "").trim();
+  const quota = meta?.quotaNote ? `\n${meta.quotaNote}\n` : "";
   if (rawOutput || structured) {
-    const text = rawOutput && !rawOutput.endsWith("\n") ? `${rawOutput}\n` : rawOutput;
-    return `${text}${text && structured ? "\n" : ""}${structured}${failure ? `\n${failure}\n` : ""}${renderWorktreeNote(meta)}`;
+    const text = rawOutput ? `${agentBlock(labelFor(meta), rawOutput)}\n` : "";
+    return `${text}${text && structured ? "\n" : ""}${structured}${failure ? `\n${failure}\n` : ""}${quota}${renderWorktreeNote(meta)}`;
   }
 
   const message = failure || `${labelFor(meta)} did not return a final message.`;
-  return `${message}\n${renderWorktreeNote(meta)}`;
+  return `${message}\n${quota}${renderWorktreeNote(meta)}`;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -403,10 +417,10 @@ function jobNotes(view) {
   const row = view.row;
   const notes = [];
   if (row.question) {
-    notes.push(`Question: ${row.question}`);
+    notes.push(`Question: ${sanitizeAgentText(row.question)}`);
   }
   if (row.error) {
-    notes.push(`Error: ${row.error}`);
+    notes.push(`Error: ${sanitizeAgentText(row.error)}`);
   }
   if (row.stopping_since !== null && row.stopping_since !== undefined) {
     notes.push(`Stop not confirmed (${row.stopping_cause ?? "unknown cause"}) since ${isoTime(row.stopping_since)}.`);
@@ -488,7 +502,7 @@ export function renderStoreJobStatus(view, { progress = [], logFile = null } = {
     lines.push(`Log: ${logFile}`);
   }
   if (progress.length > 0) {
-    lines.push("Progress:", ...progress.map((line) => `  ${line}`));
+    lines.push("Progress:", ...progress.map((line) => `  ${sanitizeAgentText(line)}`));
   }
   lines.push(
     view.isTip
@@ -524,7 +538,7 @@ function storedReview(view) {
     providerLabel: label
   };
   const rendered = renderReviewResult({ parsed, rawOutput: row.result_text ?? "", parseError }, meta);
-  return view.state !== "completed" && row.error && parsed ? `${rendered}${row.error}\n` : rendered;
+  return view.state !== "completed" && row.error && parsed ? `${rendered}${sanitizeAgentText(row.error)}\n` : rendered;
 }
 
 // The command that opens a stored job's thread in the provider's own tool. None for a thread the
@@ -559,7 +573,7 @@ function storedModelNote(view) {
  * a waiting question, an unobserved provider exit and its successor. `successor` is the view of
  * the job that continued this one, or null. A job with no end decision gets one line saying so.
  */
-export function renderStoreResult(view, { successor = null, logFile = null } = {}) {
+export function renderStoreResult(view, { successor = null, logFile = null, quotaNote = null } = {}) {
   const row = view.row;
   const label = providerLabelOf(view);
   if (["queued", "running", "stopping"].includes(view.state)) {
@@ -570,19 +584,20 @@ export function renderStoreResult(view, { successor = null, logFile = null } = {
   if (review) {
     body = review;
   } else if (typeof row.result_text === "string" && row.result_text) {
-    body = row.result_json ? `${row.result_text.replace(/\n*$/, "")}\n\n${renderStructuredOutput(JSON.parse(row.result_json))}` : row.result_text;
+    const block = agentBlock(label, row.result_text);
+    body = row.result_json ? `${block}\n\n${renderStructuredOutput(JSON.parse(row.result_json))}` : block;
     // A failed job keeps its prose; the failure follows it.
     if (view.state === "failed" && row.error) {
-      body = `${body.replace(/\n*$/, "")}\n\n${row.error}`;
+      body = `${body.replace(/\n*$/, "")}\n\n${sanitizeAgentText(row.error)}`;
     }
   } else if (row.result_json) {
     body = renderStructuredOutput(JSON.parse(row.result_json));
   } else {
-    body = [`# ${row.title || "Job Result"}`, "", `Job: ${view.id}`, `State: ${view.state}`, "", row.error || "No output was stored for this job."].join("\n");
+    body = [`# ${row.title || "Job Result"}`, "", `Job: ${view.id}`, `State: ${view.state}`, "", sanitizeAgentText(row.error ?? "") || "No output was stored for this job."].join("\n");
   }
-  const notes = [...storedModelNote(view), ...resultNotes(view, logFile)];
+  const notes = [...(quotaNote ? [quotaNote] : []), ...storedModelNote(view), ...resultNotes(view, logFile)];
   if (view.state === "waiting" && row.question) {
-    notes.push(`${label} is waiting for an answer: ${row.question}`, `Reply with /agent:send ${view.id} <answer>.`);
+    notes.push(`${label} is waiting for an answer: ${sanitizeAgentText(row.question)}`, `Reply with /agent:send ${view.id} <answer>.`);
   }
   if (view.providerExitUnobserved) {
     notes.push("The provider's exit was not observed; it may still run, so continuing its thread needs --force.");
@@ -614,5 +629,5 @@ export function renderStructuredOutput(value, { tooLarge = false } = {}) {
   if (value === null || value === undefined) {
     return "";
   }
-  return `Structured output:\n${JSON.stringify(value, null, 2)}\n`;
+  return `Structured output:\n${JSON.stringify(sanitizeAgentValue(value), null, 2)}\n`;
 }

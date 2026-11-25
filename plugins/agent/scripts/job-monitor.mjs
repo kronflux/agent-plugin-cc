@@ -12,6 +12,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
+import { sanitizeAgentText } from "./lib/untrusted.mjs";
 import { getHostPid, getSessionId, setPluginDataDir } from "./lib/host.mjs";
 import { readLeaderStates } from "./lib/job-control.mjs";
 import { createStaleTracker, readLiveSample, removeLiveFile, writeLiveFile } from "./lib/live.mjs";
@@ -82,7 +83,8 @@ function detailOf(text) {
 /** The one notification line of a job event. */
 function eventLine(event) {
   const job = `[event ${event.id}] ${providerName(event.provider)} job ${event.jobId}${event.label ? ` (${event.label})` : ""}`;
-  const detail = detailOf(event.text);
+  // The text of an event is the agent's own (an error, a question): it is shown sanitised.
+  const detail = detailOf(sanitizeAgentText(event.text ?? ""));
   switch (event.kind) {
     case "completed":
       return `${job} completed. Run /agent:result ${event.jobId} for the output.`;

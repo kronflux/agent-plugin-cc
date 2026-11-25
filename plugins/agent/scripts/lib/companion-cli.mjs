@@ -2,6 +2,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { parseArgs, splitRawArgumentString } from "./args.mjs";
+import { sanitizeAgentValue } from "./untrusted.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 // Command-line plumbing shared by the provider companions: argument parsing and output.
@@ -11,7 +12,9 @@ export class HelpRequested extends Error {}
 
 export function outputResult(value, asJson) {
   if (asJson) {
-    console.log(JSON.stringify(value, null, 2));
+    // A JSON result can carry another agent's text (a result, a question, an error): its strings
+    // are sanitised, and it gets no fence, because programs parse it.
+    console.log(JSON.stringify(sanitizeAgentValue(value), null, 2));
   } else {
     process.stdout.write(value);
   }

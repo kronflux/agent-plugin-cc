@@ -7,7 +7,9 @@ import { outputCommandResult, parseCommandInput, resolveCommandCwd } from "../li
 import { isGitRepository } from "../lib/git.mjs";
 import { getSessionId } from "../lib/host.mjs";
 import { reconcileStore } from "../lib/job-control.mjs";
+import { getProvider } from "../lib/providers.mjs";
 import { fenceFor, renderFleetTable, renderStoreResult } from "../lib/render.mjs";
+import { fenceAgentText, sanitizeAgentValue } from "../lib/untrusted.mjs";
 import {
   ManifestError,
   buildRunRecord,
@@ -204,11 +206,12 @@ function resultSection(entry) {
   } else if (row && (row.result_text || row.result_json)) {
     const parts = [];
     if (row.result_text) {
-      parts.push(row.result_text.replace(/\n+$/, ""));
+      const label = getProvider(entry.provider).label;
+      parts.push(fenceAgentText(label, row.result_text, { label }));
     }
     const json = parseResultJson(row);
     if (json !== null) {
-      const text = JSON.stringify(json, null, 2);
+      const text = JSON.stringify(sanitizeAgentValue(json), null, 2);
       const fence = fenceFor(text);
       parts.push(`${fence}json\n${text}\n${fence}`);
     }

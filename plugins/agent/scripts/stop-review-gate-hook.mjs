@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import process from "node:process";
 import path from "node:path";
@@ -15,6 +14,7 @@ import { checkRuntime, openStore, runtimeGateMessage } from "./lib/store.mjs";
 import { launchWorker } from "./lib/task-launch.mjs";
 import { waitForJob } from "./lib/tracked-jobs.mjs";
 import { formatBlockDecision, getProjectDir, getSessionId, readHookInput, readRequesterIdentity } from "./lib/host.mjs";
+import { fenceAgentText, sanitizeAgentText } from "./lib/untrusted.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 // The review waits for its job at most this long, inside the Stop hook's 900 s limit in hooks.json,
@@ -26,7 +26,6 @@ const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const VERDICT_SCHEMA = path.join(ROOT_DIR, "schemas", "stop-gate-verdict.schema.json");
 const DEFAULT_MAX_ROUNDS = 3;
 const DISABLE_HINT = "To turn the review gate off, run /agent:codex-setup --disable-review-gate.";
-const UNTRUSTED_TAG = "untrusted-claude-response";
 
 function emitBlockDecision(reason) {
   process.stdout.write(`${formatBlockDecision(reason)}\n`);
@@ -44,25 +43,11 @@ function readWaitMs() {
   return /^\d+$/.test(raw) && Number(raw) > 0 ? Number(raw) : STOP_REVIEW_WAIT_MS;
 }
 
-// The previous Claude response is quoted between markers carrying a random id, so text in
-// the response cannot close the quote early. Marker text inside the response is removed
-// repeatedly, so a marker built from the pieces of another one does not survive.
-function fenceUntrusted(text) {
-  const id = randomBytes(6).toString("hex");
-  const marker = new RegExp(`</?${UNTRUSTED_TAG}[^>]*>`, "gi");
-  let cleaned = text;
-  for (let previous = null; previous !== cleaned; ) {
-    previous = cleaned;
-    cleaned = cleaned.replace(marker, "");
-  }
-  return [`<${UNTRUSTED_TAG} id="${id}">`, cleaned, `</${UNTRUSTED_TAG} id="${id}">`].join("\n");
-}
-
 function buildStopReviewPrompt(input = {}) {
   const lastAssistantMessage = String(input.last_assistant_message ?? "").trim();
   const template = loadPromptTemplate(ROOT_DIR, "stop-review-gate");
   const claudeResponseBlock = lastAssistantMessage
-    ? ["Previous Claude response:", fenceUntrusted(lastAssistantMessage)].join("\n")
+    ? ["Previous Claude response:", fenceAgentText("claude", lastAssistantMessage, { label: "Claude" })].join("\n")
     : "";
   return interpolateTemplate(template, {
     CLAUDE_RESPONSE_BLOCK: claudeResponseBlock
@@ -90,7 +75,7 @@ function messageOf(error) {
 // The verdict comes from the structured `verdict` field. Output that is not the expected JSON
 // object counts as a failed review, so "BLOCK" in a reason or in quoted text cannot decide it.
 function parseVerdict(parsed) {
-  const reason = typeof parsed?.reason === "string" ? parsed.reason.trim() : "";
+  const reason = typeof parsed?.reason === "string" ? sanitizeAgentText(parsed.reason).trim() : "";
   if (parsed?.verdict === "allow") {
     return { ok: true, reason: null };
   }
@@ -107,7 +92,7 @@ function parseVerdict(parsed) {
 function verdictOfJob(view) {
   const row = view.row;
   if (row.end_state !== "completed") {
-    const detail = String(row.error ?? "").trim();
+    const detail = sanitizeAgentText(row.error ?? "").trim();
     return infrastructureFailure(
       detail ? `The stop-time Codex review failed: ${detail}` : `The stop-time Codex review ended ${view.state}.`
     );

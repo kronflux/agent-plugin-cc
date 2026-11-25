@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeCommittedRepo, makeTempDir, run as runCommand, stopOwnedProcess, stopOwnedProcesses, waitUntil } from "./helpers.mjs";
+import { fenceAgentText } from "../plugins/agent/scripts/lib/untrusted.mjs";
 import { resolveStateDir } from "../plugins/agent/scripts/lib/state.mjs";
 import { createCodexDriver } from "../plugins/agent/scripts/providers/codex/runtime.mjs";
 import { isProcessAlive } from "../plugins/agent/scripts/lib/process.mjs";
@@ -96,6 +97,9 @@ function seedQueuedCodexJob(repo, { sessionId = null, title = "Codex Task" } = {
     db.close();
   }
 }
+
+// What a foreground task prints for a Codex answer: the answer as a fenced block of agent output.
+const fencedCodex = (text) => `${fenceAgentText("Codex", text, { label: "Codex" })}\n`;
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
   const binDir = makeTempDir();
@@ -445,7 +449,7 @@ test("task --resume-last resumes the latest persisted task thread", () => {
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
+  assert.equal(result.stdout, fencedCodex("Resumed the prior run.\nFollow-up prompt accepted.\n"));
 });
 
 for (const value of ["0", "abc"]) {
@@ -675,7 +679,7 @@ test("write task output focuses on the Codex result without generic follow-up hi
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, fencedCodex("Handled the requested task.\nTask prompt accepted.\n"));
 });
 
 test("task --resume acts like --resume-last without leaking the flag into the prompt", () => {
@@ -810,7 +814,7 @@ test("task waits for the main thread to complete before returning the final resu
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, fencedCodex("Handled the requested task.\nTask prompt accepted.\n"));
 });
 
 test("task ignores later subagent messages when choosing the final returned output", () => {
@@ -828,7 +832,7 @@ test("task ignores later subagent messages when choosing the final returned outp
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, fencedCodex("Handled the requested task.\nTask prompt accepted.\n"));
 });
 
 test("task can finish after subagent work even if the parent turn/completed event is missing", () => {
@@ -846,7 +850,7 @@ test("task can finish after subagent work even if the parent turn/completed even
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, fencedCodex("Handled the requested task.\nTask prompt accepted.\n"));
 });
 
 test("task on its own app server completes when Codex spawns subagents", async (t) => {
@@ -866,7 +870,7 @@ test("task on its own app server completes when Codex spawns subagents", async (
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, fencedCodex("Handled the requested task.\nTask prompt accepted.\n"));
   const pids = readAppServerPids(binDir);
   assert.ok(pids.length >= 1, "no app server was started");
   await waitForExit(pids, exited, "every app server to exit");
@@ -1014,7 +1018,8 @@ test("result for a finished write-capable task returns the raw Codex final respo
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /^Handled the requested task\.\nTask prompt accepted\.\n/);
+  // The result opens with the answer as a fenced block; the plugin's notes follow it.
+  assert.ok(result.stdout.startsWith(fencedCodex("Handled the requested task.\nTask prompt accepted.\n")), result.stdout);
   // The store result names the thread; it prints no resume command.
   assert.match(result.stdout, /Codex session ID: thr_[a-z0-9]+/i);
 });
