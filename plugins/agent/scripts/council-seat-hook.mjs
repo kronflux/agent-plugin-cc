@@ -65,6 +65,17 @@ function trace(line) {
   }
 }
 
+// The folder the run was started in, as `council start` wrote it into the run folder. The state
+// of a run belongs to that folder's workspace, and the session's folder can be another one.
+function runWorkspace(runDir) {
+  try {
+    const cwd = JSON.parse(fs.readFileSync(path.join(runDir, "workspace.json"), "utf8")).cwd;
+    return typeof cwd === "string" && cwd && fs.existsSync(cwd) ? cwd : null;
+  } catch {
+    return null;
+  }
+}
+
 function main() {
   const input = readInput();
   const agentType = String(input.agent_type ?? "");
@@ -102,11 +113,16 @@ function main() {
     log(`could not write ${replyFile}: ${error?.message ?? error}`);
     return;
   }
-  const cwd = typeof input.cwd === "string" && input.cwd ? input.cwd : process.cwd();
+  const cwd = runWorkspace(prompt.runDir) ?? (typeof input.cwd === "string" && input.cwd ? input.cwd : process.cwd());
   const status = companion(["council", "status", prompt.runId, "--json", "--cwd", cwd], cwd);
   let deliveries = [];
   try {
-    deliveries = JSON.parse(status.stdout).deliveries ?? [];
+    const parsed = JSON.parse(status.stdout);
+    if (parsed.error) {
+      log(`reply saved to ${replyFile}; council status in ${cwd} answered ${parsed.error}, nothing was submitted`);
+      return;
+    }
+    deliveries = parsed.deliveries ?? [];
   } catch {
     log(`reply saved to ${replyFile}; council status gave no JSON (exit ${status.code}), nothing was submitted`);
     return;

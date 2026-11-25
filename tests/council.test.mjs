@@ -1804,7 +1804,11 @@ test("the seat hook saves a council member's reply as written and submits it for
   const runDir = path.dirname(path.dirname(delivery.promptFile));
   assert.equal(fs.existsSync(path.join(runDir, "replies")), false);
 
-  const result = hook({ agent_type: "agent:council-member", last_assistant_message: reply, agent_transcript_path: transcript, cwd });
+  // The session's folder is another workspace than the run's; the run folder names its own.
+  const elsewhere = makeTempDir(t);
+  const hookElsewhere = (input) => runCommand(process.execPath, ["--disable-warning=ExperimentalWarning", path.join(SCRIPTS, "council-seat-hook.mjs")], { cwd: elsewhere, env, input: JSON.stringify(input), timeout: 90000 });
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(runDir, "workspace.json"), "utf8")), { cwd });
+  const result = hookElsewhere({ agent_type: "agent:council-member", last_assistant_message: reply, agent_transcript_path: transcript, cwd: elsewhere });
   assert.deepEqual([result.status, result.stdout], [0, ""], result.stderr);
   const digest = /([0-9a-f]{64})\.md$/.exec(delivery.promptFile)[1];
   assert.equal(fs.readFileSync(path.join(runDir, "replies", `${digest}.json`), "utf8"), reply);

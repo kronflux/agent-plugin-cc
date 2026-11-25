@@ -1,5 +1,9 @@
 # Changelog
 
+## 3.1.3
+
+- The hook that submits the Claude seat's reply finds the run when the session's folder is another workspace than the one the council was started in. `council start` writes that folder into `workspace.json` in the run folder, and the hook reads it. In 3.1.2 the hook saved the reply in that case and submitted nothing. When `council status` refuses, `replies/hook.log` names the refusal.
+
 ## 3.1.2
 
 - The hook that saves and submits the Claude seat's reply has no matcher any more and checks the agent type itself. In 3.1.1 the host never ran it for the seat's agent, whose type is `agent:council-member` while the matcher was `council-member`. Each run of the hook leaves one line in `council-seat-hook.log` in the plugin data folder.

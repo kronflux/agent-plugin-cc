@@ -1883,6 +1883,13 @@ async function startCouncil(options, repeated, ctx) {
       throw new CouncilRefusal(created.reason, `The council could not be created: ${created.reason}.`);
     }
     publishExport(runDir, "brief.md", briefSha256, () => readCouncil(store, runId)?.run.brief_sha256 ?? null);
+    // The hook that submits the Claude seat's reply runs in the session's folder, which can be
+    // another folder than the one this run was started in; this file names the run's own folder.
+    try {
+      fs.writeFileSync(path.join(runDir, "workspace.json"), `${JSON.stringify({ cwd })}\n`);
+    } catch {
+      // The hook then uses the session's folder.
+    }
     const passed = await advance(runDir, { runId, round: 1, layer: ctx.layer, extensions: ctx.extensions, deadline, stateDir, once: true, openStore: () => store, ...ctx.advance });
     writeDiagnostics(ctx.io, passed.diagnostics, passed.notes);
     const cap = 2 * seats.length + 6;
