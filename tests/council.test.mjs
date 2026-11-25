@@ -1757,3 +1757,60 @@ test("the council loop from start to done", async (t) => {
   // Round 2's failed seats get Claude stand-ins (whose invalid answers settle once): one more collect.
   assert.deepEqual(failing, ["collect", "crossexam", "collect", "collect", "report-failure", "done"]);
 });
+
+test("a seat job the council observed is marked as delivered, so the monitor does not announce it", async (t) => {
+  const clock = useTestClock(t, 0);
+  const { cwd, store, runDir } = commandFixture(t);
+  const { seats } = await seedRun(store, runDir, { timeoutMs: T_LONG });
+  const jobId = bindAttempt(store, seats[1].attemptId, { provider: "codex" }).jobId;
+  setJob(store, jobId, { claimed_at: EPOCH + 10, started_at: EPOCH + 10, end_state: "completed", end_at: EPOCH + 20, result_json: answerText() });
+  const before = store.read((db) => db.prepare("SELECT delivered_at FROM jobs WHERE id = ?").get(jobId).delivered_at);
+  assert.equal(before, null);
+  clock.set(30);
+  const time = fakeTime();
+  await council(["collect", "run-1", "--round", "1", "--budget-ms", "2000", "--json"], { cwd, advance: { now: time.now, sleep: time.sleep } });
+  const after = store.read((db) => db.prepare("SELECT delivered_at FROM jobs WHERE id = ?").get(jobId).delivered_at);
+  assert.notEqual(after, null, "the observed seat job was not marked as delivered");
+});
+
+test("the seat hook saves a council member's reply as written and submits it for its delivery", { timeout: 180000 }, async (t) => {
+  const { lastPromptOf } = await import("../plugins/agent/scripts/council-seat-hook.mjs");
+  const SCRIPTS = path.resolve("plugins", "agent", "scripts");
+  const cwd = makeTempDir(t);
+  const env = fakeProviders(t);
+  const cli = (args) => runCommand(process.execPath, ["--disable-warning=ExperimentalWarning", path.join(SCRIPTS, "agent-companion.mjs"), "council", ...args, "--json"], { cwd, env, timeout: 90000 });
+  const started = cli(["start", "--brief", writeBrief(cwd)]);
+  assert.equal(started.status, 0, started.stderr);
+  const start = JSON.parse(started.stdout);
+  const delivery = start.deliveries.find((entry) => entry.seat === "s1");
+  assert.ok(delivery?.promptFile, started.stdout);
+
+  // The agent's transcript names the prompt file as a JSON string shows it; the reply holds
+  // characters the host shows as entities in a notification.
+  assert.equal(lastPromptOf(JSON.stringify({ text: `earlier ${delivery.promptFile.replace(/[0-9a-f]{64}/, "0".repeat(64))} then ${delivery.promptFile}` })).digest, /([0-9a-f]{64})\.md$/.exec(delivery.promptFile)[1]);
+  const transcript = path.join(makeTempDir(t), "agent.jsonl");
+  fs.writeFileSync(transcript, `${JSON.stringify({ type: "user", message: { content: `Read this council prompt file: ${delivery.promptFile}` } })}\n`);
+  const reply = JSON.stringify(round1Answer({ wouldChangeMind: "a < b && c > d" }));
+  const hook = (input) => runCommand(process.execPath, ["--disable-warning=ExperimentalWarning", path.join(SCRIPTS, "council-seat-hook.mjs")], { cwd, env, input: JSON.stringify(input), timeout: 90000 });
+
+  // Another agent's stop is not the council's business.
+  const other = hook({ agent_type: "general-purpose", last_assistant_message: reply, agent_transcript_path: transcript, cwd });
+  assert.deepEqual([other.status, other.stdout], [0, ""]);
+  const runDir = path.dirname(path.dirname(delivery.promptFile));
+  assert.equal(fs.existsSync(path.join(runDir, "replies")), false);
+
+  const result = hook({ agent_type: "agent:council-member", last_assistant_message: reply, agent_transcript_path: transcript, cwd });
+  assert.deepEqual([result.status, result.stdout], [0, ""], result.stderr);
+  const digest = /([0-9a-f]{64})\.md$/.exec(delivery.promptFile)[1];
+  assert.equal(fs.readFileSync(path.join(runDir, "replies", `${digest}.json`), "utf8"), reply);
+  assert.match(fs.readFileSync(path.join(runDir, "replies", "hook.log"), "utf8"), /submit for s1 intent [0-9a-f]+: valid/);
+  const status = JSON.parse(cli(["status", start.runId]).stdout);
+  const seat = status.rounds[0].seats.find((entry) => entry.seat === "s1");
+  assert.equal(seat.state, "valid", JSON.stringify(seat));
+  assert.equal(status.deliveries.some((entry) => entry.seat === "s1"), false, "the delivery is still open");
+
+  // A second stop of the same agent (a late notice resumed it) finds no open delivery and submits nothing.
+  const again = hook({ agent_type: "agent:council-member", last_assistant_message: reply, agent_transcript_path: transcript, cwd });
+  assert.equal(again.status, 0);
+  assert.match(fs.readFileSync(path.join(runDir, "replies", "hook.log"), "utf8"), /no open delivery has this prompt, nothing was submitted/);
+});

@@ -1,5 +1,5 @@
 {
-  "description": "Optional stop-time review gate for Codex Companion.",
+  "description": "Session start and end, the optional stop-time review gate, and the council seat's reply.",
   "hooks": {
     "SessionStart": [
       {
@@ -44,6 +44,22 @@
               "${CLAUDE_PLUGIN_ROOT}/scripts/stop-review-gate-hook.mjs"
             ],
             "timeout": 900
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "council-member",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "--disable-warning=ExperimentalWarning",
+              "${CLAUDE_PLUGIN_ROOT}/scripts/council-seat-hook.mjs"
+            ],
+            "timeout": 60
           }
         ]
       }
