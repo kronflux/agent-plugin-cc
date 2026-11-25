@@ -1796,6 +1796,11 @@ test("the seat hook saves a council member's reply as written and submits it for
   // Another agent's stop is not the council's business.
   const other = hook({ agent_type: "general-purpose", last_assistant_message: reply, agent_transcript_path: transcript, cwd });
   assert.deepEqual([other.status, other.stdout], [0, ""]);
+  // The hook has no matcher, so the host calls it for every agent; each call leaves one trace line.
+  const hooksJson = JSON.parse(fs.readFileSync(path.resolve("plugins", "agent", "hooks", "hooks.json"), "utf8"));
+  assert.equal(Object.hasOwn(hooksJson.hooks.SubagentStop[0], "matcher"), false);
+  const traceFile = path.join(env.CLAUDE_PLUGIN_DATA ?? process.env.CLAUDE_PLUGIN_DATA, "council-seat-hook.log");
+  assert.match(fs.readFileSync(traceFile, "utf8"), /agent type "general-purpose": not a council seat/);
   const runDir = path.dirname(path.dirname(delivery.promptFile));
   assert.equal(fs.existsSync(path.join(runDir, "replies")), false);
 

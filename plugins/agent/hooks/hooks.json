@@ -50,7 +50,6 @@
     ],
     "SubagentStop": [
       {
-        "matcher": "council-member",
         "hooks": [
           {
             "type": "command",

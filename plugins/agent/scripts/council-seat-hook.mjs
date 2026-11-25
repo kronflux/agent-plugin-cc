@@ -7,8 +7,12 @@
 // it for the delivery that prompt belongs to. The leader then finds the seat answered in the next
 // `council status`, or submits the file itself when the submit here did not happen.
 //
-// The hook prints nothing and always exits 0: it must never keep an agent running or change what
-// the leader sees. What it did is in `<run folder>/replies/hook.log`.
+// The hook has no matcher, because a host matches a plain agent name exactly and a plugin's agent
+// carries the plugin's name before it; the agent type is checked here instead. The hook prints
+// nothing and always exits 0: it must never keep an agent running or change what the leader sees.
+// What it did for a reply is in `<run folder>/replies/hook.log`; each run of the hook adds one line
+// to `council-seat-hook.log` in the plugin data folder, which shows whether the host called it and
+// with which agent type.
 
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -46,22 +50,42 @@ function companion(args, cwd) {
   return { code: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "", error: result.error ?? null };
 }
 
+// One line per run of the hook in the plugin data folder; the file starts again past 64 KiB.
+function trace(line) {
+  const dir = process.env.CLAUDE_PLUGIN_DATA;
+  if (!dir) {
+    return;
+  }
+  try {
+    const file = path.join(dir, "council-seat-hook.log");
+    const flag = fs.existsSync(file) && fs.statSync(file).size > 65536 ? "w" : "a";
+    fs.writeFileSync(file, `${new Date().toISOString()} ${line}\n`, { flag });
+  } catch {
+    // The trace is a convenience.
+  }
+}
+
 function main() {
   const input = readInput();
-  if (!/(^|:)council-member$/.test(String(input.agent_type ?? ""))) {
+  const agentType = String(input.agent_type ?? "");
+  if (!/(^|:)council-member$/.test(agentType)) {
+    trace(`agent type ${JSON.stringify(agentType)}: not a council seat`);
     return;
   }
   const reply = typeof input.last_assistant_message === "string" ? input.last_assistant_message : "";
   let transcript = "";
   try {
     transcript = fs.readFileSync(String(input.agent_transcript_path ?? ""), "utf8");
-  } catch {
+  } catch (error) {
+    trace(`council seat: the transcript ${JSON.stringify(input.agent_transcript_path ?? null)} could not be read (${error?.code ?? error})`);
     return;
   }
   const prompt = lastPromptOf(transcript);
   if (!prompt || !reply.trim() || !fs.existsSync(prompt.runDir)) {
+    trace(`council seat: nothing to save (prompt file ${prompt ? "found" : "not found"}, reply ${reply.trim() ? "present" : "empty"})`);
     return;
   }
+  trace(`council seat: run ${prompt.runId}, prompt ${prompt.digest.slice(0, 12)}`);
   const repliesDir = path.join(prompt.runDir, "replies");
   const replyFile = path.join(repliesDir, `${prompt.digest}.json`);
   const log = (line) => {
