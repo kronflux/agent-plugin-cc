@@ -5,6 +5,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { parseCommandInput, resolveCommandCwd } from "../lib/companion-cli.mjs";
+import { sanitizeAgentValue } from "../lib/untrusted.mjs";
 import { readRequesterIdentity } from "../lib/host.mjs";
 import { reconcileStore } from "../lib/job-control.mjs";
 import { readMessageOutcome, sendToChain, withdrawMessage } from "../lib/mailbox.mjs";
@@ -765,7 +766,7 @@ function followupAnswerVerdict(runDir, snapshot, text, eventAt) {
   } catch {
     answer = undefined;
   }
-  const checked = answer === undefined ? { ok: false, errors: ["answer: not valid JSON"] } : validateFollowupAnswer(answer, followupContext(snapshot));
+  const checked = answer === undefined ? { ok: false, errors: ["answer: not valid JSON"] } : validateFollowupAnswer(sanitizeAgentValue(answer), followupContext(snapshot));
   if (checked.ok) {
     return { outcome: "valid", eventAt, answerSha256: installObject(runDir, `${JSON.stringify(checked.answer)}\n`, "json") };
   }
@@ -1784,7 +1785,8 @@ function nodeIo() {
 }
 
 function emit(io, json, payload, text) {
-  io.stdout(json ? `${JSON.stringify(payload, null, 2)}\n` : text.endsWith("\n") ? text : `${text}\n`);
+  // A JSON result can carry the members' words (answers, findings): its strings are sanitised.
+  io.stdout(json ? `${JSON.stringify(sanitizeAgentValue(payload), null, 2)}\n` : text.endsWith("\n") ? text : `${text}\n`);
 }
 
 // At `layer` 1 or more, the digest of a seat's prepared retry prompt: the full round prompt,

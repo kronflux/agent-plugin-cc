@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 
 import { interpolateTemplate, loadPromptTemplate } from "../prompts.mjs";
 import { listProviders } from "../providers.mjs";
+import { sanitizeAgentValue } from "../untrusted.mjs";
 
 // Council seats, lenses and the round, repair and retry prompts. The brief carries the question,
 // the target paths, the options and the claims marked observed or assumed; the templates add the
@@ -118,7 +119,9 @@ function trimEnd(text) {
   return String(text ?? "").replace(/\s+$/, "");
 }
 
+// Every value shown this way was written by a council member, so its strings are sanitised.
 function jsonBlock(value) {
+  value = sanitizeAgentValue(value);
   return `\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
 }
 
