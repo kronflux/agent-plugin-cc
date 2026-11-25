@@ -15,10 +15,12 @@ import { sanitizeAgentValue } from "../untrusted.mjs";
 const SCHEMA_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "schemas");
 const ROUND_SCHEMAS = { 1: "council-round1", 2: "council-round2" };
 // The round schemas of the kinds whose seats answer the question in their own words: Round 1 adds
-// the answer, Round 2 adds the answer labels a seat links (`question`) or agrees with (`open`).
+// the answer (at most 500 characters for `question`, whose answers become the options of a vote;
+// 1500 for `open`, a matter of judgement), Round 2 adds the answer labels a seat links
+// (`question`) or agrees with (`open`).
 const KIND_SCHEMAS = {
   question: { 1: "council-round1-question", 2: "council-round2-question" },
-  open: { 1: "council-round1-question", 2: "council-round2-open" }
+  open: { 1: "council-round1-open", 2: "council-round2-open" }
 };
 const schemaCache = new Map();
 

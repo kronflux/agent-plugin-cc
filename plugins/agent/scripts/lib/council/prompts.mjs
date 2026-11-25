@@ -33,15 +33,22 @@ export const DEFAULT_LENSES = {
 // What a seat writes in its first answer, by kind: findings and a stance for a review or a
 // decision; a statement of its own answer, with findings as its supporting points, for a question
 // or an open council.
+// The most characters of a seat's own answer, as the Round 1 schema of each kind sets it.
+const QUESTION_ANSWER_LIMIT = 500;
+const OPEN_ANSWER_LIMIT = 1500;
+
 const ROUND1_RULES = {
   findings:
     "Give each finding an id `f1`, `f2` and so on, a severity from `P1` (most severe) to `P3`, the claim, the file path and line (or null when the finding has none), and the evidence that supports it. State what you assumed under `assumptions`, and say under `wouldChangeMind` what would change your view. For a decision, set `stance` to one of the options the brief names; for a review, set `stance` to null.",
-  ownWords:
-    "Answer the question in `answer`: one statement in your own words, at most 500 characters. Give the points that support it as findings: each with an id `f1`, `f2` and so on, a weight from `P1` (most important) to `P3` in `severity`, the claim, the file path and line (or null when the point has none), and the evidence. State what you assumed under `assumptions`, and say under `wouldChangeMind` what would change your answer. Set `stance` to null."
+  ownWords: (limit) =>
+    `Answer the question in \`answer\`: one statement in your own words, at most ${limit} characters. Give the points that support it as findings: each with an id \`f1\`, \`f2\` and so on, a weight from \`P1\` (most important) to \`P3\` in \`severity\`, the claim, the file path and line (or null when the point has none), and the evidence. State what you assumed under \`assumptions\`, and say under \`wouldChangeMind\` what would change your answer. Set \`stance\` to null.`
 };
 
 function round1Rules(kind) {
-  return kind === "question" || kind === "open" ? ROUND1_RULES.ownWords : ROUND1_RULES.findings;
+  if (kind === "open") {
+    return ROUND1_RULES.ownWords(OPEN_ANSWER_LIMIT);
+  }
+  return kind === "question" ? ROUND1_RULES.ownWords(QUESTION_ANSWER_LIMIT) : ROUND1_RULES.findings;
 }
 
 // The Round 2 instruction on the stance, by kind; for a question or open council it also says how

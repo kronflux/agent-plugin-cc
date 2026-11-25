@@ -49,18 +49,19 @@ test("each kind answers its rounds against its own schema", () => {
       ["council-round1", "council-round2"],
       ["council-round1", "council-round2"],
       ["council-round1-question", "council-round2-question"],
-      ["council-round1-question", "council-round2-open"]
+      ["council-round1-open", "council-round2-open"]
     ]
   );
   assert.throws(() => roundSchemaName(3, "question"), /Unknown council round "3"/);
 });
 
-test("a question or open Round 1 answer needs a statement of at most 500 characters and a null stance", () => {
-  for (const kind of ["question", "open"]) {
+test("a question or open Round 1 answer needs a statement within the limit of its kind and a null stance", () => {
+  // A question answer becomes an option of a vote and stays short; an open answer is a judgement.
+  for (const [kind, limit] of [["question", 500], ["open", 1500]]) {
     const context = { kind, options: [] };
     assert.deepEqual(validateAnswer(1, round1("The cache is correct."), context), { ok: true, errors: [] });
-    assert.deepEqual(validateAnswer(1, round1("x".repeat(500)), context), { ok: true, errors: [] });
-    assert.deepEqual(validateAnswer(1, round1("x".repeat(501)), context), { ok: false, errors: ["answer: must have at most 500 characters, got 501"] });
+    assert.deepEqual(validateAnswer(1, round1("x".repeat(limit)), context), { ok: true, errors: [] });
+    assert.deepEqual(validateAnswer(1, round1("x".repeat(limit + 1)), context), { ok: false, errors: [`answer: must have at most ${limit} characters, got ${limit + 1}`] });
     assert.deepEqual(validateAnswer(1, round1(""), context), { ok: false, errors: ["answer: must have at least 1 character(s)"] });
     const { answer: _answer, ...withoutAnswer } = round1("unused");
     assert.deepEqual(validateAnswer(1, withoutAnswer, context), { ok: false, errors: ["answer: required property is missing"] });
@@ -718,4 +719,17 @@ test("a round 2 prompt and a stored reply treat other seats' text as data withou
   const stored = JSON.parse(normalizeAnswerBytes("council-round1-question", Buffer.from(JSON.stringify(reply))).toString("utf8"));
   assert.equal(stored.answer, "Hello World!");
   assert.equal(stored.wouldChangeMind, "x");
+});
+
+test("an open council lets a seat answer in up to 1500 characters and says so; a question council keeps 500", async () => {
+  const { renderRound1Prompt } = await import("../plugins/agent/scripts/lib/council/prompts.mjs");
+  const answer = (length) => ({ schema: 1, answer: "x".repeat(length), stance: null, confidence: "high", dealbreaker: null, findings: [], assumptions: [], wouldChangeMind: "y" });
+  assert.equal(roundSchemaName(1, "open"), "council-round1-open");
+  assert.equal(roundSchemaName(1, "question"), "council-round1-question");
+  assert.deepEqual(validateSchemaFile("council-round1-open", answer(1500)).errors, []);
+  assert.deepEqual(validateSchemaFile("council-round1-open", answer(1501)).errors, ["answer: must have at most 1500 characters, got 1501"]);
+  assert.deepEqual(validateSchemaFile("council-round1-question", answer(501)).errors, ["answer: must have at most 500 characters, got 501"]);
+  const prompt = (kind) => renderRound1Prompt({ brief: "Question: x", lens: "evidence", kind, schemaText: "{}" });
+  assert.match(prompt("open"), /in your own words, at most 1500 characters\./);
+  assert.match(prompt("question"), /in your own words, at most 500 characters\./);
 });
