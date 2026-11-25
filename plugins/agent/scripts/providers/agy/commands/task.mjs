@@ -123,7 +123,7 @@ function applyResumeChoices(db, successorId, request) {
   );
 }
 
-function renderTask(view) {
+function renderTask(view, { quotaNote = null } = {}) {
   const request = view.request ?? {};
   const rendered = renderTaskResult(
     {
@@ -138,7 +138,8 @@ function renderTask(view) {
       write: Boolean(request.write),
       providerLabel: agyProvider.label,
       worktreePath: request.worktree?.path ?? null,
-      worktreeBranch: request.worktree?.branch ?? null
+      worktreeBranch: request.worktree?.branch ?? null,
+      quotaNote
     }
   );
   return `${rendered}${notesText(modelNoteLines(request.model, request.providerModel, request.savedModelChange))}`;

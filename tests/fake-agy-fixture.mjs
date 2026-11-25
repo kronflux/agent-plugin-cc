@@ -64,6 +64,8 @@ const LINGERING = new Set(["slow", "hang", "silent", "chatty-silent", "replay-th
 //   step of an earlier turn (step_index 0), then nothing, and runs until it is stopped.
 // - "replayed-events": a continued conversation writes init twice and repeats the previous
 //   turn's user_input step before its own.
+// - "quota-empty": every turn ends at once with status ERROR, and `/usage` reports the group of
+//   Fake Model with nothing left and a reset time.
 // - "fail-first-turn": ends turn 1 at once with status ERROR and a response whose braces are not
 //   JSON; a later line gets a normal SUCCESS turn.
 //
@@ -227,6 +229,9 @@ const USAGE_GROUPS = [
 ];
 
 function usageGroups() {
+  if (BEHAVIOR === "quota-empty") {
+    return [...USAGE_GROUPS, { name: "Fake Group", description: "Models within this group: Fake Model", buckets: [{ id: "fake-weekly", name: "Weekly Limit Remaining", window: "weekly", remaining_fraction: 0, reset_time: "2026-12-01T09:00:00Z" }] }];
+  }
   return BEHAVIOR === "usage-fake-model"
     ? [...USAGE_GROUPS, { name: "Fake Group", description: "Models within this group: Fake Model", buckets: [{ id: "fake-weekly", name: "Weekly Limit Remaining", window: "weekly", remaining_fraction: 0.4, reset_time: "2026-11-24T09:01:29Z" }] }]
     : USAGE_GROUPS;
@@ -490,7 +495,7 @@ function runNext() {
     runNext();
     return;
   }
-  if (BEHAVIOR === "fail-first-turn" && turns === 1) {
+  if ((BEHAVIOR === "fail-first-turn" && turns === 1) || BEHAVIOR === "quota-empty") {
     emit({ event: "result", result: { conversation_id: conversationId, status: "ERROR", response: "Error: the model request failed {code: 7}", duration_seconds: 0.1, num_turns: turns } });
     busy = false;
     runNext();

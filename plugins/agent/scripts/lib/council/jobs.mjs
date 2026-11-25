@@ -4,7 +4,7 @@ import process from "node:process";
 
 import { delegationOptions, resolveModelSelection } from "../model-selection.mjs";
 import { getProvider } from "../providers.mjs";
-import { runCompanion } from "../runs.mjs";
+import { readProviderUsage } from "../quota.mjs";
 import { readTaskInputFiles } from "../task-launch.mjs";
 import { resolveWorkspaceRoot } from "../workspace.mjs";
 import { familyProvider } from "./prompts.mjs";
@@ -98,18 +98,5 @@ export async function buildSeatJob({ family, model = null, prompt, schemaPath, l
  * out or printed nothing readable: a failed read is no quota evidence.
  */
 export async function readSeatUsage(family, { cwd, env = process.env, timeoutMs }) {
-  const provider = familyProvider(family);
-  if (!provider || !(timeoutMs > 0)) {
-    return null;
-  }
-  const outcome = await runCompanion(getProvider(provider).companionScript, ["usage", "--json"], { cwd, env, timeoutMs });
-  if (outcome.timedOut || outcome.error || outcome.code !== 0) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(outcome.stdout);
-    return parsed && typeof parsed === "object" ? { raw: parsed, normalized: parsed.normalized ?? parsed } : null;
-  } catch {
-    return null;
-  }
+  return readProviderUsage(familyProvider(family), { cwd, env, timeoutMs });
 }

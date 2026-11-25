@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 
 import { agyModelCatalog } from "./runtime.mjs";
+import { agyEndedTurn, agyQuotaBuckets } from "./usage.mjs";
 
 // Antigravity (agy) runs one CLI process per turn. It has no protocol to interrupt a turn, so
 // cancel stops the job's processes. A message sent during a turn is not written to the running
@@ -44,6 +45,9 @@ export const agyProvider = Object.freeze({
     adversarialReview: "/agent:agy-review --stance critical"
   }),
   modelCatalog: agyModelCatalog,
+  // How a usage report shows a reached limit for a job, and which failures agy ended itself.
+  quotaBuckets: agyQuotaBuckets,
+  endedByProvider: agyEndedTurn,
   validatedVersion: VALIDATED_VERSION,
   cleanupContracts: CLEANUP_CONTRACTS,
 

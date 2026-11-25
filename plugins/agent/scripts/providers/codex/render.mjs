@@ -171,3 +171,18 @@ export function normalizeCodexUsage(response, { now = Date.now() } = {}) {
     }))
   };
 }
+
+/**
+ * The reached limits of a rate-limit reply (`{ raw, normalized }` or the normalised object): the
+ * normalised buckets with nothing left, or, when the raw reply names a reached limit without one,
+ * a single bucket with no reset time.
+ */
+export function codexQuotaBuckets(usage) {
+  const raw = usage?.raw ?? usage;
+  const empty = ((usage?.normalized ?? usage)?.groups ?? []).flatMap((group) => (group.buckets ?? []).filter((bucket) => bucket.remainingFraction === 0));
+  if (empty.length > 0) {
+    return empty;
+  }
+  const rawBuckets = [raw?.rateLimits, ...Object.values(raw?.rateLimitsByLimitId ?? {})].filter(Boolean);
+  return rawBuckets.some((bucket) => bucket.rateLimitReachedType !== null && bucket.rateLimitReachedType !== undefined) ? [{ resetTime: null }] : [];
+}

@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 
 import { selfLabel, standInAnswerMap } from "./anonymise.mjs";
 import { readObject as readStoredObject } from "./objects.mjs";
+import { quotaReached } from "../quota.mjs";
+import { sanitizeAgentValue } from "../untrusted.mjs";
 
 // Checks council answers against the round schemas and the rules a schema cannot express.
 // The schema checker covers the keywords the council schemas use: type (with nullable type
@@ -377,42 +379,6 @@ export function classifyJob({ row, T }) {
   return { kind: "failed", eventAt, reason: null, timely, lateReason };
 }
 
-function lower(value) {
-  return String(value ?? "").trim().toLowerCase();
-}
-
-// Whether a normalised usage object `{ groups: [{ name, description, defaultDelegation, buckets:
-// [{ remainingFraction }] }] }` holds an empty bucket in the group the job's model draws on: the
-// group named after the model, or the default delegation group when the job ran on the default.
-function applicableZeroBucket(normalized, { model, defaultModel }) {
-  const groups = Array.isArray(normalized?.groups) ? normalized.groups : [];
-  const wanted = lower(model ?? defaultModel);
-  const usesDefault = !model || (defaultModel && lower(model) === lower(defaultModel));
-  const applicable = groups.filter((group) => {
-    if (usesDefault && group.defaultDelegation) {
-      return true;
-    }
-    if (!wanted) {
-      return false;
-    }
-    const name = lower(group.name);
-    return name === wanted || `${name}\n${lower(group.description)}`.includes(wanted);
-  });
-  return applicable.some((group) => (group.buckets ?? []).some((bucket) => bucket.remainingFraction === 0));
-}
-
-// Whether a Codex rate-limit reply reports a reached limit: a raw bucket with a non-null
-// `rateLimitReachedType`, or a normalised bucket with nothing left.
-function codexLimitReached(usage) {
-  const raw = usage?.raw ?? usage;
-  const buckets = [raw?.rateLimits, ...Object.values(raw?.rateLimitsByLimitId ?? {})].filter(Boolean);
-  if (buckets.some((bucket) => bucket.rateLimitReachedType !== null && bucket.rateLimitReachedType !== undefined)) {
-    return true;
-  }
-  const normalized = usage?.normalized ?? null;
-  return Boolean(normalized && (normalized.groups ?? []).some((group) => (group.buckets ?? []).some((bucket) => bucket.remainingFraction === 0)));
-}
-
 /**
  * The class of a failed or interrupted provider turn, in the contract's order: `quota` when the
  * usage read (`usage`, null when it failed or was not made) shows an applicable empty bucket
@@ -422,8 +388,7 @@ function codexLimitReached(usage) {
  */
 export function classifyFailure({ family, model = null, defaultModel = null, usage = null, row }) {
   if (usage && !usage.error) {
-    const quota = family === "codex" ? codexLimitReached(usage) : applicableZeroBucket(usage.normalized ?? usage, { model, defaultModel });
-    if (quota) {
+    if (quotaReached(family, usage, { model, defaultModel }).reached) {
       return "quota";
     }
   }
@@ -556,7 +521,9 @@ export function normalizeAnswerBytes(schemaName, bytes) {
   if (parsed === undefined || parsed === null || typeof parsed !== "object" || Array.isArray(parsed) || hasNonFiniteNumber(parsed)) {
     return Buffer.from(bytes);
   }
-  return Buffer.from(JSON.stringify(pairSameAsGroups(fillNullable(loadCouncilSchema(schemaName), parsed))), "utf8");
+  // The reply is stored without characters that hide or reorder text, so the merge, the report and
+  // the next round's prompts all read the same clean words.
+  return Buffer.from(JSON.stringify(sanitizeAgentValue(pairSameAsGroups(fillNullable(loadCouncilSchema(schemaName), parsed)))), "utf8");
 }
 
 // A seat that finds three or more answers alike often names them in one top-level `sameAs` group,

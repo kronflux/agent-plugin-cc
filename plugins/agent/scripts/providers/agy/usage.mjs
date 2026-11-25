@@ -187,3 +187,43 @@ export function markDefaultGroup(groups, name) {
 
 /** The line a report prints when no delegation model is known. */
 export const UNKNOWN_DELEGATION_MODEL_LINE = "Default delegation model: unknown (no model key in the Antigravity settings).";
+
+const EFFORT_SUFFIX = /-(?:none|minimal|low|medium|high|xhigh|max|ultra)$/;
+
+// The names a model id may carry in a usage report, lower case, most exact first. An id such as
+// <base>-medium names its group by the display name of <base>, so the id is also tried without its
+// effort word and with spaces for hyphens.
+function modelNames(model) {
+  const id = String(model ?? "").trim().toLowerCase();
+  if (!id) {
+    return [];
+  }
+  const base = id.replace(EFFORT_SUFFIX, "");
+  return [...new Set([id, base, id.replace(/-/g, " "), base.replace(/-/g, " ")])];
+}
+
+/**
+ * The empty buckets of a usage report (`{ raw, normalized }` or the normalised object) in the
+ * group the job's model draws on: the group the model's id names, or the default delegation group
+ * when the job ran on the default. The most exact form of the id that names a group decides, so a
+ * shorter form cannot add the group of a longer model name.
+ */
+export function agyQuotaBuckets(usage, { model = null, defaultModel = null } = {}) {
+  const normalized = usage?.normalized ?? usage;
+  const groups = Array.isArray(normalized?.groups) ? normalized.groups : [];
+  const lower = (value) => String(value ?? "").trim().toLowerCase();
+  const usesDefault = !model || (defaultModel && lower(model) === lower(defaultModel));
+  const named = (candidate) =>
+    groups.filter((group) => {
+      const name = lower(group.name);
+      return name === candidate || `${name}\n${lower(group.description)}`.includes(candidate);
+    });
+  const byName = modelNames(model ?? defaultModel).map(named).find((found) => found.length > 0) ?? [];
+  const applicable = groups.filter((group) => (usesDefault && group.defaultDelegation) || byName.includes(group));
+  return applicable.flatMap((group) => (group.buckets ?? []).filter((bucket) => bucket.remainingFraction === 0));
+}
+
+/** True for the error of a turn that agy itself ended in failure, as the driver words it. */
+export function agyEndedTurn(error) {
+  return /^agy (?:exited with code|was ended by|ended the turn with status)/.test(String(error ?? ""));
+}

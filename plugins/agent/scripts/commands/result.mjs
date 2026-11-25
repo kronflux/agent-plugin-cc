@@ -4,6 +4,7 @@ import process from "node:process";
 import { outputCommandResult, parseCommandInput } from "../lib/companion-cli.mjs";
 import { getSessionId } from "../lib/host.mjs";
 import { listEvents, markEventRead } from "../lib/mailbox.mjs";
+import { quotaNoteForView } from "../lib/quota.mjs";
 import { renderStatusJson, renderStoreResult } from "../lib/render.mjs";
 import { listJobViews, readJobView } from "../lib/state.mjs";
 import { waitForJob } from "../lib/tracked-jobs.mjs";
@@ -83,9 +84,11 @@ export async function run(argv) {
     return { current: latest, successor: next };
   });
   const logFile = jobLogFile(stateDir, current.id);
+  // A failed job whose provider may have ended it is shown with what the usage report says now.
+  const quotaNote = await quotaNoteForView(current);
   outputCommandResult(
-    resultPayload(current, successor),
-    renderStoreResult(current, { successor, logFile: fs.existsSync(logFile) ? logFile : null }),
+    resultPayload(current, successor, quotaNote ? { quotaNote } : {}),
+    renderStoreResult(current, { successor, logFile: fs.existsSync(logFile) ? logFile : null, quotaNote }),
     options.json
   );
 }

@@ -15,6 +15,7 @@ import { reconcileStore } from "../../../lib/job-control.mjs";
 import { delegationOptions, resolveModelSelection, storedSelection } from "../../../lib/model-selection.mjs";
 import { writeSandboxFor } from "../../../lib/settings.mjs";
 import { providerForJob } from "../../../lib/providers.mjs";
+import { quotaNoteForView } from "../../../lib/quota.mjs";
 import { renderTaskResult } from "../../../lib/render.mjs";
 import {
   createJob,
@@ -26,6 +27,7 @@ import {
 } from "../../../lib/state.mjs";
 import { openStoreRetrying, withRetry } from "../../../lib/store.mjs";
 import { waitForJob } from "../../../lib/tracked-jobs.mjs";
+import { sanitizeAgentText } from "../../../lib/untrusted.mjs";
 import {
   attachWorktree,
   buildSessionReviewHandoff,
@@ -340,7 +342,7 @@ export async function waitStoreJob(stateDir, jobId, { json = false } = {}) {
           const start = seen;
           seen += chunk.length;
           if (seen > printed) {
-            process.stderr.write(chunk.subarray(Math.max(0, printed - start)).toString("utf8"));
+            process.stderr.write(sanitizeAgentText(chunk.subarray(Math.max(0, printed - start)).toString("utf8")));
             printed = seen;
           }
         };
@@ -367,7 +369,7 @@ async function waitForegroundJob(stateDir, jobId, { json, render }) {
   }
   const view = outcome.view;
   const state = view?.state ?? "failed";
-  const { payload, rendered } = render(view);
+  const { payload, rendered } = render(view, { quotaNote: await quotaNoteForView(view) });
   outputCommandResult({ ...payload, jobId, status: state }, rendered, json);
   process.exitCode = state === "completed" || state === "waiting" ? 0 : 1;
 }
@@ -415,14 +417,14 @@ export async function startStoreJob(cwd, { fields, label }, { background, json, 
 }
 
 // The rendered result of a finished Codex task, read from its job row.
-function renderStoredTask(view, { title, write }) {
+function renderStoredTask(view, { title, write, quotaNote = null }) {
   const row = view?.row ?? {};
   const request = view?.request ?? {};
   const rawOutput = row.result_text ?? "";
   const failureMessage = row.error ?? "";
   const rendered = renderTaskResult(
     { rawOutput, failureMessage, reasoningSummary: [] },
-    { title, jobId: row.id ?? null, write, worktreePath: request.worktree?.path ?? null, worktreeBranch: request.worktree?.branch ?? null }
+    { title, jobId: row.id ?? null, write, worktreePath: request.worktree?.path ?? null, worktreeBranch: request.worktree?.branch ?? null, quotaNote }
   );
   return {
     payload: {
@@ -430,7 +432,8 @@ function renderStoredTask(view, { title, write }) {
       threadId: row.thread_id ?? null,
       rawOutput,
       ...(row.question ? { question: row.question } : {}),
-      ...(failureMessage ? { failureMessage } : {})
+      ...(failureMessage ? { failureMessage } : {}),
+      ...(quotaNote ? { quotaNote } : {})
     },
     rendered
   };
@@ -447,7 +450,7 @@ async function runStoreTask(cwd, options) {
   const title = options.title ?? "Codex Task";
   const { jobId, stateDir } = await startStoreJob(cwd, built, { background: options.background, json: options.json, title, worktreeRoot: options.worktreeRoot ?? null });
   if (!options.background) {
-    await waitForegroundJob(stateDir, jobId, { json: options.json, render: (view) => renderStoredTask(view, { title, write: options.write }) });
+    await waitForegroundJob(stateDir, jobId, { json: options.json, render: (view, extra) => renderStoredTask(view, { title, write: options.write, ...extra }) });
   }
 }
 
@@ -498,7 +501,7 @@ async function runResumeLast(cwd, options, requester) {
   } finally {
     store.close();
   }
-  await waitForegroundJob(stateDir, successorId, { json: options.json, render: (view) => renderStoredTask(view, { title: "Codex Resume", write: options.write }) });
+  await waitForegroundJob(stateDir, successorId, { json: options.json, render: (view, extra) => renderStoredTask(view, { title: "Codex Resume", write: options.write, ...extra }) });
 }
 
 // Checks a replacement schema against the question setting the successor inherited, inside the

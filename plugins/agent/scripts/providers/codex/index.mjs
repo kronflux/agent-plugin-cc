@@ -2,6 +2,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { codexModelCatalog } from "./model-catalog.mjs";
+import { codexQuotaBuckets } from "./render.mjs";
 import { getSessionRuntimeStatus } from "./runtime.mjs";
 
 // The Codex version the cleanup contracts below were measured on.
@@ -47,6 +48,8 @@ export const codexProvider = Object.freeze({
     adversarialReview: "/agent:codex-review --stance critical"
   }),
   modelCatalog: codexModelCatalog,
+  // How a usage report shows a reached limit.
+  quotaBuckets: codexQuotaBuckets,
 
   cleanupContracts: CLEANUP_CONTRACTS,
   validatedVersion: VALIDATED_VERSION,

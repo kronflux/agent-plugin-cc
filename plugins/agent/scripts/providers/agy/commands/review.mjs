@@ -10,6 +10,7 @@ import { delegationOptions, resolveModelSelection } from "../../../lib/model-sel
 import { renderReviewResult } from "../../../lib/render.mjs";
 import { buildReviewPrompt, parseReviewArguments, resolveReviewTarget } from "../../../lib/review-target.mjs";
 import { createJob, InvalidLabelError } from "../../../lib/state.mjs";
+import { sanitizeAgentText } from "../../../lib/untrusted.mjs";
 import { resolveWorkspaceRoot } from "../../../lib/workspace.mjs";
 import { agyProvider } from "../index.mjs";
 import { ensureAgyAvailable, outsideFolders, readAgySavedModel } from "../runtime.mjs";
@@ -72,7 +73,7 @@ function takeValueOption(argv, name) {
   return { value, rest };
 }
 
-function renderReview(view) {
+function renderReview(view, { quotaNote = null } = {}) {
   const request = view.request ?? {};
   const review = request.review ?? {};
   const parsed = parseReviewOutput({
@@ -81,8 +82,8 @@ function renderReview(view) {
     error: view.row.error ? { message: view.row.error } : null
   });
   const meta = { reviewLabel: reviewLabelFor(review.stance), targetLabel: review.targetLabel, targetKind: review.target, providerLabel: agyProvider.label };
-  const failure = view.state !== "completed" && view.row.error ? `${view.row.error}\n` : "";
-  return `${renderReviewResult(parsed, meta)}${failure}${notesText(modelNoteLines(request.model, request.providerModel, null))}`;
+  const failure = view.state !== "completed" && view.row.error ? `${sanitizeAgentText(view.row.error)}\n` : "";
+  return `${renderReviewResult(parsed, meta)}${failure}${quotaNote ? `${quotaNote}\n` : ""}${notesText(modelNoteLines(request.model, request.providerModel, null))}`;
 }
 
 /**

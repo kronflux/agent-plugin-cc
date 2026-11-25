@@ -418,7 +418,7 @@ test("a review path outside the working folder is passed with --add-dir or refus
   assert.equal(storeJobs(ctx.repo).length, before);
 });
 
-const DELEGATE_LINE = "Do this work yourself. Do not start subagents, swarms, workflows or scheduled tasks.";
+const DELEGATE_LINE = agyRuntime.AGY_DELEGATE_LINE;
 const READ_ONLY_LINE =
   "This is a read-only task. Do not use any tool that creates, edits or deletes a file, anywhere, including plan files, and do not run commands.";
 
@@ -2270,4 +2270,24 @@ test("the guard counts a tool that failed without a refusal, or never ended, as 
   // A tool that ran and hit a permission error of the system is no refusal by agy.
   const osError = { type: "tool", state: "ERROR", name: "mcp_tool", path: null, error: { type: "OS_ERROR", message: "EACCES: permission denied" } };
   assert.equal(decide([tool("ACTIVE", "mcp_tool"), osError]).outcome, "failed");
+});
+
+test("a failed job says when the provider's quota is used up, and stays as it was when quota is left", (t) => {
+  const empty = makeRepo("quota-empty", t);
+  const { result, stored, reply } = runEndedTask(empty, ["--model", "fake-model-high", "do", "it"]);
+  assert.notEqual(result.status, 0, result.stdout);
+  assert.equal(stored.end_state, "failed", JSON.stringify(stored));
+  // The stored error is the provider's; the command that shows the job adds what the usage report says.
+  assert.equal(stored.error, "agy ended the turn with status ERROR.");
+  assert.equal(reply.error, stored.error);
+  assert.equal(reply.quotaNote, "Antigravity reports that its quota is used up. It resets at 2026-12-01T09:00:00Z.");
+  const shown = run("node", [NEUTRAL, "result", stored.id], { cwd: empty.repo, env: empty.env });
+  assert.match(shown.stdout, /agy ended the turn with status ERROR\.\n\nAntigravity reports that its quota is used up\. It resets at 2026-12-01T09:00:00Z\./);
+
+  // The same failure with quota left: the usage report is read and the error is unchanged.
+  const left = makeRepo("fail-first-turn", t);
+  const other = runEndedTask(left, ["--model", "fake-model-high", "do", "it"]);
+  assert.equal(other.stored.end_state, "failed");
+  assert.equal(other.stored.error, "agy ended the turn with status ERROR.");
+  assert.equal(other.reply.quotaNote, undefined);
 });

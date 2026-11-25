@@ -1,7 +1,9 @@
+import { quotaNoteForView } from "../../../lib/quota.mjs";
 import { readJobView, resolveStateDir } from "../../../lib/state.mjs";
 import { openStoreRetrying } from "../../../lib/store.mjs";
 import { launchWorker } from "../../../lib/task-launch.mjs";
 import { waitForJob } from "../../../lib/tracked-jobs.mjs";
+import { sanitizeAgentText, sanitizeAgentValue } from "../../../lib/untrusted.mjs";
 import { readAgyTurnTimeoutMs } from "../runtime.mjs";
 
 // What the Antigravity task and review commands share once their job row exists: the launch of
@@ -52,7 +54,7 @@ function foregroundReply(view) {
 /**
  * Launches the worker of a job that was just created, then either prints the background reply
  * (`backgroundText(view)` without --json) or waits for the job's end, printing its log to stderr
- * and `render(view)` to stdout. The exit code is 0 for completed or waiting, 1 for any other end,
+ * and `render(view, { quotaNote })` to stdout, `quotaNote` being the quota sentence of a failed job or null. The exit code is 0 for completed or waiting, 1 for any other end,
  * and STILL_RUNNING_EXIT when the wait ended first, which leaves the job running.
  */
 export async function launchAndFollow({ store, stateDir, jobId, background, json, backgroundText, render }) {
@@ -75,7 +77,7 @@ export async function launchAndFollow({ store, stateDir, jobId, background, json
   const waited = await waitForJob(stateDir, jobId, {
     until: "end",
     timeoutMs: readAgyTurnTimeoutMs() + 60000,
-    onLog: json ? null : (text) => process.stderr.write(text),
+    onLog: json ? null : (text) => process.stderr.write(sanitizeAgentText(text)),
     deliver: true
   });
   if (waited.timedOut) {
@@ -84,7 +86,8 @@ export async function launchAndFollow({ store, stateDir, jobId, background, json
     return;
   }
   const view = waited.view;
-  process.stdout.write(json ? `${JSON.stringify(foregroundReply(view))}\n` : render(view));
+  const quotaNote = await quotaNoteForView(view);
+  process.stdout.write(json ? `${JSON.stringify(sanitizeAgentValue({ ...foregroundReply(view), ...(quotaNote ? { quotaNote } : {}) }))}\n` : render(view, { quotaNote }));
   if (!["completed", "waiting"].includes(view.state)) {
     process.exitCode = 1;
   }
