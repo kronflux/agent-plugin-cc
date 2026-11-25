@@ -1,5 +1,9 @@
 # Changelog
 
+## 3.1.2
+
+- The hook that saves and submits the Claude seat's reply has no matcher any more and checks the agent type itself. In 3.1.1 the host never ran it for the seat's agent, whose type is `agent:council-member` while the matcher was `council-member`. Each run of the hook leaves one line in `council-seat-hook.log` in the plugin data folder.
+
 ## 3.1.1
 
 - Council: when the Claude seat's agent stops, a `SubagentStop` hook saves its reply as the agent wrote it to `<run folder>/replies/<prompt digest>.json` and submits it for its delivery. The leader no longer copies the reply out of a notification, where the host shows `<`, `>` and `&` as entities, and a seat's reply is recorded before a cutoff notice can reach it.
