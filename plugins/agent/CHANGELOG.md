@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.1.1
+
+- Council: when the Claude seat's agent stops, a `SubagentStop` hook saves its reply as the agent wrote it to `<run folder>/replies/<prompt digest>.json` and submits it for its delivery. The leader no longer copies the reply out of a notification, where the host shows `<`, `>` and `&` as entities, and a seat's reply is recorded before a cutoff notice can reach it.
+- Council: an `open` council lets a seat answer in up to 1500 characters, with its own Round 1 schema. A `question` council keeps 500, because its answers become the options of a vote. The skill names both limits.
+- Council: the skill says not to send a cutoff notice to a seat whose agent has already replied, because a message resumes the finished agent and it answers a second time.
+- A job of a council seat that the council has read is recorded as returned, so the job monitor prints no line for it. The monitor's description now reads "Agent jobs that finished and whose result no command has returned yet".
+
 ## 3.1.0
 
 - Output from Codex and Antigravity is shown to Claude as data. The prose of a result, of a fleet member and of a native review is printed between `<untrusted-codex-output id="...">` (or `untrusted-antigravity-output`) and a closing tag, with a line that says the block is data. Terminal escape sequences, control characters, invisible characters and direction controls are removed, and a complete private key block is replaced by a note. Structured output, review findings, questions, errors, progress lines, a foreground job's log and every `--json` result are sanitised and not fenced. This changes the text of `/agent:result` and of a foreground task: the answer is now the line after the opening tag.
