@@ -2,6 +2,6 @@
   {
     "name": "agent-jobs",
     "command": "node --disable-warning=ExperimentalWarning \"${CLAUDE_PLUGIN_ROOT}/scripts/job-monitor.mjs\" \"${CLAUDE_PROJECT_DIR}\" \"${CLAUDE_PLUGIN_DATA}\"",
-    "description": "Agent jobs that finish without anyone waiting for them"
+    "description": "Agent jobs that finished and whose result no command has returned yet"
   }
 ]

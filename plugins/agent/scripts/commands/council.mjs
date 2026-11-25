@@ -8,7 +8,7 @@ import { parseCommandInput, resolveCommandCwd } from "../lib/companion-cli.mjs";
 import { sanitizeAgentValue } from "../lib/untrusted.mjs";
 import { readRequesterIdentity } from "../lib/host.mjs";
 import { reconcileStore } from "../lib/job-control.mjs";
-import { readMessageOutcome, sendToChain, withdrawMessage } from "../lib/mailbox.mjs";
+import { markDelivered, readMessageOutcome, sendToChain, withdrawMessage } from "../lib/mailbox.mjs";
 import { providerForJob } from "../lib/providers.mjs";
 import {
   createJob,
@@ -682,6 +682,20 @@ function startUsageRead(job, family, run, deps) {
  * `replacement prompt unavailable` and `deps.diagnostics` gets `{ seat, jobId, problem, message }`.
  * Resolves to the number of observations deposited.
  */
+// The council reads the end of its seat jobs itself, so the job is recorded as returned to a
+// waiting command and the session's monitor prints no line for it. A failed write changes nothing
+// for the council; the monitor then prints the line.
+function markSeatJobDelivered(store, row) {
+  if (!row || row.end_state === null || row.delivered_at !== null) {
+    return;
+  }
+  try {
+    markDelivered(store, row.id);
+  } catch {
+    // The store was busy.
+  }
+}
+
 export async function observeJobs(store, runDir, snapshot, deps) {
   deps.usage ??= new Map();
   const observed = new Set(snapshot.observations.map((row) => row.attempt_id));
@@ -697,6 +711,7 @@ export async function observeJobs(store, runDir, snapshot, deps) {
     if (!cls) {
       continue;
     }
+    markSeatJobDelivered(store, row);
     let verdict;
     switch (cls.kind) {
       case "missing":
@@ -795,6 +810,7 @@ export async function observeFollowups(store, runDir, snapshot, deps) {
     if (!cls) {
       continue;
     }
+    markSeatJobDelivered(store, row);
     let verdict;
     switch (cls.kind) {
       case "missing":
