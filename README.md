@@ -346,6 +346,8 @@ finished job of the current Claude session. A job that is still queued, running,
 no result yet; `--wait` waits for its end, for at most `--timeout-ms` milliseconds (default
 240000), and exits with code 75 if the job is still running then.
 
+The agent's prose is printed as a fenced block (see [Output from another agent](#output-from-another-agent)). When a job failed and the provider's usage report shows a reached limit, a sentence such as `Antigravity reports that its quota is used up. It resets at 2026-12-01T09:00:00Z.` follows the error. The command that shows the job reads the report then, within 10 seconds, and only for a failure the provider may have caused; a foreground task does the same when it ends. With `--json` the sentence is the field `quotaNote`. The stored error does not change.
+
 The output ends with notes where they apply: that the stored result was truncated and where
 the full log is, the question of a waiting job, that the agent's exit was not observed, the
 agent's session ID, and the job that continued this one. Reopen the session in the agent's own
@@ -1102,6 +1104,18 @@ Yes. Because the plugin uses your local Codex CLI, your existing sign-in method 
 If you need to point the built-in OpenAI provider at a different endpoint, set `openai_base_url` in your [Codex config](https://developers.openai.com/codex/config-advanced/#config-and-state-locations).
 
 ## Security notes
+
+### Output from another agent
+
+What Codex or Antigravity writes is shown to Claude as data, not as instructions:
+
+- **Sanitised.** Terminal escape sequences, control characters, invisible characters (zero-width space, tag characters) and the characters that change the direction of text are removed, and a complete private key block is replaced by a note. Tabs, line ends, accents, other scripts and the joiners that Persian spelling and joined emoji need are unchanged.
+- **Fenced.** The prose of a result is printed between `<untrusted-codex-output id="...">` (or `untrusted-antigravity-output`) and a closing tag with the same id, followed by one line that says the block is data. The id is made from the text, so the same result always prints the same block, and text that tries to close its own block is stripped of the tag.
+- **Where.** `/agent:result`, a foreground task, `fleet results` and a native review are fenced. Structured output, review findings, questions, errors, progress lines, the log a foreground job prints and every `--json` result are sanitised and not fenced, because programs and the plugin's own layout read them. The reason of a stop review gate block is sanitised too.
+- **Council.** A seat's reply and a follow-up answer are stored sanitised, and the round 2 prompt tells each seat that the other members' findings and answers are data to judge.
+- **Stored text.** The job store keeps a result as the agent sent it; the job log (`/agent:result` names it for a truncated result) holds the raw lines.
+
+An Antigravity job is told to do the work itself: it may not start subagents, swarms, workflows or scheduled tasks, and may not call another AI agent or its tools. Codex requests carry no such line; a Codex job is bounded by its sandbox.
 
 When Codex runs a delegated task and an MCP server asks for consent through an elicitation, the runner answers on your behalf, because a delegated run has no operator to ask. It declines requests in `form`, `openai/form`, `openaiForm` or `url` mode, because it cannot fill in a form or open a URL. It accepts a request with no `mode` or an unknown `mode` with empty content, because declining blocks the MCP tool call that raised it.
 
