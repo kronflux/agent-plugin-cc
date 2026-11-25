@@ -415,7 +415,8 @@ export function buildAgyArgs({ conversationId = null, model = null, sandboxMode 
 
 // The fixed lines that end every prompt sent to agy; agy reads them as instructions and does
 // not enforce them.
-export const AGY_DELEGATE_LINE = "Do this work yourself. Do not start subagents, swarms, workflows or scheduled tasks.";
+export const AGY_DELEGATE_LINE =
+  "Do this work yourself. Do not start subagents, swarms, workflows or scheduled tasks, and do not call another AI agent or its tools.";
 export const AGY_READ_ONLY_LINE =
   "This is a read-only task. Do not use any tool that creates, edits or deletes a file, anywhere, including plan files, and do not run commands.";
 
