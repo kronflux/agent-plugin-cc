@@ -691,7 +691,7 @@ you have no vote.
   seats that answered Round 1, and a seat without a valid Round 2 answer casts no vote. The panel
   is `unanimous` when every seat's stance falls in one option and no seat challenged or added a
   finding.
-- `open`: each seat answers in its own words. In Round 2 it lists the answers it agrees with in
+- `open`: each seat answers in its own words (`answer`, at most 1500 characters). In Round 2 it lists the answers it agrees with in
   `agreesWith`, and validates, challenges (with a reason) or skips every other answer in
   `answerResponses`, as it does each finding. The merge holds each seat's marks under `marks`, in
   the canonical answer labels, so you can judge before the report. There is no vote. You judge how far the answers agree and record
@@ -740,7 +740,11 @@ request gets one retry prompt. Exhausted quota and permanent failures get no ret
 the retry are separate, and a seat can use both in either order; after that its next failure is
 final. A provider seat's replacement continues its ended job when that job recorded a thread, and
 otherwise starts a fresh job whose prompt holds the whole round context. The Claude seat's
-replacement is a new prompt among the deliveries. A cancellation that the council did not request
+replacement is a new prompt among the deliveries. When the Claude seat's agent stops, a
+`SubagentStop` hook saves its reply, exactly as the agent wrote it, to
+`<run folder>/replies/<prompt digest>.json` and submits it for the delivery that prompt belongs to;
+`replies/hook.log` says what it did. The leader submits that file itself only when the delivery is
+still open. A cancellation that the council did not request
 ends the seat as `error` with no retry. Each seat ends a round as `valid`, `invalid`, `timed-out`,
 `error`, `missing-cli` or `quota-exhausted`; a failed provider turn is checked against the
 provider's usage to tell exhausted quota from other failures. The member-turn cap counts ordinary
