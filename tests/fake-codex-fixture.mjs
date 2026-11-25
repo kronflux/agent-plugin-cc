@@ -167,6 +167,20 @@ function withStateLock(fn) {
         fs.rmSync(LOCK_PATH, { force: true });
         continue;
       }
+      // A lock file without a process id was left by a holder that was stopped between creating
+      // the file and writing its id. No live holder keeps it that way for two seconds.
+      if (!Number.isInteger(holder) || holder <= 0) {
+        let age = 0;
+        try {
+          age = Date.now() - fs.statSync(LOCK_PATH).mtimeMs;
+        } catch {
+          continue;
+        }
+        if (age > 2000) {
+          fs.rmSync(LOCK_PATH, { force: true });
+          continue;
+        }
+      }
       if (Date.now() >= deadline) {
         throw new Error("fake codex state lock is held by process " + holder);
       }
